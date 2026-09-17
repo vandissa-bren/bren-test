@@ -495,8 +495,54 @@ async def main():
             print(f"  {name} FAILED: {e}")
         await asyncio.sleep(2)
 
-    # Push to Supabase
-    async with httpx.AsyncClient() as client:
+    # Push to Supabase -- C4b, 17 Sep 2026: THROUGH merge_availability.
+    #
+    # This used to PATCH each venue's whole `data` object, copied from the read
+    # at the top of this run. Anything written in between -- the nightly
+    # scrape's sessions and rosters, another court run's days -- was silently
+    # reverted: on 17 Sep, 18 of 21 venues were serving the previous night's
+    # sessions because of it. Now each venue gets ONE call that changes only
+    # what this job owns: the court days it fetched, court prices and their
+    # timestamps, and fetch_status, with past days pruned in the same
+    # statement. Sessions, rosters and everything else are never sent.
+    #
+    # Every save is checked. The old PATCH ignored its response, so a rejected
+    # write looked exactly like a successful one. A failed save is printed and
+    # makes the run exit non-zero, so it shows as failed in GitHub Actions.
+    #
+    # Known limit, unchanged by this step: court_prices is still replaced as a
+    # whole, so two overlapping runs can overwrite each other's newest price
+    # entries. A lost entry is simply refetched later. R3 (no overlapping runs)
+    # removes it.
+    save_failed = []
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        async def merge(row_id, name, p_set, p_by_date=None, prune_before=None):
+            body = {"p_id": row_id, "p_set": p_set}
+            if p_by_date is not None:
+                body["p_by_date"] = p_by_date
+            if prune_before is not None:
+                body["p_prune_before"] = prune_before
+            try:
+                r = await client.post(
+                    f"{SUPABASE_URL}/rest/v1/rpc/merge_availability",
+                    headers=headers,
+                    json=body,
+                )
+            except Exception as e:
+                save_failed.append((row_id, f"{type(e).__name__}: {e}"))
+                print(f"  SAVE FAILED {name}: {type(e).__name__}: {e}")
+                return None
+            if r.status_code != 200:
+                save_failed.append((row_id, f"HTTP {r.status_code}"))
+                print(f"  SAVE FAILED {name}: HTTP {r.status_code} {r.text[:200]}")
+                return None
+            out = r.json()
+            if isinstance(out, dict) and out.get("result") == "missing":
+                print(f"  NOT SAVED {name}: row {row_id} no longer exists")
+                return None
+            return out
+
         async def patch_venue(record):
             row_id = record["id"]
             data = record["data"]
@@ -504,58 +550,54 @@ async def main():
             if fid not in results_by_venue:
                 return
             result = results_by_venue[fid]
+            name = data.get("name", row_id)
 
-            # A failed fetch must not overwrite good data. Previously
-            # court_prices was written unconditionally from a dict that
-            # stayed empty when the venue raised, so one transient failure
-            # wiped that venue's cached prices entirely.
+            # A failed fetch must not overwrite good data. Only the status is
+            # written; days and prices are left exactly as they are.
             if not result["ok"]:
-                data["fetch_status"] = {
+                await merge(row_id, name, {"fetch_status": {
                     "state": "failed",
                     "at": datetime.now(timezone.utc).isoformat(),
                     "error": result["error"],
                     "dates_ok": result["dates_ok"],
-                }
-                await client.patch(
-                    f"{SUPABASE_URL}/rest/v1/availability_cache",
-                    params={"id": f"eq.{row_id}"},
-                    headers=headers,
-                    json={"data": data},
-                )
-                print(f"  NOT SAVED {data.get('name', row_id)}: fetch failed, "
-                      f"existing cache left intact")
+                }})
+                print(f"  NOT SAVED {name}: fetch failed, existing cache left intact")
                 return
 
-            # Prune before merging, so a date this writer is about to write is
-            # never dropped by its own prune.
-            by_date = prune_past_dates(data.get("by_date", {}),
-                                       date.today().isoformat())
+            # The status reports the venue's stored total as this run would
+            # leave it, computed from the read at the top of the run -- the
+            # same number the old whole-record write produced. Other runs may
+            # change other days meanwhile; the count is a status, not data.
+            today_str = date.today().isoformat()
+            by_date = prune_past_dates(data.get("by_date", {}), today_str)
             for date_str, blocks in result["by_date"].items():
                 by_date[date_str] = blocks
-            data["by_date"] = by_date
-            data["court_prices"] = result["court_prices"]
-            data["court_prices_fetched_at"] = result["court_prices_fetched_at"]
-
             total = sum(len(v) for v in by_date.values())
             # "Fetched successfully and found nothing" and "could not fetch"
             # are different facts. A timestamp alone cannot tell them apart,
             # which is why SportsWell reading blocks=0 / error=None was
             # operationally ambiguous.
-            data["fetch_status"] = {
+            fetch_status = {
                 "state": "ok" if total else "ok_empty",
                 "at": datetime.now(timezone.utc).isoformat(),
                 "error": None,
                 "dates_ok": result["dates_ok"],
                 "blocks": total,
             }
-            await client.patch(
-                f"{SUPABASE_URL}/rest/v1/availability_cache",
-                params={"id": f"eq.{row_id}"},
-                headers=headers,
-                json={"data": data},
+            out = await merge(
+                row_id, name,
+                {
+                    "court_prices": result["court_prices"],
+                    "court_prices_fetched_at": result["court_prices_fetched_at"],
+                    "fetch_status": fetch_status,
+                },
+                p_by_date=result["by_date"],
+                prune_before=today_str,
             )
+            if out is None:
+                return
             n_prices = len(result["court_prices"])
-            print(f"  Saved {data.get('name', row_id)}: {total} total blocks, "
+            print(f"  Saved {name}: {total} total blocks, "
                   f"{n_prices} prices cached"
                   + ("  [ZERO BLOCKS -- fetch succeeded but found nothing]"
                      if not total else ""))
@@ -578,6 +620,11 @@ async def main():
     for fid in failed:
         print(f"  FAILED {fid} {_venue_name(fid)} "
               f"-- {results_by_venue[fid]['error']}")
+    for row_id, why in save_failed:
+        print(f"  SAVE FAILED {row_id} -- {why}")
+    if save_failed:
+        # Loud on purpose: a run whose saves were rejected must not look green.
+        raise SystemExit(1)
     print("=" * 60)
     print("Done.")
 
