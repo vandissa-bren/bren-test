@@ -602,23 +602,40 @@ async def _get_pbp_availability(
 
 # ── Routes ──────────────────────────────────────────────────────────────────
 
-async def _warm_single_date(target):
-    from datetime import date as date_type
+async def _warm_single_date(target, supabase_data=None):
+    """Pre-fill the in-memory cache for one date FROM STORED DATA.
+
+    R0(a), 17 Sep 2026. This used to call PlayByPoint live for every venue
+    (_get_pbp_availability): 21 venues x 7 dates every 10 minutes, all from
+    this droplet. PlayByPoint's Cloudflare now refuses this droplet's address
+    outright -- 403 on every request, public pages included -- so every warm
+    produced a week with no courts and cached it, and players saw court hire
+    blank for the whole week until the cache expired.
+
+    Stored court blocks (availability_cache.data.by_date) are kept fresh by the
+    scheduled court jobs, and the cache-miss path in pbp_availability already
+    serves them. The warm now builds exactly that response, so a player gets
+    the same courts whether the request hits the cache or misses it.
+
+    Nothing the app shows is lost: the old call also fetched today's live
+    sessions, but threw them away. _get_pbp_availability is deliberately left
+    in place, unused, so this can be reverted by restoring this function alone.
+    """
     date_str = target.isoformat()
     cache_key = f"availability:{date_str}:00:00:23:30:all"
     if _cache_get(cache_key):
         return
-    cookies, user_id, _ = _load_session_with_env_fallback()
-    if not cookies:
-        return
     try:
-        from_sec, to_sec = _hhmm_to_sec("00:00"), _hhmm_to_sec("23:30")
-        results = await asyncio.gather(*[
-            _get_pbp_availability(fid, registry_name(fid), slug, target, from_sec, to_sec)
-            for fid, slug in active_slug_map().items()
-        ], return_exceptions=True)
-        court_blocks_by_id = {r["id"]: r.get("court_blocks", []) for r in results if isinstance(r, dict)}
-        supabase_data = await _read_from_supabase("playbypoint")
+        if supabase_data is None:
+            supabase_data = await _read_from_supabase("playbypoint")
+        if not supabase_data:
+            # A failed or empty read is not an empty catalogue. Caching it
+            # would show a blank week for five minutes; leave the cache alone
+            # and let the next request try the read itself.
+            logger.warning(f"Warm skipped for {date_str}: no stored availability was read")
+            return
+        court_blocks_by_id = {r.get("id"): (r.get("by_date") or {}).get(date_str, [])
+                              for r in supabase_data}
         output = []
         for r in supabase_data:
             vid = r.get("id")
@@ -635,8 +652,11 @@ async def _warm_cache():
     from datetime import date as date_type
     await asyncio.sleep(5)
     targets = [date_type.fromordinal(date_type.today().toordinal() + i) for i in range(7)]
+    # One stored read per cycle, not one per date: every date is built from the
+    # same rows. Read here rather than per date so a cycle is consistent.
+    supabase_data = await _read_from_supabase("playbypoint")
     for t in targets:
-        await _warm_single_date(t)
+        await _warm_single_date(t, supabase_data)
         await asyncio.sleep(3)
 
 async def _cache_refresh_loop():
