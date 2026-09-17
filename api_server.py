@@ -692,8 +692,29 @@ class RefreshCookiesRequest(BaseModel):
 
 @app.post("/api/internal/refresh-cookies")
 async def refresh_cookies(req: RefreshCookiesRequest):
-    """Accept fresh PBP cookies pushed from the Windows machine."""
+    """Accept fresh PBP cookies pushed from the Windows machine.
+
+    C3 / A1c, 17 Sep 2026: FAILS CLOSED. The request model has always carried
+    a `secret`, but nothing checked it, and nginx passes this path through, so
+    anyone who found it could replace this server's PlayByPoint session.
+
+    A push is accepted only when INTERNAL_COOKIE_SECRET is set in this
+    server's environment AND the request's `secret` matches it. With the
+    variable unset -- the state on 17 Sep -- every push is refused, which is
+    the intended default: nothing has used this endpoint in 30 days, and the
+    only caller in any repository (refresh_cookies_server.py, unscheduled)
+    writes /app/.pbp_cookies.json first, which this server already reads.
+
+    The secret is never logged or echoed.
+    """
     global _runtime_cookies, _runtime_user_id, _runtime_email
+    import hmac
+    expected = os.environ.get("INTERNAL_COOKIE_SECRET", "")
+    supplied = req.secret or ""
+    if not expected or not hmac.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8")):
+        logger.warning("refresh-cookies refused: %s",
+                       "no INTERNAL_COOKIE_SECRET configured" if not expected else "secret did not match")
+        raise HTTPException(status_code=403, detail="Forbidden")
     try:
         data = json.loads(req.pbp_cookies_json)
         cookies = data.get("cookies", {})
