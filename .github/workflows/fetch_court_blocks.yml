@@ -1,16 +1,4 @@
 name: Fetch Court Blocks
-# C6, 17 Sep 2026 -- windows as intended (D23), and no job ever runs on top of
-# its own previous run:
-#   fetch-near  days 0-1   every 15 minutes
-#   fetch-mid   days 2-7   hourly      (was days 0-7: no DAYS_START was set)
-#   fetch-far   days 8-13  every 2 hours
-# Each job has its own concurrency group: a new run waits for the previous run
-# of the SAME job instead of overlapping it, and a waiting run is replaced by a
-# newer one. The three windows never share a day, so different jobs may run at
-# once -- each saves only its own days through merge_availability (C4b).
-# Timeouts are generous upper bounds so a stuck run cannot hold its group for
-# GitHub's six-hour default; a run that times out saves nothing, and the
-# stored courts stay as they were.
 on:
   schedule:
     - cron: '0,15,30,45 * * * *'
@@ -26,10 +14,6 @@ jobs:
   fetch-near:
     name: Fetch today + tomorrow
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-    concurrency:
-      group: court-blocks-near
-      cancel-in-progress: false
     if: github.event_name == 'workflow_dispatch' || (github.event_name == 'schedule' && startsWith(github.event.schedule, '0,15'))
     steps:
       - uses: actions/checkout@v4
@@ -48,12 +32,8 @@ jobs:
         run: python fetch_court_blocks.py
 
   fetch-mid:
-    name: Fetch days 2-7
+    name: Fetch days 3-8
     runs-on: ubuntu-latest
-    timeout-minutes: 50
-    concurrency:
-      group: court-blocks-mid
-      cancel-in-progress: false
     if: github.event_name == 'schedule' && startsWith(github.event.schedule, '5 * ')
     steps:
       - uses: actions/checkout@v4
@@ -62,23 +42,18 @@ jobs:
           python-version: '3.11'
       - name: Install dependencies
         run: pip install httpx curl_cffi loguru python-dotenv rich supabase typer tenacity
-      - name: Fetch court blocks (days 2-7)
+      - name: Fetch court blocks (days 3-8)
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           PBP_COOKIES_JSON: ${{ secrets.PBP_COOKIES_JSON }}
           DAYS_AHEAD: '8'
-          DAYS_START: '2'
           PRICE_REFRESH_HOURS: '168'
         run: python fetch_court_blocks.py
 
   fetch-far:
-    name: Fetch days 8-13
+    name: Fetch days 8-14
     runs-on: ubuntu-latest
-    timeout-minutes: 50
-    concurrency:
-      group: court-blocks-far
-      cancel-in-progress: false
     if: github.event_name == 'schedule' && startsWith(github.event.schedule, '7 ')
     steps:
       - uses: actions/checkout@v4
@@ -87,7 +62,7 @@ jobs:
           python-version: '3.11'
       - name: Install dependencies
         run: pip install httpx curl_cffi loguru python-dotenv rich supabase typer tenacity
-      - name: Fetch court blocks (days 8-13)
+      - name: Fetch court blocks (days 8-14)
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
