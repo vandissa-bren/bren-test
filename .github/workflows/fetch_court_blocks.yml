@@ -1,9 +1,20 @@
 name: Fetch Court Blocks
+# C12 / Build A, 17 Sep 2026 -- windows as intended (D23) with no self-overlap,
+# and run minutes moved OFF the top of the hour. GitHub's scheduled trigger is
+# best-effort and drops runs under load, worst at :00 (F66); offsetting the
+# minute is GitHub's own recommended mitigation. This does NOT guarantee every
+# run fires -- that would need an external trigger (Build B) -- but it reduces
+# the drops and fixes the day windows.
+#   fetch-near  days 0-1   every 15 min   at :08 :23 :38 :53
+#   fetch-mid   days 2-7   hourly         at :23        (was days 0-7 -- the collision bug)
+#   fetch-far   days 8-13  every 2 hours  at :43
+# No concurrency groups (kept simple by request); the three windows never share
+# a day, and each save goes through merge_availability (C4b) so overlaps are safe.
 on:
   schedule:
-    - cron: '0,15,30,45 * * * *'
-    - cron: '5 * * * *'
-    - cron: '7 */2 * * *'
+    - cron: '8,23,38,53 * * * *'
+    - cron: '23 * * * *'
+    - cron: '43 */2 * * *'
   workflow_dispatch:
     inputs:
       days_ahead:
@@ -14,7 +25,7 @@ jobs:
   fetch-near:
     name: Fetch today + tomorrow
     runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'schedule' && startsWith(github.event.schedule, '0,15'))
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'schedule' && startsWith(github.event.schedule, '8,23'))
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -32,9 +43,9 @@ jobs:
         run: python fetch_court_blocks.py
 
   fetch-mid:
-    name: Fetch days 3-8
+    name: Fetch days 2-7
     runs-on: ubuntu-latest
-    if: github.event_name == 'schedule' && startsWith(github.event.schedule, '5 * ')
+    if: github.event_name == 'schedule' && startsWith(github.event.schedule, '23 * ')
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -42,19 +53,20 @@ jobs:
           python-version: '3.11'
       - name: Install dependencies
         run: pip install httpx curl_cffi loguru python-dotenv rich supabase typer tenacity
-      - name: Fetch court blocks (days 3-8)
+      - name: Fetch court blocks (days 2-7)
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           PBP_COOKIES_JSON: ${{ secrets.PBP_COOKIES_JSON }}
           DAYS_AHEAD: '8'
+          DAYS_START: '2'
           PRICE_REFRESH_HOURS: '168'
         run: python fetch_court_blocks.py
 
   fetch-far:
-    name: Fetch days 8-14
+    name: Fetch days 8-13
     runs-on: ubuntu-latest
-    if: github.event_name == 'schedule' && startsWith(github.event.schedule, '7 ')
+    if: github.event_name == 'schedule' && startsWith(github.event.schedule, '43 ')
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -62,7 +74,7 @@ jobs:
           python-version: '3.11'
       - name: Install dependencies
         run: pip install httpx curl_cffi loguru python-dotenv rich supabase typer tenacity
-      - name: Fetch court blocks (days 8-14)
+      - name: Fetch court blocks (days 8-13)
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
