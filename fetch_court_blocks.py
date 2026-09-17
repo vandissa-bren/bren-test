@@ -109,8 +109,12 @@ def get_shift(sec: int, target_date: date = None) -> str:
     return shift
 
 
-async def fetch_blocks_for_surface(api, facility_id: int, target_date: date, surface: str) -> tuple:
-    """Fetch court_slots for one surface type. Returns ({court_key: [secs]}, {sec: real_pbp_shift})."""
+async def fetch_blocks_for_surface(api, facility_id: int, target_date: date, surface: str, errors: list = None) -> tuple:
+    """Fetch court_slots for one surface type. Returns ({court_key: [secs]}, {sec: real_pbp_shift}).
+
+    C5, 17 Sep 2026: any error is also appended to `errors` when a list is
+    given, so the caller can tell an incomplete day from a genuinely empty one.
+    """
     court_slots = {}
     sec_shift_map = {}
     try:
@@ -146,8 +150,12 @@ async def fetch_blocks_for_surface(api, facility_id: int, target_date: date, sur
                 await asyncio.sleep(0.3)
             except Exception as e:
                 print(f"    slot {sec_to_hhmm(sec)} error: {e}")
+                if errors is not None:
+                    errors.append(f"slot {sec_to_hhmm(sec)}: {e}")
     except Exception as e:
         print(f"    surface {surface} error: {e}")
+        if errors is not None:
+            errors.append(f"surface {surface}: {e}")
     return court_slots, sec_shift_map
 
 
@@ -342,10 +350,16 @@ def apply_prices_to_blocks(blocks: list, court_prices: dict) -> list:
     return result
 
 
-async def fetch_court_blocks_for_venue(api, facility_id: int, target_date: date, user_id: int, existing_prices: dict, existing_fetched_at: dict = None) -> tuple:
+async def fetch_court_blocks_for_venue(api, facility_id: int, target_date: date, user_id: int, existing_prices: dict, existing_fetched_at: dict = None, errors: list = None) -> tuple:
     """
     Fetch available court blocks for one venue on one date.
     Returns (blocks_with_prices, updated_court_prices, updated_fetched_at).
+
+    C5, 17 Sep 2026: when `errors` is a list, every failure on the way -- the
+    surface lookup, available hours, any single slot -- is appended to it. An
+    empty return with no errors means the venue genuinely has nothing free;
+    an empty return WITH errors means the day could not be read, and the
+    caller must not store it.
     """
     try:
         # Surfaces come from the reviewed classification, not from
@@ -386,7 +400,7 @@ async def fetch_court_blocks_for_venue(api, facility_id: int, target_date: date,
         combined_slots: dict = {}
         combined_shift_map: dict = {}
         for surface in surfaces:
-            slots, sec_shift_map = await fetch_blocks_for_surface(api, facility_id, target_date, surface)
+            slots, sec_shift_map = await fetch_blocks_for_surface(api, facility_id, target_date, surface, errors)
             for k, v in slots.items():
                 combined_slots.setdefault(k, []).extend(v)
             combined_shift_map.update(sec_shift_map)
@@ -410,6 +424,8 @@ async def fetch_court_blocks_for_venue(api, facility_id: int, target_date: date,
 
     except Exception as e:
         print(f"  Error fetching {facility_id} for {target_date}: {e}")
+        if errors is not None:
+            errors.append(str(e))
         return [], existing_prices, (existing_fetched_at or {})
 
 
@@ -472,6 +488,9 @@ async def main():
         results_by_venue[fid]["ok"] = False
         results_by_venue[fid]["error"] = None
         results_by_venue[fid]["dates_ok"] = 0
+        # C5: days that could not be read. They are NOT stored, so the day
+        # already in the cache stays as it is instead of becoming "no courts".
+        results_by_venue[fid]["failed_dates"] = []
 
         try:
             async with PlayByPointAPI(cookies=cookies, club_slug=slug) as api:
@@ -480,14 +499,23 @@ async def main():
                 updated_fetched_at = existing_fetched_at.copy()
                 for target_date in dates:
                     date_str = target_date.isoformat()
+                    date_errors = []
                     blocks, updated_prices, updated_fetched_at = await fetch_court_blocks_for_venue(
-                        api, fid, target_date, user_id, updated_prices, updated_fetched_at
+                        api, fid, target_date, user_id, updated_prices, updated_fetched_at,
+                        errors=date_errors,
                     )
-                    results_by_venue[fid]["by_date"][date_str] = blocks
                     results_by_venue[fid]["court_prices"] = updated_prices
                     results_by_venue[fid]["court_prices_fetched_at"] = updated_fetched_at
-                    results_by_venue[fid]["dates_ok"] += 1
-                    print(f"  {name} {date_str}: {len(blocks)} blocks")
+                    if date_errors:
+                        results_by_venue[fid]["failed_dates"].append(date_str)
+                        if results_by_venue[fid]["error"] is None:
+                            results_by_venue[fid]["error"] = date_errors[0][:300]
+                        print(f"  {name} {date_str}: FAILED ({len(date_errors)} error(s)) "
+                              f"-- stored day kept")
+                    else:
+                        results_by_venue[fid]["by_date"][date_str] = blocks
+                        results_by_venue[fid]["dates_ok"] += 1
+                        print(f"  {name} {date_str}: {len(blocks)} blocks")
                     await asyncio.sleep(1)
                 results_by_venue[fid]["ok"] = True
         except Exception as e:
@@ -553,13 +581,17 @@ async def main():
             name = data.get("name", row_id)
 
             # A failed fetch must not overwrite good data. Only the status is
-            # written; days and prices are left exactly as they are.
+            # written; days and prices are left exactly as they are. C5: a
+            # venue where every day failed is treated the same way.
+            if result["ok"] and result["failed_dates"] and not result["dates_ok"]:
+                result["ok"] = False
             if not result["ok"]:
                 await merge(row_id, name, {"fetch_status": {
                     "state": "failed",
                     "at": datetime.now(timezone.utc).isoformat(),
                     "error": result["error"],
                     "dates_ok": result["dates_ok"],
+                    "failed_dates": result["failed_dates"],
                 }})
                 print(f"  NOT SAVED {name}: fetch failed, existing cache left intact")
                 return
@@ -577,11 +609,18 @@ async def main():
             # are different facts. A timestamp alone cannot tell them apart,
             # which is why SportsWell reading blocks=0 / error=None was
             # operationally ambiguous.
+            # C5: "partial" when some days could not be read. Those days were
+            # not sent, so the cache still holds their previous courts.
+            if result["failed_dates"]:
+                state = "partial"
+            else:
+                state = "ok" if total else "ok_empty"
             fetch_status = {
-                "state": "ok" if total else "ok_empty",
+                "state": state,
                 "at": datetime.now(timezone.utc).isoformat(),
-                "error": None,
+                "error": result["error"],
                 "dates_ok": result["dates_ok"],
+                "failed_dates": result["failed_dates"],
                 "blocks": total,
             }
             out = await merge(
@@ -599,6 +638,8 @@ async def main():
             n_prices = len(result["court_prices"])
             print(f"  Saved {name}: {total} total blocks, "
                   f"{n_prices} prices cached"
+                  + (f"  [PARTIAL -- kept stored days {', '.join(result['failed_dates'])}]"
+                     if result["failed_dates"] else "")
                   + ("  [ZERO BLOCKS -- fetch succeeded but found nothing]"
                      if not total else ""))
 
@@ -610,10 +651,16 @@ async def main():
     ok = [f for f, r in results_by_venue.items() if r["ok"] and r["by_date"]]
     empty = [f for f in ok if not sum(len(v) for v in results_by_venue[f]["by_date"].values())]
     failed = [f for f, r in results_by_venue.items() if not r["ok"]]
+    partial = [f for f, r in results_by_venue.items() if r["ok"] and r.get("failed_dates")]
     print()
     print("=" * 60)
     print(f"CYCLE SUMMARY  attempted={len(results_by_venue)}  "
-          f"ok={len(ok) - len(empty)}  ok_but_empty={len(empty)}  failed={len(failed)}")
+          f"ok={len(ok) - len(empty)}  ok_but_empty={len(empty)}  failed={len(failed)}  "
+          f"partial={len(partial)}")
+    for fid in partial:
+        print(f"  PARTIAL {fid} {_venue_name(fid)} "
+              f"-- kept stored {', '.join(results_by_venue[fid]['failed_dates'])}: "
+              f"{results_by_venue[fid]['error']}")
     for fid in empty:
         print(f"  EMPTY  {fid} {_venue_name(fid)} "
               f"-- fetched cleanly, zero blocks")
@@ -624,6 +671,11 @@ async def main():
         print(f"  SAVE FAILED {row_id} -- {why}")
     if save_failed:
         # Loud on purpose: a run whose saves were rejected must not look green.
+        raise SystemExit(1)
+    if results_by_venue and len(failed) == len(results_by_venue):
+        # C5: every venue failed. That is not a venue problem -- it is a block,
+        # an expired session or an outage -- so the run must show red.
+        print("EVERY VENUE FAILED -- exiting non-zero so the run shows as failed")
         raise SystemExit(1)
     print("=" * 60)
     print("Done.")
