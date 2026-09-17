@@ -8,14 +8,27 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, '/app')
+try:
+    from dotenv import load_dotenv
+    load_dotenv('/app/.env')
+except Exception:
+    pass
 from extract_thejar import harvest_cookies_via_playwright
 
-PBP_EMAIL = "blakerenfrey@yahoo.com.au"
-PBP_PASSWORD = "Barkers16"
-COOKIE_PATH = "/app/.pbp_cookies.json"
+import os
+
+# C13c, 17 Sep 2026: read credentials from the environment (/app/.env),
+# not hardcoded here. The literal password used to sit in this file and
+# was exposed while the repo was public.
+PBP_EMAIL = os.environ.get("PBP_EMAIL")
+PBP_PASSWORD = os.environ.get("PBP_PASSWORD")
+COOKIE_PATH = os.environ.get("PBP_COOKIE_PATH", "/app/.pbp_cookies.json")
 
 
 async def main():
+    if not PBP_EMAIL or not PBP_PASSWORD:
+        print("ERROR: PBP_EMAIL / PBP_PASSWORD not set in the environment (/app/.env)")
+        sys.exit(2)
     print("Logging in to PlayByPoint...")
     cookies, user_id = await harvest_cookies_via_playwright(
         email=PBP_EMAIL,
