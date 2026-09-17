@@ -3,8 +3,33 @@
 These venues (SportsWell, Raya, Pickle4Real) are geo-restricted by PBP and
 can only be reliably fetched from an Australian IP -- this DO server, not
 GitHub Actions runners. Hence a separate script from fetch_court_blocks.py.
+
+C7, 17 Sep 2026 -- runs on picklematch-geo-syd1 (170.64.183.118) as the
+unprivileged user `pmjobs`. What changed, and what did not:
+
+  * UNCHANGED: how blocks and prices are built (fetch_blocks_and_prices).
+    These venues book by the hour, so one block per available hour.
+  * SETTINGS come from a private JSON file (GEO_SECRETS, default
+    /home/pmjobs/secrets.json: supabase_url, supabase_secret_key,
+    pbp_email, pbp_password), read when the job runs -- not at import.
+    SUPABASE_URL / SUPABASE_SECRET_KEY in the environment override it.
+  * THE KEY is a new-style sb_secret_ key, sent on the `apikey` header only;
+    Supabase rejects those as Authorization: Bearer. A legacy JWT key still
+    gets both headers.
+  * THE SESSION lives in GEO_SESSION (default /home/pmjobs/pbp_session.json).
+    It is checked once per run; if PlayByPoint refuses it, the job logs in
+    again the same browserless way the app's connect step does, and saves
+    the new session. The account number comes from whoami(), which logs
+    nothing, and is kept with the session for price lookups.
+  * WINDOWS: DAYS_START..DAYS_AHEAD-1 (defaults 0..13). DRY_RUN=1 fetches
+    everything and writes nothing.
+  * SAVING goes through merge_availability (C4b): only this job's court days,
+    court prices and their timestamps, and fetch_status; past days pruned.
+  * FAILURES (C5): a day that errors is not saved, so its stored courts stay;
+    fetch_status is ok / ok_empty / partial / failed. The run exits non-zero
+    if every venue failed or any save was rejected.
 """
-import asyncio, json, os, httpx
+import asyncio, json, os, re, sys, time, httpx
 import venue_registry
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -14,10 +39,12 @@ load_dotenv()
 
 from extract_thejar import PlayByPointAPI
 
-# URL is not sensitive (just a project ref); the service key is, so no
-# hardcoded fallback for that one.
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://stwohmddmdwttasbyblt.supabase.co")
-SUPABASE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
+SECRETS_PATH = os.environ.get("GEO_SECRETS", "/home/pmjobs/secrets.json")
+SESSION_PATH = os.environ.get("GEO_SESSION", "/home/pmjobs/pbp_session.json")
+PBP_BASE = os.environ.get("PBP_BASE_OVERRIDE") or "https://app.playbypoint.com"
+DAYS_START = int(os.environ.get("DAYS_START", "0"))
+DAYS_AHEAD = int(os.environ.get("DAYS_AHEAD", "14"))
+DRY_RUN = os.environ.get("DRY_RUN", "") == "1"
 
 # How old a cached price can get before we refetch it. Matches
 # fetch_court_blocks.py's PRICE_REFRESH_HOURS behaviour.
@@ -46,13 +73,17 @@ def get_shift(sec, target_date=None):
     return shift
 
 
-async def fetch_blocks_and_prices(api, fid, target, existing_prices, existing_fetched_at):
+async def fetch_blocks_and_prices(api, fid, target, existing_prices, existing_fetched_at, errors=None):
     """
     SportsWell-style venues use session-style available_hours (one block per
     hour) -- we deliberately build one block per available hour slot rather
     than merging consecutive hours, since these venues book hourly not in
     30-min increments (a different, still-open issue for the main pipeline).
     """
+    # C7: when `errors` is a list, any failure that makes the day's blocks
+    # incomplete is appended to it, and the caller does not save that day.
+    # Price errors are not among them -- a missing price is shown as
+    # unpriced, which is honest; a missing court is not.
     blocks = []
     new_prices = dict(existing_prices)
     new_fetched_at = dict(existing_fetched_at)
@@ -139,8 +170,10 @@ async def fetch_blocks_and_prices(api, fid, target, existing_prices, existing_fe
             shift = shift_for(sec)
             try:
                 courts = await api.available_courts(fid, target, sec, sec + 1800, surface="pickleball")
-            except Exception:
+            except Exception as e:
                 courts = []
+                if errors is not None:
+                    errors.append(f"courts at {sec_to_hhmm(sec)}: {e}")
             if not courts:
                 courts = [{"id": None, "name": "Court"}]
             for court in courts:
@@ -160,57 +193,249 @@ async def fetch_blocks_and_prices(api, fid, target, existing_prices, existing_fe
 
     except Exception as e:
         print(f"  Error: {e}")
+        if errors is not None:
+            errors.append(str(e))
 
     return blocks, new_prices, new_fetched_at
 
 
+def load_settings() -> dict:
+    s = {}
+    if os.path.exists(SECRETS_PATH):
+        with open(SECRETS_PATH) as f:
+            s = json.load(f)
+    s["supabase_url"] = os.environ.get("SUPABASE_URL") or s.get("supabase_url") \
+        or "https://stwohmddmdwttasbyblt.supabase.co"
+    key = (os.environ.get("SUPABASE_SECRET_KEY") or s.get("supabase_secret_key")
+           or os.environ.get("SUPABASE_SERVICE_KEY"))
+    if not key:
+        raise SystemExit(f"No Supabase key: expected {SECRETS_PATH} or SUPABASE_SECRET_KEY")
+    s["supabase_secret_key"] = key
+    return s
+
+
+def supabase_headers(key: str) -> dict:
+    h = {"apikey": key, "Content-Type": "application/json"}
+    if key.startswith("eyJ"):            # legacy JWT service key only
+        h["Authorization"] = f"Bearer {key}"
+    return h
+
+
+def _write_private(path: str, obj: dict) -> None:
+    fd = os.open(path + ".new", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(obj, f)
+    os.replace(path + ".new", path)
+
+
+def load_session():
+    try:
+        with open(SESSION_PATH) as f:
+            s = json.load(f)
+        return s if (s.get("cookies") or {}).get("_paybycourt_session") else None
+    except Exception:
+        return None
+
+
+async def login(settings: dict):
+    """Browserless PlayByPoint login, as the app's connect step does it."""
+    from curl_cffi.requests import AsyncSession
+    email, password = settings.get("pbp_email"), settings.get("pbp_password")
+    if not (email and password):
+        print("  LOGIN NOT POSSIBLE: no PlayByPoint email/password in the settings file")
+        return None
+    try:
+        async with AsyncSession(impersonate="chrome124") as s:
+            r = await s.get(f"{PBP_BASE}/users/sign_in")
+            m = re.search(r'<meta name="csrf-token" content="([^"]+)"', r.text or "")
+            if not m:
+                print(f"  LOGIN FAILED: sign-in page HTTP {r.status_code}, no token")
+                return None
+            r2 = await s.post(
+                f"{PBP_BASE}/users/sign_in",
+                json={"user": {"email": email, "password": password, "remember_me": "1"}},
+                headers={"Accept": "application/json", "Content-Type": "application/json",
+                         "X-CSRF-Token": m.group(1), "X-Requested-With": "XMLHttpRequest",
+                         "Referer": f"{PBP_BASE}/users/sign_in"},
+            )
+            try:
+                ok = bool(r2.json().get("success"))
+            except Exception:
+                ok = False
+            jar = {k: v for k, v in s.cookies.items()}
+    except Exception as e:
+        print(f"  LOGIN FAILED: {type(e).__name__}: {str(e)[:100]}")
+        return None
+    if not (ok and jar.get("_paybycourt_session")):
+        print(f"  LOGIN FAILED: HTTP {r2.status_code}, not accepted")
+        return None
+    session = {"cookies": jar, "obtained_at": int(time.time())}
+    _write_private(SESSION_PATH, session)
+    print("  logged in again; new session saved")
+    return session
+
+
+def _api(cookies, slug):
+    kw = {"app_base_url": PBP_BASE} if os.environ.get("PBP_BASE_OVERRIDE") else {}
+    return PlayByPointAPI(cookies=cookies, club_slug=slug, **kw)
+
+
+async def session_accepted(cookies, venue) -> bool:
+    async with _api(cookies, venue.slug) as api:
+        try:
+            await api.court_types(venue.facility_id, kind=None)
+            return True
+        except PermissionError:
+            return False
+        except Exception as e:
+            print(f"  session check could not complete: {type(e).__name__}: {str(e)[:80]}")
+            return False
+
+
+async def ensure_session(settings, venue):
+    session = load_session()
+    if session and await session_accepted(session["cookies"], venue):
+        return session
+    print("  saved session missing or refused -- logging in")
+    session = await login(settings)
+    if session and not await session_accepted(session["cookies"], venue):
+        print("  NEW SESSION ALSO REFUSED")
+        return None
+    return session
+
+
 async def main():
-    d = json.loads(open("/app/.pbp_cookies.json").read())
-    cookies, user_id = d["cookies"], d["user_id"]
+    settings = load_settings()
+    headers = supabase_headers(settings["supabase_secret_key"])
+    base = settings["supabase_url"].rstrip("/")
     today = datetime.now(ZoneInfo('Australia/Melbourne')).date()
-    dates = [today + timedelta(days=i) for i in range(14)]  # match main pipeline's 14-day coverage
-    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}", "Content-Type": "application/json"}
+    dates = [today + timedelta(days=i) for i in range(DAYS_START, DAYS_AHEAD)]
+    venues = list(venue_registry.venues_for_fetcher("sportswell"))
+    print(f"Geo court job: days {DAYS_START}-{DAYS_AHEAD - 1}, {len(venues)} venues"
+          + ("  [DRY RUN - nothing will be saved]" if DRY_RUN else ""))
 
-    async with httpx.AsyncClient() as client:
-        # Venue selection from the registry. These carry fetcher='sportswell'
-        # because they are geo-restricted and need this script's proxy path;
-        # they are deliberately absent from fetch_court_blocks rather than
-        # missing from it.
-        for _v in venue_registry.venues_for_fetcher("sportswell"):
-            fid, slug = _v.facility_id, _v.slug
-            # Load existing data
-            resp = await client.get(
-                f"{SUPABASE_URL}/rest/v1/availability_cache",
-                params={"id": f"eq.pbp-{fid}", "select": "id,data"},
-                headers=headers,
-            )
-            record = resp.json()[0]
-            data = record["data"]
-            by_date = data.get("by_date", {})
-            existing_prices = data.get("court_prices", {})
-            existing_fetched_at = data.get("court_prices_fetched_at", {})
+    results = {v.facility_id: {"name": v.name, "ok": False, "error": None, "dates_ok": 0,
+                               "failed_dates": [], "by_date": {}} for v in venues}
+    save_failed = []
 
-            async with PlayByPointAPI(cookies=cookies, club_slug=slug) as api:
-                api._user_id = user_id
-                updated_prices = existing_prices.copy()
-                updated_fetched_at = existing_fetched_at.copy()
-                for target in dates:
-                    blocks, updated_prices, updated_fetched_at = await fetch_blocks_and_prices(
-                        api, fid, target, updated_prices, updated_fetched_at
-                    )
-                    by_date[target.isoformat()] = blocks
-                    print(f"  {slug} {target}: {len(blocks)} blocks")
-                    await asyncio.sleep(1)
+    session = await ensure_session(settings, venues[0]) if venues else None
+    if session and not session.get("user_id"):
+        async with _api(session["cookies"], venues[0].slug) as api:
+            uid = await api.whoami()
+        if uid:
+            session["user_id"] = uid
+            _write_private(SESSION_PATH, session)
+        else:
+            print("  note: account number not found; prices may come back empty")
 
-            data["by_date"] = by_date
-            data["court_prices"] = updated_prices
-            data["court_prices_fetched_at"] = updated_fetched_at
-            await client.patch(
-                f"{SUPABASE_URL}/rest/v1/availability_cache",
-                params={"id": f"eq.pbp-{fid}"},
-                headers=headers,
-                json={"data": data},
-            )
-            print(f"Saved {slug} ({len(updated_prices)} prices cached)")
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        async def merge(row_id, name, p_set, p_by_date=None, prune_before=None):
+            if DRY_RUN:
+                days = ", ".join(f"{d}:{len(b)}" for d, b in sorted((p_by_date or {}).items()))
+                print(f"  DRY RUN {name}: would save status={p_set.get('fetch_status', {}).get('state')} days [{days}]")
+                return {"result": "dry-run"}
+            body = {"p_id": row_id, "p_set": p_set}
+            if p_by_date is not None:
+                body["p_by_date"] = p_by_date
+            if prune_before is not None:
+                body["p_prune_before"] = prune_before
+            try:
+                r = await client.post(f"{base}/rest/v1/rpc/merge_availability", headers=headers, json=body)
+            except Exception as e:
+                save_failed.append((row_id, f"{type(e).__name__}: {e}"))
+                print(f"  SAVE FAILED {name}: {type(e).__name__}: {e}")
+                return None
+            if r.status_code != 200:
+                save_failed.append((row_id, f"HTTP {r.status_code}"))
+                print(f"  SAVE FAILED {name}: HTTP {r.status_code} {r.text[:200]}")
+                return None
+            out = r.json()
+            if isinstance(out, dict) and out.get("result") == "missing":
+                print(f"  NOT SAVED {name}: row {row_id} does not exist")
+                return None
+            return out
 
-asyncio.run(main())
+        for v in venues:
+            fid, slug, res = v.facility_id, v.slug, results[v.facility_id]
+            row_id = f"pbp-{fid}"
+            status = "no response"
+            try:
+                resp = await client.get(f"{base}/rest/v1/availability_cache",
+                                        params={"id": f"eq.{row_id}", "select": "id,data"}, headers=headers)
+                status = f"HTTP {resp.status_code}"
+                rows = resp.json() if resp.status_code == 200 else []
+            except Exception as e:
+                rows, res["error"] = [], f"read failed: {e}"
+            if not rows:
+                res["error"] = res["error"] or f"no stored row {row_id} ({status})"
+                print(f"  SKIPPED {v.name}: {res['error']}")
+                continue
+            data = rows[0].get("data") or {}
+            existing_prices = data.get("court_prices", {}) or {}
+            existing_fetched_at = data.get("court_prices_fetched_at", {}) or {}
+            res["prices"], res["fetched_at"] = dict(existing_prices), dict(existing_fetched_at)
+
+            if not session:
+                res["error"] = "no PlayByPoint session (login failed)"
+            else:
+                try:
+                    async with _api(session["cookies"], slug) as api:
+                        api._user_id = session.get("user_id")
+                        for target in dates:
+                            date_errors = []
+                            blocks, res["prices"], res["fetched_at"] = await fetch_blocks_and_prices(
+                                api, fid, target, res["prices"], res["fetched_at"], errors=date_errors)
+                            ds = target.isoformat()
+                            if date_errors:
+                                res["failed_dates"].append(ds)
+                                res["error"] = res["error"] or date_errors[0][:300]
+                                print(f"  {slug} {ds}: FAILED ({len(date_errors)} error(s)) -- stored day kept")
+                            else:
+                                res["by_date"][ds] = blocks
+                                res["dates_ok"] += 1
+                                print(f"  {slug} {ds}: {len(blocks)} blocks")
+                            await asyncio.sleep(1)
+                    res["ok"] = res["dates_ok"] > 0
+                except Exception as e:
+                    res["error"] = f"{type(e).__name__}: {e}"
+                    print(f"  {v.name} FAILED: {res['error']}")
+
+            now_iso = datetime.now().astimezone().isoformat()
+            if not res["ok"]:
+                await merge(row_id, v.name, {"fetch_status": {
+                    "state": "failed", "at": now_iso, "error": res["error"],
+                    "dates_ok": res["dates_ok"], "failed_dates": res["failed_dates"]}})
+                print(f"  NOT SAVED {v.name}: fetch failed, existing courts left intact")
+                continue
+            today_str = date.today().isoformat()
+            stored = {d: b for d, b in (data.get("by_date") or {}).items() if str(d) >= today_str}
+            stored.update(res["by_date"])
+            total = sum(len(b) for b in stored.values() if isinstance(b, list))
+            state = "partial" if res["failed_dates"] else ("ok" if total else "ok_empty")
+            out = await merge(
+                row_id, v.name,
+                {"court_prices": res["prices"], "court_prices_fetched_at": res["fetched_at"],
+                 "fetch_status": {"state": state, "at": now_iso, "error": res["error"],
+                                  "dates_ok": res["dates_ok"], "failed_dates": res["failed_dates"],
+                                  "blocks": total}},
+                p_by_date=res["by_date"], prune_before=today_str)
+            if out is not None and not DRY_RUN:
+                print(f"Saved {slug}: {total} total blocks, {len(res['prices'])} prices cached"
+                      + (f"  [PARTIAL -- kept stored days {', '.join(res['failed_dates'])}]" if res["failed_dates"] else ""))
+
+    failed = [f for f, r in results.items() if not r["ok"]]
+    partial = [f for f, r in results.items() if r["ok"] and r["failed_dates"]]
+    print("=" * 60)
+    print(f"GEO SUMMARY  attempted={len(results)}  ok={len(results) - len(failed) - len(partial)}  "
+          f"partial={len(partial)}  failed={len(failed)}  save_failed={len(save_failed)}"
+          + ("  DRY RUN" if DRY_RUN else ""))
+    for f in failed:
+        print(f"  FAILED {f} {results[f]['name']} -- {results[f]['error']}")
+    for f in partial:
+        print(f"  PARTIAL {f} {results[f]['name']} -- kept {', '.join(results[f]['failed_dates'])}")
+    if save_failed or (results and len(failed) == len(results)):
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
