@@ -1,0 +1,27 @@
+name: Capture Roster Sightings
+
+on:
+  schedule:
+    # every 3 hours, offset off the top of the hour (GitHub drops on-the-hour runs)
+    - cron: '17 */3 * * *'
+  workflow_dispatch:
+
+jobs:
+  capture:
+    name: Capture PBP roster sightings
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install httpx curl_cffi python-dotenv loguru rich typer tenacity
+      - name: Capture roster sightings
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          PBP_COOKIES_JSON: ${{ secrets.PBP_COOKIES_JSON }}
+          ROSTER_DAYS_AHEAD: '21'
+        run: python capture_roster_sightings.py
