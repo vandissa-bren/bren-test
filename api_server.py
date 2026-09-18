@@ -142,6 +142,19 @@ app.add_middleware(
 # ── Supabase REST helper ─────────────────────────────────────────────────────
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://stwohmddmdwttasbyblt.supabase.co")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
+
+def _supabase_headers(extra: dict | None = None) -> dict:
+    """C15, 18 Sep 2026: send the Supabase key correctly (apikey for new-style
+    keys; Bearer only for legacy eyJ… keys). New-style sb_ keys are rejected on
+    Authorization: Bearer, which made _read_from_supabase return [] and blanked
+    court hire for the 5-min cache TTL before a lucky retry refilled it."""
+    h = {"apikey": SUPABASE_KEY}
+    if SUPABASE_KEY.startswith("eyJ"):
+        h["Authorization"] = f"Bearer {SUPABASE_KEY}"
+    if extra:
+        h.update(extra)
+    return h
+
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", SUPABASE_KEY)
 PROXY_URL = os.environ.get("PROXY_URL")  # e.g. http://user:pass@p.webshare.io:80
 
@@ -151,7 +164,6 @@ async def _read_from_supabase(platform: str) -> list[dict]:
     try:
         headers = {
             "apikey": SUPABASE_KEY,
-            "Authorization": f"Bearer {SUPABASE_KEY}",
         }
         url = f"{SUPABASE_URL}/rest/v1/availability_cache?select=data&platform=eq.{platform}"
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -696,7 +708,6 @@ async def debug_supabase():
     try:
         headers = {
             "apikey": SUPABASE_KEY,
-            "Authorization": f"Bearer {SUPABASE_KEY}",
         }
         url = f"{SUPABASE_URL}/rest/v1/availability_cache?select=id,platform,venue_name&limit=5"
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -833,8 +844,15 @@ async def pbp_availability(
                                       description="PickleMatch user, for personalised pricing"),
 ):
     """
-    Get court blocks + sessions for PBP venues via live API calls through residential proxy.
-    Falls back to Supabase cache if proxy calls fail.
+    Get court blocks + sessions for PBP venues from the Supabase cache.
+
+    NOTE (18 Sep 2026): despite the old wording here, this endpoint does NO
+    live PlayByPoint calls. Court data is fetched once by GitHub Actions
+    (fetch_court_blocks.py) and the geo droplet, written to availability_cache,
+    and this endpoint only READS it. The `"source": "live"` field below is a
+    historical label, not a live fetch. .117 is Cloudflare-blocked and cannot
+    fetch live anyway; its job here is to read Supabase and apply per-user
+    pricing (_personalise_prices), which the anon key cannot do from the app.
 
     When `user_id` is supplied, sessions where that member's price differs
     gain a `resolved_price`. `price` is never modified, so callers read
@@ -1079,7 +1097,6 @@ async def pbp_book_court(req: CourtBookingRequest):
     try:
         headers = {
             "apikey": SUPABASE_KEY,
-            "Authorization": f"Bearer {SUPABASE_KEY}",
         }
         url = f"{SUPABASE_URL}/rest/v1/pbp_credentials?user_id=eq.{req.user_id}&select=pbp_cookies,pbp_user_id,is_connected"
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -1177,7 +1194,6 @@ async def pbp_book(req: BookingRequest):
     try:
         headers = {
             "apikey": SUPABASE_KEY,
-            "Authorization": f"Bearer {SUPABASE_KEY}",
         }
         url = f"{SUPABASE_URL}/rest/v1/pbp_credentials?user_id=eq.{req.user_id}&select=pbp_cookies,pbp_user_id,is_connected,session_valid_until"
         async with httpx.AsyncClient(timeout=10.0) as client:
