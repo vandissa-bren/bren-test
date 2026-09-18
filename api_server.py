@@ -602,40 +602,23 @@ async def _get_pbp_availability(
 
 # ── Routes ──────────────────────────────────────────────────────────────────
 
-async def _warm_single_date(target, supabase_data=None):
-    """Pre-fill the in-memory cache for one date FROM STORED DATA.
-
-    R0(a), 17 Sep 2026. This used to call PlayByPoint live for every venue
-    (_get_pbp_availability): 21 venues x 7 dates every 10 minutes, all from
-    this droplet. PlayByPoint's Cloudflare now refuses this droplet's address
-    outright -- 403 on every request, public pages included -- so every warm
-    produced a week with no courts and cached it, and players saw court hire
-    blank for the whole week until the cache expired.
-
-    Stored court blocks (availability_cache.data.by_date) are kept fresh by the
-    scheduled court jobs, and the cache-miss path in pbp_availability already
-    serves them. The warm now builds exactly that response, so a player gets
-    the same courts whether the request hits the cache or misses it.
-
-    Nothing the app shows is lost: the old call also fetched today's live
-    sessions, but threw them away. _get_pbp_availability is deliberately left
-    in place, unused, so this can be reverted by restoring this function alone.
-    """
+async def _warm_single_date(target):
+    from datetime import date as date_type
     date_str = target.isoformat()
     cache_key = f"availability:{date_str}:00:00:23:30:all"
     if _cache_get(cache_key):
         return
+    cookies, user_id, _ = _load_session_with_env_fallback()
+    if not cookies:
+        return
     try:
-        if supabase_data is None:
-            supabase_data = await _read_from_supabase("playbypoint")
-        if not supabase_data:
-            # A failed or empty read is not an empty catalogue. Caching it
-            # would show a blank week for five minutes; leave the cache alone
-            # and let the next request try the read itself.
-            logger.warning(f"Warm skipped for {date_str}: no stored availability was read")
-            return
-        court_blocks_by_id = {r.get("id"): (r.get("by_date") or {}).get(date_str, [])
-                              for r in supabase_data}
+        from_sec, to_sec = _hhmm_to_sec("00:00"), _hhmm_to_sec("23:30")
+        results = await asyncio.gather(*[
+            _get_pbp_availability(fid, registry_name(fid), slug, target, from_sec, to_sec)
+            for fid, slug in active_slug_map().items()
+        ], return_exceptions=True)
+        court_blocks_by_id = {r["id"]: r.get("court_blocks", []) for r in results if isinstance(r, dict)}
+        supabase_data = await _read_from_supabase("playbypoint")
         output = []
         for r in supabase_data:
             vid = r.get("id")
@@ -652,11 +635,8 @@ async def _warm_cache():
     from datetime import date as date_type
     await asyncio.sleep(5)
     targets = [date_type.fromordinal(date_type.today().toordinal() + i) for i in range(7)]
-    # One stored read per cycle, not one per date: every date is built from the
-    # same rows. Read here rather than per date so a cycle is consistent.
-    supabase_data = await _read_from_supabase("playbypoint")
     for t in targets:
-        await _warm_single_date(t, supabase_data)
+        await _warm_single_date(t)
         await asyncio.sleep(3)
 
 async def _cache_refresh_loop():
@@ -692,29 +672,8 @@ class RefreshCookiesRequest(BaseModel):
 
 @app.post("/api/internal/refresh-cookies")
 async def refresh_cookies(req: RefreshCookiesRequest):
-    """Accept fresh PBP cookies pushed from the Windows machine.
-
-    C3 / A1c, 17 Sep 2026: FAILS CLOSED. The request model has always carried
-    a `secret`, but nothing checked it, and nginx passes this path through, so
-    anyone who found it could replace this server's PlayByPoint session.
-
-    A push is accepted only when INTERNAL_COOKIE_SECRET is set in this
-    server's environment AND the request's `secret` matches it. With the
-    variable unset -- the state on 17 Sep -- every push is refused, which is
-    the intended default: nothing has used this endpoint in 30 days, and the
-    only caller in any repository (refresh_cookies_server.py, unscheduled)
-    writes /app/.pbp_cookies.json first, which this server already reads.
-
-    The secret is never logged or echoed.
-    """
+    """Accept fresh PBP cookies pushed from the Windows machine."""
     global _runtime_cookies, _runtime_user_id, _runtime_email
-    import hmac
-    expected = os.environ.get("INTERNAL_COOKIE_SECRET", "")
-    supplied = req.secret or ""
-    if not expected or not hmac.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8")):
-        logger.warning("refresh-cookies refused: %s",
-                       "no INTERNAL_COOKIE_SECRET configured" if not expected else "secret did not match")
-        raise HTTPException(status_code=403, detail="Forbidden")
     try:
         data = json.loads(req.pbp_cookies_json)
         cookies = data.get("cookies", {})
@@ -1312,247 +1271,32 @@ class ConnectRequest(BaseModel):
 
 @app.post("/api/pbp/connect")
 async def pbp_connect(req: ConnectRequest):
-    import re
-    from curl_cffi.requests import AsyncSession
-    from playwright.async_api import async_playwright
-
+    # C9b, 18 Sep 2026: this server (.117) is Cloudflare-blocked and cannot
+    # reach PlayByPoint, so account connection is done on the booking server
+    # (.206), which is not blocked. We forward the request there and return its
+    # response unchanged, so the app -- which still calls this URL -- needs no
+    # change. The booking server does the login, stores pbp_credentials, and
+    # syncs memberships/rating. See booking_server.py /api/pbp/connect.
     try:
-        # Step 1: curl_cffi login
-        session = AsyncSession(impersonate="chrome124")
-        r = await session.get("https://app.playbypoint.com/users/sign_in")
-        csrf_match = re.search(r'<meta name="csrf-token" content="([^"]+)"', r.text)
-        if not csrf_match:
-            raise HTTPException(status_code=500, detail="Could not load PBP login page.")
-        token = csrf_match.group(1)
-        get_cookies = dict(r.cookies)
-
-        r2 = await session.post(
-            "https://app.playbypoint.com/users/sign_in",
-            json={"user": {"email": req.email, "password": req.password, "remember_me": "1"}},
-            headers={
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-                "X-CSRF-Token": token,
-                "X-Requested-With": "XMLHttpRequest",
-                "Referer": "https://app.playbypoint.com/users/sign_in",
-            },
-            cookies=get_cookies,
-        )
-        resp_json = r2.json() if r2.headers.get("content-type", "").startswith("application/json") else {}
-        if not resp_json.get("success"):
-            raise HTTPException(status_code=401, detail="Invalid PBP email or password.")
-
-        session_cookie = dict(r2.cookies).get("_paybycourt_session") or get_cookies.get("_paybycourt_session")
-        if not session_cookie:
-            raise HTTPException(status_code=401, detail="Login failed — no session cookie returned.")
-
-        # Step 2: Playwright loads home to get user_id
-        async with async_playwright() as pw:
-            browser = await pw.chromium.launch(headless=True)
-            context = await browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            )
-            await context.add_cookies([{
-                "name": "_paybycourt_session",
-                "value": session_cookie,
-                "domain": "app.playbypoint.com",
-                "path": "/",
-            }])
-            page = await context.new_page()
-            await page.goto("https://app.playbypoint.com/home", timeout=30000)
-            for _ in range(10):
-                await page.wait_for_timeout(2000)
-                title = (await page.title()).lower()
-                if "just a moment" not in title and "cloudflare" not in title:
-                    break
-            html = await page.content()
-            uid_match = re.search(r'"user_id"\s*:\s*(\d+)', html)
-            pbp_user_id = int(uid_match.group(1)) if uid_match else 0
-            pw_cookies = await context.cookies()
-            all_cookies = {c["name"]: c["value"] for c in pw_cookies}
-            await browser.close()
-
-        # Step 3: Upsert to Supabase
-        from datetime import datetime, timedelta
-        svc_headers = {
-            "apikey": SUPABASE_SERVICE_KEY,
-            "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
-            "Content-Type": "application/json",
-            "Prefer": "return=representation",
-        }
-        payload = {
-            "user_id": req.user_id,
-            "pbp_email": req.email,
-            "pbp_cookies": all_cookies,
-            "pbp_user_id": pbp_user_id,
-            "is_connected": True,
-            "last_synced_at": datetime.utcnow().isoformat(),
-            "session_valid_until": (datetime.utcnow() + timedelta(days=30)).isoformat(),
-        }
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            # Try PATCH first
-            resp = await client.patch(
-                f"{SUPABASE_URL}/rest/v1/pbp_credentials?user_id=eq.{req.user_id}",
-                headers=svc_headers,
-                json=payload,
-            )
-            # If no existing row, INSERT
-            if resp.status_code == 200 and resp.json() == []:
-                resp = await client.post(
-                    f"{SUPABASE_URL}/rest/v1/pbp_credentials",
-                    headers={**svc_headers, "Prefer": "return=minimal"},
-                    json=payload,
-                )
-            if resp.status_code not in (200, 201, 204):
-                raise HTTPException(status_code=500, detail=f"Failed to save credentials: {resp.text}")
-
-        # Step 4: Fetch DUPR ratings
-        dupr_rating = None
-        dupr_rating_doubles = None
-        dupr_rating_name = None
-        try:
-            from curl_cffi.requests import AsyncSession as _Session
-            _sess = _Session(impersonate="chrome124")
-            _r = await _sess.get(
-                f"https://app.playbypoint.com/api/users/{pbp_user_id}/ratings",
-                cookies=all_cookies,
-                headers={"Accept": "application/json", "X-Requested-With": "XMLHttpRequest"},
-            )
-            if _r.status_code == 200:
-                _ratings = _r.json().get("ratings", [])
-                _dupr = next((x for x in _ratings if x.get("provider") == "dupr"), None)
-                _nrp = next((x for x in _ratings if x.get("provider") == "ntrp_default"), None)
-                _best = _dupr or _nrp
-                if _best:
-                    dupr_rating = _best.get("single")
-                    dupr_rating_doubles = _best.get("double")
-                    dupr_rating_name = "DUPR" if _dupr else "NRP"
-            if dupr_rating is not None or dupr_rating_doubles is not None:
-                _upd = {}
-                if dupr_rating is not None: _upd["dupr_rating"] = dupr_rating
-                if dupr_rating_doubles is not None: _upd["dupr_rating_doubles"] = dupr_rating_doubles
-                if dupr_rating_name: _upd["dupr_rating_name"] = dupr_rating_name
-                async with httpx.AsyncClient(timeout=10.0) as _c:
-                    await _c.patch(
-                        f"{SUPABASE_URL}/rest/v1/pbp_credentials?user_id=eq.{req.user_id}",
-                        headers=svc_headers,
-                        json=_upd,
-                    )
-        except Exception:
-            pass
-        # Step 5: Sync memberships and rating via booking server (fire and forget).
-        # The inline DUPR fetch above (Step 4) uses cookies still mid-connection
-        # and can silently fail (broad except/pass, no logging). This call
-        # re-reads the now-persisted session cookies instead, which testing
-        # confirmed reliably works even when Step 4 doesn't -- so it's not
-        # just a duplicate, it's the actual fix for new users never getting
-        # a rating synced.
-        try:
-            async with httpx.AsyncClient(timeout=15.0) as _mc:
-                await _mc.post(f"https://booking.picklematch.com.au/api/sync_memberships/{req.user_id}")
-                await _mc.post(f"https://booking.picklematch.com.au/api/sync_rating/{req.user_id}")
-        except Exception:
-            pass
-
-        return {
-            "success": True,
-            "pbp_email": req.email,
-            "pbp_user_id": pbp_user_id,
-            "dupr_rating": dupr_rating,
-            "dupr_rating_doubles": dupr_rating_doubles,
-            "dupr_rating_name": dupr_rating_name,
-            "message": "PlayByPoint account connected successfully.",
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Connection failed: {e}")
-
-# ── Live session fetch for extended dates ─────────────────────────────────────
-def _extract_tiers(records):
-    """
-    Shape PBP pricing records for the resolver.
-
-    Field selection only -- no pricing decision is made here. Which tier
-    applies to a user is decided solely by the resolver in booking_server,
-    and this endpoint deliberately holds no part of that rule.
-
-    Mirrors the scraper's shaping in push_to_supabase.py. The two live in
-    separate repositories on separate hosts and cannot share code; keeping
-    them consistent is a small, visible cost, and far preferable to a second
-    copy of the matching logic.
-    """
-    out = []
-    for r in (records or []):
-        if not isinstance(r, dict) or r.get("hidden"):
-            continue
-        raw = r.get("price")
-        if raw is None or isinstance(raw, bool):
-            continue
-        try:
-            value = float(raw)
-        except (TypeError, ValueError):
-            continue
-        tier = {"price": value, "player_category": r.get("player_category")}
-        # lesson_unit must be carried: the resolver uses it to decide whether
-        # a programme-level price may be shown as a session price, and
-        # excludes anything unlabelled. Omitting it here meant live-scraped
-        # programme pricing was silently ineligible.
-        for key in ("allowed_affiliations", "lessons", "lesson_unit",
-                    "lesson_details", "time_unit",
-                    "time_range_start", "time_range_end"):
-            if r.get(key) is not None:
-                tier[key] = r.get(key)
-        out.append(tier)
-    return out
-
-
-async def _personalise_live_sessions(sessions, user_id):
-    """
-    Overlay `resolved_price` on live-scraped sessions.
-
-    Sends the tiers inline: these sessions were scraped just now and need
-    not be in availability_cache, so the resolver could not look them up.
-
-    Same batch endpoint and same frozen resolver as cached discovery, so
-    both paths price identically. An enhancement, never a dependency --
-    any failure returns the sessions untouched, because "search my member
-    venues" must keep working even when personalisation cannot.
-    """
-    if not user_id or not sessions:
-        return sessions
-
-    payload = [{"lesson_id": s["lesson_id"], "facility_id": s["facility_id"],
-                "price": s.get("price"), "price_tiers": s.get("price_tiers") or []}
-               for s in sessions if s.get("lesson_id") and s.get("facility_id")]
-    if not payload:
-        return sessions
-
-    try:
-        async with httpx.AsyncClient(timeout=6.0) as client:
+        async with httpx.AsyncClient(timeout=60.0) as client:
             r = await client.post(
-                f"{BOOKING_SERVER_URL}/api/resolve-prices",
-                json={"user_id": user_id, "sessions": payload},
-                headers={"X-Internal-Key": SUPABASE_SERVICE_KEY or ""},
+                f"{BOOKING_SERVER_URL}/api/pbp/connect",
+                json={"user_id": req.user_id, "email": req.email, "password": req.password},
             )
-        if r.status_code != 200:
-            # Logged, not silent: a non-2xx here previously produced exactly
-            # the same observable result as "this member has no discount",
-            # which made a broken call indistinguishable from correct
-            # behaviour.
-            print(f"live_sessions personalisation HTTP {r.status_code}: {r.text[:200]}", flush=True)
-            return sessions
-        resolved = (r.json() or {}).get("resolved") or {}
     except Exception as e:
-        print(f"live_sessions personalisation unavailable: {e}", flush=True)
-        return sessions
-
-    for s in sessions:
-        hit = resolved.get(str(s.get("lesson_id")))
-        if hit:
-            s["resolved_price"] = hit
-    return sessions
-
+        raise HTTPException(status_code=502, detail="Connect service unavailable, please try again.")
+    # pass the booking server's status + body straight back to the app
+    if r.status_code >= 400:
+        detail = "Could not connect account."
+        try:
+            detail = r.json().get("detail", detail)
+        except Exception:
+            pass
+        raise HTTPException(status_code=r.status_code, detail=detail)
+    try:
+        return r.json()
+    except Exception:
+        return {"success": True}
 
 @app.get("/api/live_sessions")
 async def live_sessions(
