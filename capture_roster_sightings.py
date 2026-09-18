@@ -89,7 +89,11 @@ def collect_target_sessions(catalogue: list[dict]) -> list[dict]:
                 continue
             seen.add(lid)
             out.append({"row_id": row_id, "lesson_id": lid, "date": date_str,
-                        "capacity": s.get("capacity")})
+                        "capacity": s.get("capacity"),
+                        "start": s.get("start"),
+                        "session_type": s.get("type") or s.get("category"),
+                        "price": s.get("price"),
+                        "status": s.get("status")})
     return out
 
 
@@ -128,7 +132,7 @@ async def main():
         print(f"Roster capture: {len(targets)} sessions, day window {DAYS_START}..{DAYS_AHEAD-1}")
 
         run_at = datetime.now(timezone.utc).isoformat()
-        observations, spot_updates, failures, empty, withppl = [], [], 0, 0, 0
+        observations, spot_updates, inv_observations, failures, empty, withppl = [], [], [], 0, 0, 0
         # One shared client session for all lesson_players calls.
         async with PlayByPointAPI(cookies=cookies, club_slug="thejar", **kw) as api:
             api._user_id = user_id
@@ -161,6 +165,20 @@ async def main():
                         "spots_left": left,
                         "status": "Full" if left == 0 else "Available",
                         "observed_at": run_at,
+                    })
+                    # inventory_snapshots observation — the durable demand-curve
+                    # history, now with venue + type so it can later be sliced by
+                    # venue / type / day / price band (analytics groundwork).
+                    inv_observations.append({
+                        "session_key": f"pbp-{t['lesson_id']}",
+                        "spots_left": left,
+                        "capacity": int(cap),
+                        "session_date": t.get("date"),
+                        "start_time": t.get("start"),
+                        "price": t.get("price"),
+                        "status": "Full" if left == 0 else "Available",
+                        "venue_id": t["row_id"],
+                        "session_type": t.get("session_type"),
                     })
                 await asyncio.sleep(0.3)
 
@@ -200,10 +218,27 @@ async def main():
             else:
                 print(f"  SPOTS RPC FAILED: HTTP {r.status_code} {r.text[:200]}")
 
+        # inventory_snapshots: the durable demand-curve history (server-side,
+        # complete every run — not browsing-dependent like the client write).
+        inv_written = 0
+        if inv_observations and not os.environ.get("SKIP_INVENTORY"):
+            r = await client.post(
+                f"{SUPABASE_URL}/rest/v1/rpc/record_inventory_snapshot",
+                headers=supabase_headers(),
+                json={"p_observations": inv_observations, "p_source": "pbp"},
+            )
+            if r.status_code == 200:
+                try:
+                    inv_written = int(r.json())
+                except Exception:
+                    inv_written = -1
+            else:
+                print(f"  INVENTORY RPC FAILED: HTTP {r.status_code} {r.text[:160]}")
+
         print("=" * 56)
         print(f"CAPTURE SUMMARY  sessions={len(targets)}  read_ok={withppl + empty}  "
               f"with_players={withppl}  empty={empty}  read_failed={failures}  "
-              f"rows_written={written}  spots_updated={spots_written}")
+              f"rows_written={written}  spots_updated={spots_written}  inv_snapshots={inv_written}")
         # Loud only if we read NOTHING at all (session dead / blocked).
         if targets and (withppl + empty) == 0:
             print("READ NOTHING FROM PLAYBYPOINT — session may be expired or blocked")
