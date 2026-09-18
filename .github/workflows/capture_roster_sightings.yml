@@ -2,13 +2,25 @@ name: Capture Roster Sightings
 
 on:
   schedule:
-    # every 3 hours, offset off the top of the hour (GitHub drops on-the-hour runs)
-    - cron: '17 */3 * * *'
+    # near: today + tomorrow, HOURLY -- fresh spots for players AND late-
+    # cancellation capture (the last observation lands close to each start)
+    - cron: '9 * * * *'
+    # mid: days 2-7, every 3 hours
+    - cron: '24 */3 * * *'
+    # far: days 8-21, once a day (far rosters barely move)
+    - cron: '39 5 * * *'
   workflow_dispatch:
+    inputs:
+      days_start:
+        description: 'First day offset (0=today)'
+        default: '0'
+      days_ahead:
+        description: 'Days ahead to capture'
+        default: '21'
 
 jobs:
   capture:
-    name: Capture PBP roster sightings
+    name: Capture PBP roster sightings + spots
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -18,10 +30,21 @@ jobs:
           python-version: '3.11'
       - name: Install dependencies
         run: pip install httpx curl_cffi python-dotenv loguru rich typer tenacity
-      - name: Capture roster sightings
+      - name: Capture roster sightings and refresh spots
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           PBP_COOKIES_JSON: ${{ secrets.PBP_COOKIES_JSON }}
-          ROSTER_DAYS_AHEAD: '21'
+          # near window (hourly) covers days 0-1; mid covers 2-7; far 8-21.
+          # workflow_dispatch overrides both via its inputs.
+          ROSTER_DAYS_START: >-
+            ${{ github.event_name == 'workflow_dispatch' && inputs.days_start
+                || (github.event.schedule == '9 * * * *' && '0')
+                || (github.event.schedule == '24 */3 * * *' && '2')
+                || '8' }}
+          ROSTER_DAYS_AHEAD: >-
+            ${{ github.event_name == 'workflow_dispatch' && inputs.days_ahead
+                || (github.event.schedule == '9 * * * *' && '2')
+                || (github.event.schedule == '24 */3 * * *' && '8')
+                || '22' }}
         run: python capture_roster_sightings.py
