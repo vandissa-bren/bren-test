@@ -36,6 +36,7 @@ PBP_BASE = os.environ.get("PBP_BASE_OVERRIDE") or "https://app.playbypoint.com"
 # Only capture rosters for sessions from today out to this many days ahead:
 # rosters for long-past sessions never change, and far-future ones are usually
 # empty. The band that actually moves is the near future.
+DAYS_START = int(os.environ.get("ROSTER_DAYS_START", "0"))
 DAYS_AHEAD = int(os.environ.get("ROSTER_DAYS_AHEAD", "21"))
 
 
@@ -59,20 +60,20 @@ async def read_catalogue(client) -> list[dict]:
     """The stored PBP catalogue: one row per venue, each with its sessions."""
     r = await client.get(
         f"{SUPABASE_URL}/rest/v1/availability_cache",
-        params={"select": "data", "platform": "eq.playbypoint"},
+        params={"select": "id,data", "platform": "eq.playbypoint"},
         headers=supabase_headers(),
     )
     if r.status_code != 200:
         print(f"  CATALOGUE READ FAILED: HTTP {r.status_code} {r.text[:200]}")
         return []
-    return [row["data"] for row in r.json() if row.get("data")]
+    return [(row["id"], row["data"]) for row in r.json() if row.get("data")]
 
 
 def collect_target_sessions(catalogue: list[dict]) -> list[dict]:
     """Every session with a lesson_id, in the near-future band, deduped by lesson_id."""
     today = datetime.now(timezone.utc).date()
     seen, out = set(), []
-    for venue in catalogue:
+    for row_id, venue in catalogue:
         for s in venue.get("sessions", []) or []:
             lid = s.get("lesson_id")
             if not lid or lid in seen:
@@ -82,10 +83,13 @@ def collect_target_sessions(catalogue: list[dict]) -> list[dict]:
                 d = datetime.strptime(date_str, "%Y-%m-%d").date() if date_str else None
             except Exception:
                 d = None
-            if d is not None and not (today <= d <= today.fromordinal(today.toordinal() + DAYS_AHEAD)):
+            lo = today.fromordinal(today.toordinal() + DAYS_START)
+            hi = today.fromordinal(today.toordinal() + DAYS_AHEAD - 1)
+            if d is not None and not (lo <= d <= hi):
                 continue
             seen.add(lid)
-            out.append({"lesson_id": lid, "date": date_str})
+            out.append({"row_id": row_id, "lesson_id": lid, "date": date_str,
+                        "capacity": s.get("capacity")})
     return out
 
 
@@ -121,10 +125,10 @@ async def main():
             print("No catalogue rows; nothing to capture.")
             sys.exit(1)
         targets = collect_target_sessions(catalogue)
-        print(f"Roster capture: {len(targets)} sessions in the next {DAYS_AHEAD} days")
+        print(f"Roster capture: {len(targets)} sessions, day window {DAYS_START}..{DAYS_AHEAD-1}")
 
         run_at = datetime.now(timezone.utc).isoformat()
-        observations, failures, empty, withppl = [], 0, 0, 0
+        observations, spot_updates, failures, empty, withppl = [], [], 0, 0, 0
         # One shared client session for all lesson_players calls.
         async with PlayByPointAPI(cookies=cookies, club_slug="thejar", **kw) as api:
             api._user_id = user_id
@@ -144,6 +148,20 @@ async def main():
                     "observed_at": run_at,
                     "players": players,           # [] here = genuinely empty (read OK)
                 })
+                # Count write-back: spots_left = capacity - roster size, when we
+                # know the capacity. This is the (previously dead) count refresh,
+                # served by the same fetch. Only sessions we READ contribute; a
+                # failed fetch never touches spots.
+                cap = t.get("capacity")
+                if cap is not None:
+                    left = max(0, int(cap) - len(players))
+                    spot_updates.append({
+                        "id": t["row_id"],
+                        "lesson_id": t["lesson_id"],
+                        "spots_left": left,
+                        "status": "Full" if left == 0 else "Available",
+                        "observed_at": run_at,
+                    })
                 await asyncio.sleep(0.3)
 
         # Send everything we read (including genuine empties -> departures) in
@@ -165,10 +183,27 @@ async def main():
                 print(f"  RPC FAILED: HTTP {r.status_code} {r.text[:200]}")
                 sys.exit(1)
 
+        # Count write-back through the session-level merge (M2), so only the
+        # named sessions' spots change -- never a whole-array overwrite (F30).
+        spots_written = 0
+        if spot_updates and not os.environ.get("SKIP_SPOTS"):
+            r = await client.post(
+                f"{SUPABASE_URL}/rest/v1/rpc/merge_session_spots",
+                headers=supabase_headers(),
+                json={"p_updates": spot_updates},
+            )
+            if r.status_code == 200:
+                try:
+                    spots_written = int(r.json())
+                except Exception:
+                    spots_written = -1
+            else:
+                print(f"  SPOTS RPC FAILED: HTTP {r.status_code} {r.text[:200]}")
+
         print("=" * 56)
         print(f"CAPTURE SUMMARY  sessions={len(targets)}  read_ok={withppl + empty}  "
               f"with_players={withppl}  empty={empty}  read_failed={failures}  "
-              f"rows_written={written}")
+              f"rows_written={written}  spots_updated={spots_written}")
         # Loud only if we read NOTHING at all (session dead / blocked).
         if targets and (withppl + empty) == 0:
             print("READ NOTHING FROM PLAYBYPOINT — session may be expired or blocked")
