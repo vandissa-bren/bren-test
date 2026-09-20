@@ -614,23 +614,40 @@ async def _get_pbp_availability(
 
 # ── Routes ──────────────────────────────────────────────────────────────────
 
-async def _warm_single_date(target):
-    from datetime import date as date_type
+async def _warm_single_date(target, supabase_data=None):
+    """Pre-fill the in-memory cache for one date FROM STORED DATA.
+
+    R0(a), 17 Sep 2026. This used to call PlayByPoint live for every venue
+    (_get_pbp_availability): 21 venues x 7 dates every 10 minutes, all from
+    this droplet. PlayByPoint's Cloudflare now refuses this droplet's address
+    outright -- 403 on every request, public pages included -- so every warm
+    produced a week with no courts and cached it, and players saw court hire
+    blank for the whole week until the cache expired.
+
+    Stored court blocks (availability_cache.data.by_date) are kept fresh by the
+    scheduled court jobs, and the cache-miss path in pbp_availability already
+    serves them. The warm now builds exactly that response, so a player gets
+    the same courts whether the request hits the cache or misses it.
+
+    Nothing the app shows is lost: the old call also fetched today's live
+    sessions, but threw them away. _get_pbp_availability is deliberately left
+    in place, unused, so this can be reverted by restoring this function alone.
+    """
     date_str = target.isoformat()
     cache_key = f"availability:{date_str}:00:00:23:30:all"
     if _cache_get(cache_key):
         return
-    cookies, user_id, _ = _load_session_with_env_fallback()
-    if not cookies:
-        return
     try:
-        from_sec, to_sec = _hhmm_to_sec("00:00"), _hhmm_to_sec("23:30")
-        results = await asyncio.gather(*[
-            _get_pbp_availability(fid, registry_name(fid), slug, target, from_sec, to_sec)
-            for fid, slug in active_slug_map().items()
-        ], return_exceptions=True)
-        court_blocks_by_id = {r["id"]: r.get("court_blocks", []) for r in results if isinstance(r, dict)}
-        supabase_data = await _read_from_supabase("playbypoint")
+        if supabase_data is None:
+            supabase_data = await _read_from_supabase("playbypoint")
+        if not supabase_data:
+            # A failed or empty read is not an empty catalogue. Caching it
+            # would show a blank week for five minutes; leave the cache alone
+            # and let the next request try the read itself.
+            logger.warning(f"Warm skipped for {date_str}: no stored availability was read")
+            return
+        court_blocks_by_id = {r.get("id"): (r.get("by_date") or {}).get(date_str, [])
+                              for r in supabase_data}
         output = []
         for r in supabase_data:
             vid = r.get("id")
@@ -647,8 +664,11 @@ async def _warm_cache():
     from datetime import date as date_type
     await asyncio.sleep(5)
     targets = [date_type.fromordinal(date_type.today().toordinal() + i) for i in range(7)]
+    # One stored read per cycle, not one per date: every date is built from the
+    # same rows. Read here rather than per date so a cycle is consistent.
+    supabase_data = await _read_from_supabase("playbypoint")
     for t in targets:
-        await _warm_single_date(t)
+        await _warm_single_date(t, supabase_data)
         await asyncio.sleep(3)
 
 async def _cache_refresh_loop():
@@ -684,8 +704,29 @@ class RefreshCookiesRequest(BaseModel):
 
 @app.post("/api/internal/refresh-cookies")
 async def refresh_cookies(req: RefreshCookiesRequest):
-    """Accept fresh PBP cookies pushed from the Windows machine."""
+    """Accept fresh PBP cookies pushed from the Windows machine.
+
+    C3 / A1c, 17 Sep 2026: FAILS CLOSED. The request model has always carried
+    a `secret`, but nothing checked it, and nginx passes this path through, so
+    anyone who found it could replace this server's PlayByPoint session.
+
+    A push is accepted only when INTERNAL_COOKIE_SECRET is set in this
+    server's environment AND the request's `secret` matches it. With the
+    variable unset -- the state on 17 Sep -- every push is refused, which is
+    the intended default: nothing has used this endpoint in 30 days, and the
+    only caller in any repository (refresh_cookies_server.py, unscheduled)
+    writes /app/.pbp_cookies.json first, which this server already reads.
+
+    The secret is never logged or echoed.
+    """
     global _runtime_cookies, _runtime_user_id, _runtime_email
+    import hmac
+    expected = os.environ.get("INTERNAL_COOKIE_SECRET", "")
+    supplied = req.secret or ""
+    if not expected or not hmac.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8")):
+        logger.warning("refresh-cookies refused: %s",
+                       "no INTERNAL_COOKIE_SECRET configured" if not expected else "secret did not match")
+        raise HTTPException(status_code=403, detail="Forbidden")
     try:
         data = json.loads(req.pbp_cookies_json)
         cookies = data.get("cookies", {})
@@ -1313,6 +1354,92 @@ async def pbp_connect(req: ConnectRequest):
         return r.json()
     except Exception:
         return {"success": True}
+
+# ── Live session fetch for extended dates ─────────────────────────────────────
+def _extract_tiers(records):
+    """
+    Shape PBP pricing records for the resolver.
+
+    Field selection only -- no pricing decision is made here. Which tier
+    applies to a user is decided solely by the resolver in booking_server,
+    and this endpoint deliberately holds no part of that rule.
+
+    Mirrors the scraper's shaping in push_to_supabase.py. The two live in
+    separate repositories on separate hosts and cannot share code; keeping
+    them consistent is a small, visible cost, and far preferable to a second
+    copy of the matching logic.
+    """
+    out = []
+    for r in (records or []):
+        if not isinstance(r, dict) or r.get("hidden"):
+            continue
+        raw = r.get("price")
+        if raw is None or isinstance(raw, bool):
+            continue
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            continue
+        tier = {"price": value, "player_category": r.get("player_category")}
+        # lesson_unit must be carried: the resolver uses it to decide whether
+        # a programme-level price may be shown as a session price, and
+        # excludes anything unlabelled. Omitting it here meant live-scraped
+        # programme pricing was silently ineligible.
+        for key in ("allowed_affiliations", "lessons", "lesson_unit",
+                    "lesson_details", "time_unit",
+                    "time_range_start", "time_range_end"):
+            if r.get(key) is not None:
+                tier[key] = r.get(key)
+        out.append(tier)
+    return out
+
+
+async def _personalise_live_sessions(sessions, user_id):
+    """
+    Overlay `resolved_price` on live-scraped sessions.
+
+    Sends the tiers inline: these sessions were scraped just now and need
+    not be in availability_cache, so the resolver could not look them up.
+
+    Same batch endpoint and same frozen resolver as cached discovery, so
+    both paths price identically. An enhancement, never a dependency --
+    any failure returns the sessions untouched, because "search my member
+    venues" must keep working even when personalisation cannot.
+    """
+    if not user_id or not sessions:
+        return sessions
+
+    payload = [{"lesson_id": s["lesson_id"], "facility_id": s["facility_id"],
+                "price": s.get("price"), "price_tiers": s.get("price_tiers") or []}
+               for s in sessions if s.get("lesson_id") and s.get("facility_id")]
+    if not payload:
+        return sessions
+
+    try:
+        async with httpx.AsyncClient(timeout=6.0) as client:
+            r = await client.post(
+                f"{BOOKING_SERVER_URL}/api/resolve-prices",
+                json={"user_id": user_id, "sessions": payload},
+                headers={"X-Internal-Key": SUPABASE_SERVICE_KEY or ""},
+            )
+        if r.status_code != 200:
+            # Logged, not silent: a non-2xx here previously produced exactly
+            # the same observable result as "this member has no discount",
+            # which made a broken call indistinguishable from correct
+            # behaviour.
+            print(f"live_sessions personalisation HTTP {r.status_code}: {r.text[:200]}", flush=True)
+            return sessions
+        resolved = (r.json() or {}).get("resolved") or {}
+    except Exception as e:
+        print(f"live_sessions personalisation unavailable: {e}", flush=True)
+        return sessions
+
+    for s in sessions:
+        hit = resolved.get(str(s.get("lesson_id")))
+        if hit:
+            s["resolved_price"] = hit
+    return sessions
+
 
 @app.get("/api/live_sessions")
 async def live_sessions(
