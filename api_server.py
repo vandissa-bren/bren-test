@@ -28,7 +28,7 @@ from typing import Optional
 import sys
 
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Query, HTTPException, Request
+from fastapi import FastAPI, Query, HTTPException, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -1327,7 +1327,7 @@ class ConnectRequest(BaseModel):
 
 
 @app.post("/api/pbp/connect")
-async def pbp_connect(req: ConnectRequest):
+async def pbp_connect(req: ConnectRequest, authorization: Optional[str] = Header(None)):
     # C9b, 18 Sep 2026: this server (.117) is Cloudflare-blocked and cannot
     # reach PlayByPoint, so account connection is done on the booking server
     # (.206), which is not blocked. We forward the request there and return its
@@ -1336,9 +1336,12 @@ async def pbp_connect(req: ConnectRequest):
     # syncs memberships/rating. See booking_server.py /api/pbp/connect.
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
+            # F129: pass the player's sign-in token through, so the booking server's
+            # guard can confirm the account being linked is the caller's own.
             r = await client.post(
                 f"{BOOKING_SERVER_URL}/api/pbp/connect",
                 json={"user_id": req.user_id, "email": req.email, "password": req.password},
+                headers={"Authorization": authorization} if authorization else None,
             )
     except Exception as e:
         raise HTTPException(status_code=502, detail="Connect service unavailable, please try again.")
