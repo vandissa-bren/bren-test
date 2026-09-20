@@ -93,7 +93,10 @@ def collect_target_sessions(catalogue: list[dict]) -> list[dict]:
                         "start": s.get("start"),
                         "session_type": s.get("type") or s.get("category"),
                         "price": s.get("price"),
-                        "status": s.get("status")})
+                        "status": s.get("status"),
+                        "title": s.get("title"),
+                        "program_slug": s.get("program_slug"),
+                        "skill_level": s.get("skill_level")})
     return out
 
 
@@ -151,6 +154,16 @@ async def main():
                     "session_date": t.get("date"),
                     "observed_at": run_at,
                     "players": players,           # [] here = genuinely empty (read OK)
+                    # the session's facts, stored with its roster so the history
+                    # survives the session leaving the catalogue (F114)
+                    "venue_id": t["row_id"],
+                    "start_time": t.get("start"),
+                    "session_type": t.get("session_type"),
+                    "title": t.get("title"),
+                    "program_slug": t.get("program_slug"),
+                    "skill_level": t.get("skill_level"),
+                    "price": t.get("price"),
+                    "capacity": t.get("capacity"),
                 })
                 # Count write-back: spots_left = capacity - roster size, when we
                 # know the capacity. This is the (previously dead) count refresh,
@@ -235,10 +248,26 @@ async def main():
             else:
                 print(f"  INVENTORY RPC FAILED: HTTP {r.status_code} {r.text[:160]}")
 
+        # Roster history upkeep (F114): fill any session facts still missing, and
+        # roll sightings older than 12 months into per-player counts. Idempotent,
+        # and does nothing when nothing is due. A failure here never fails the run.
+        upkeep = None
+        if not os.environ.get("SKIP_UPKEEP"):
+            r = await client.post(
+                f"{SUPABASE_URL}/rest/v1/rpc/maintain_roster_history",
+                headers=supabase_headers(),
+                json={},
+            )
+            if r.status_code == 200:
+                upkeep = r.json()
+            else:
+                print(f"  UPKEEP RPC FAILED: HTTP {r.status_code} {r.text[:160]}")
+
         print("=" * 56)
         print(f"CAPTURE SUMMARY  sessions={len(targets)}  read_ok={withppl + empty}  "
               f"with_players={withppl}  empty={empty}  read_failed={failures}  "
-              f"rows_written={written}  spots_updated={spots_written}  inv_snapshots={inv_written}")
+              f"rows_written={written}  spots_updated={spots_written}  inv_snapshots={inv_written}  "
+              f"upkeep={upkeep}")
         # Loud only if we read NOTHING at all (session dead / blocked).
         if targets and (withppl + empty) == 0:
             print("READ NOTHING FROM PLAYBYPOINT — session may be expired or blocked")
