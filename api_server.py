@@ -1448,128 +1448,39 @@ async def _personalise_live_sessions(sessions, user_id):
 async def live_sessions(
     facility_ids: str = Query(...),  # comma-separated facility IDs
     date: str = Query(...),          # YYYY-MM-DD
-    # Named pm_user_id, not the obvious alternative: this function already
-    # binds that shorter name to the PBP scraper id from the cookie file
-    # below, which silently overwrote the parameter and sent PBP's numeric
-    # id to the pricing service instead of the caller's UUID.
+    # Named pm_user_id, not the obvious alternative: this function once bound
+    # that shorter name to the PBP scraper id, which silently overwrote the
+    # parameter and sent PBP's numeric id to the pricing service.
     pm_user_id: Optional[str] = Query(None, alias="user_id",
                                       description="PickleMatch user, for personalised pricing"),
 ):
     """
-    Scrape sessions live from PBP for specific venues on a specific date.
+    "Search my member venues": every session at these venues on one date.
 
-    This backs the "search my member venues" feature, so it is precisely
-    where a member is most likely to be looking -- and it filtered member
-    pricing out entirely. With `user_id`, sessions priced differently for
-    that member gain `resolved_price`; `price` stays the public figure.
+    F130, 20 Sep 2026: this server (.117) is Cloudflare-blocked from PlayByPoint
+    (403 on every request), so the fetch that used to live here returned no
+    sessions at all. The booking server (.206), which PlayByPoint accepts, now
+    does the fetch (/api/live_sessions_raw, live_sessions_206.py) and returns
+    sessions in exactly the shape this endpoint always built. Member pricing
+    stays here, unchanged. Same move as account linking (C9b).
     """
-    import re
-    from extract_thejar import _extract_react_props_from_html
-
-    fids = [int(x.strip()) for x in facility_ids.split(",") if x.strip().isdigit()]
     target_date = datetime.strptime(date, "%Y-%m-%d").date()
     date_str = target_date.isoformat()
 
-    # Load system cookies
-    try:
-        with open("/app/.pbp_cookies.json") as f:
-            cookie_data = json.load(f)
-        cookies = cookie_data.get("cookies", {})
-        user_id = cookie_data.get("user_id", 0)
-    except Exception:
-        cookies = {}
-        user_id = 0
-
     all_sessions = []
-
-    for fid in fids:
-        slug = registry_slug(fid)
-        if not slug:
-            continue
-        try:
-            async with PlayByPointAPI(cookies=cookies, club_slug=slug, proxy=PROXY_URL) as api:
-                api._user_id = user_id
-                resp = await api._get_json(
-                    "/api/public/clinics",
-                    params={"search": "", "facility_id": fid, "per_page": 50},
-                )
-                stubs = (resp or {}).get("clinics") or [] if isinstance(resp, dict) else (resp or [])
-                for stub in stubs:
-                    clinic_id = stub.get("id")
-                    program_url = stub.get("url") or ""
-                    program_slug = program_url.split("/programs/")[-1] if "/programs/" in program_url else ""
-                    if not clinic_id or not program_slug:
-                        continue
-                    try:
-                        html = await api.program_detail_html(program_slug)
-                        props = _extract_react_props_from_html(html)
-                        lessons_raw = props.get("sessions") or props.get("clinic_lessons") or []
-                        raw_desc = props.get("description") or ""
-                        desc = re.sub(r"<[^>]+>", " ", raw_desc).strip()[:500]
-                        desc = re.sub(r"\s+", " ", desc)
-                        sl = stub.get("ntrp_str") or ""
-                        if not sl:
-                            mn = props.get("min_rating")
-                            mx = props.get("max_rating")
-                            if mn and mx:
-                                sl = f"{mn} / {mx}"
-                            elif mn:
-                                sl = f"{mn}+"
-                        price = ""
-                        for pl in (props.get("prices") or props.get("packages") or []):
-                            if not pl.get("hidden") and pl.get("price") and pl.get("player_category") != "member":
-                                p = float(pl["price"])
-                                price = f"${p:.0f}" if p == int(p) else f"${p:.2f}"
-                                break
-                        # The loop above skips every member record, which is
-                        # why this endpoint could never show a member price.
-                        # Keep them; `price` stays the public figure.
-                        program_tiers = _extract_tiers(
-                            (props.get("prices") or []) + (props.get("packages") or []))
-                        for lesson in lessons_raw:
-                            ld = lesson.get("lesson_date")
-                            if ld != date_str:
-                                continue
-                            lid = lesson.get("id")
-                            cap = lesson.get("capacity") or stub.get("capacity") or 0
-                            pc = lesson.get("player_count", 0)
-                            spots = max(0, cap - pc) if cap else None
-                            is_full = cap > 0 and spots == 0
-                            hs = lesson.get("hour_start", 0)
-                            he = lesson.get("hour_end", hs + 3600)
-                            lp = price
-                            for ip in (lesson.get("individual_prices") or []):
-                                if ip.get("price") and ip.get("player_category") != "member":
-                                    p = float(ip["price"])
-                                    lp = f"${p:.0f}" if p == int(p) else f"${p:.2f}"
-                                    break
-                            # Per-lesson tiers where the clinic prices per
-                            # session; otherwise the programme-level ones.
-                            lesson_tiers = _extract_tiers(
-                                lesson.get("individual_prices")) or program_tiers
-                            all_sessions.append({
-                                "facility_id": fid,
-                                "title": stub.get("name", "Session"),
-                                "type": stub.get("category") or "Session",
-                                "date": ld,
-                                "start": _sec_to_hhmm(hs),
-                                "end": _sec_to_hhmm(he),
-                                "price": lp,
-                                "spots_left": spots,
-                                "capacity": cap,
-                                "status": "Full" if is_full else "Available",
-                                "description": desc,
-                                "skill_level": sl,
-                                "lesson_id": lid,
-                                "clinic_id": clinic_id,
-                                "program_slug": program_slug,
-                                "price_tiers": lesson_tiers,
-                            })
-                    except Exception:
-                        continue
-        except Exception as e:
-            print(f"live_sessions error for {fid}: {e}", flush=True)
-            continue
+    try:
+        async with httpx.AsyncClient(timeout=75.0) as client:
+            r = await client.get(
+                f"{BOOKING_SERVER_URL}/api/live_sessions_raw",
+                params={"facility_ids": facility_ids, "date": date_str},
+                headers={"X-Internal-Key": SUPABASE_SERVICE_KEY or ""},
+            )
+        if r.status_code == 200:
+            all_sessions = (r.json() or {}).get("sessions") or []
+        else:
+            print(f"live_sessions: booking server HTTP {r.status_code}: {r.text[:200]}", flush=True)
+    except Exception as e:
+        print(f"live_sessions: booking server unavailable: {e}", flush=True)
 
     all_sessions = await _personalise_live_sessions(all_sessions, pm_user_id)
     return {"sessions": all_sessions, "date": date_str, "fetched_at": datetime.utcnow().isoformat()}
