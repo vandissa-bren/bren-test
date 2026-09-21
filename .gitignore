@@ -13,3 +13,7 @@ debug/
 *.bak
 *.bak-*
 *.keybak
+.availability_snapshot.json
+.pbp_cookies.json
+.gmail_token.json
+.env
