@@ -159,24 +159,72 @@ SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", SUPABASE_KEY)
 PROXY_URL = os.environ.get("PROXY_URL")  # e.g. http://user:pass@p.webshare.io:80
 
 
-async def _read_from_supabase(platform: str) -> list[dict]:
-    """Read cached availability data from Supabase REST API."""
+# ── the catalogue read, and the copy that covers a blip ─────────────────────
+# F136, 21 Sep 2026: a single failed read made this return [], and the
+# availability endpoint answered 200 with no venues in it — the app received a
+# valid, empty answer and showed "no sessions" (22:44 on 21 Sep, and twice
+# overnight). The catalogue was never the problem; both times it was full.
+#
+# So a read now RETRIES, and a read that still fails falls back to the last
+# answer that worked, kept in memory and on disk so a restart keeps it. Serving
+# a few minutes stale is right for a catalogue the scrape only refreshes daily,
+# and is certainly better than an empty page.
+#
+# An empty answer is only ever served when Supabase genuinely returns no rows,
+# which is a real state (and one watch_sessions.py on .206 reports).
+_LAST_GOOD_PATH = "/app/.availability_snapshot.json"
+_last_good: dict[str, list[dict]] = {}
+
+
+def _remember(platform: str, rows: list[dict]) -> None:
+    _last_good[platform] = rows
     try:
-        headers = {
-            "apikey": SUPABASE_KEY,
-        }
-        url = f"{SUPABASE_URL}/rest/v1/availability_cache?select=data&platform=eq.{platform}"
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(url, headers=headers)
-            logger.info(f"Supabase read {platform}: status={resp.status_code} rows={len(resp.json()) if resp.status_code == 200 else 'err'} url={url}")
+        with open(_LAST_GOOD_PATH, "w") as f:
+            json.dump({platform: rows}, f)
+    except Exception:
+        pass                                  # a snapshot that cannot be written is not fatal
+
+
+def _recall(platform: str) -> list[dict]:
+    if _last_good.get(platform):
+        return _last_good[platform]
+    try:
+        with open(_LAST_GOOD_PATH) as f:
+            rows = (json.load(f) or {}).get(platform) or []
+        if rows:
+            _last_good[platform] = rows
+        return rows
+    except Exception:
+        return []
+
+
+async def _read_from_supabase(platform: str, attempts: int = 3) -> list[dict]:
+    """Cached availability from Supabase. Retries, then the last good answer."""
+    headers = {"apikey": SUPABASE_KEY}
+    url = f"{SUPABASE_URL}/rest/v1/availability_cache?select=data&platform=eq.{platform}"
+    why = ""
+    for attempt in range(1, attempts + 1):
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.get(url, headers=headers)
             if resp.status_code == 200:
                 rows = resp.json()
                 result = [row["data"] for row in rows if row.get("data")]
                 logger.info(f"Supabase {platform}: {len(rows)} raw rows → {len(result)} with data")
+                if result:
+                    _remember(platform, result)
                 return result
-    except Exception as e:
-        logger.error(f"Supabase read error: {e}")
-    return []
+            why = f"HTTP {resp.status_code}"
+        except Exception as e:
+            why = f"{type(e).__name__}: {e}"
+        logger.warning(f"Supabase read {platform} attempt {attempt}/{attempts} failed ({why})")
+        if attempt < attempts:
+            await asyncio.sleep(0.5 * attempt)
+    fallback = _recall(platform)
+    logger.error(f"Supabase read error after {attempts} attempts ({why}) — "
+                 + (f"serving the last good copy ({len(fallback)} venues)" if fallback
+                    else "and there is no earlier copy to serve"))
+    return fallback
 
 # ── Slug map for saved venues ───────────────────────────────────────────────
 # In-memory cache for live court fetches (facility_id+date -> {blocks, expires})
