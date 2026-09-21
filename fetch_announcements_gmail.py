@@ -356,6 +356,11 @@ def main():
                     print(f"    + Stored and marked as read")
                     announcement_id = abs(hash(f"{facility_id}-{subject}-{sent_at}")) % (10**9)
                     extract_codes_from_text(body, venue_name, facility_id, announcement_id, sent_at)
+                    try:
+                        from promo_detect import store_candidate
+                        print("    promo: " + store_candidate(SUPABASE_URL, SUPABASE_KEY, f"gmail-{announcement_id}", facility_id, venue_name, subject, body, sent_at))
+                    except Exception as e:
+                        print(f"    promo check failed: {e}")
                 else:
                     print(f"    x Failed to store -- logged for review, left unread to retry")
                     log_unmatched(sender, subject, body, sent_at)
