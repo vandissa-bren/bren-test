@@ -9,9 +9,15 @@ offer ends and some hits are events rather than offers.
 
     detect(subject, body) -> dict | None
     store_candidate(supabase_url, key, announcement_id, facility_id, venue, subject, body, sent_at) -> str
+
+F142: a venue mentions the same offer in email after email (Melbourne Pickle Club's
+20% off memberships arrived three times in September). A follow-up ATTACHES to the
+offer already being tracked — recorded in its seen_announcements — instead of adding
+another row. Same venue, and either the same code, the same headline discount, or a
+title that reads the same.
 """
 from __future__ import annotations
-import re
+import difflib, re
 
 # An OFFER: something cheaper, free or extra. Prize pools and tournaments alone are not.
 OFFER = re.compile(
@@ -85,22 +91,89 @@ def detect(subject: str, body: str) -> dict | None:
     }
 
 
+def _same_offer(found: dict, subject: str, row: dict) -> str | None:
+    """Why this announcement is the offer `row` already tracks, or None.
+
+    A shared CODE is never enough on its own. Melbourne Pickle Club ran its
+    birthday open play and its 20% off memberships under one MPCTURNS1
+    campaign: two offers, two banners, two rows. The announcements must also
+    agree on WHAT is offered — the same kind, the same headline discount, or a
+    title that reads the same."""
+    # The headline signal: "20% off" twice at one venue is one offer, not two.
+    theirs = {s for s in (row.get("signals") or []) if "%" in s or "$" in s}
+    mine = {s for s in found["signals"] if "%" in s or "$" in s}
+    shared = theirs & mine if (theirs and mine) else set()
+
+    a, b = _norm(subject), _norm(row.get("title") or "")
+    alike = bool(a and b and difflib.SequenceMatcher(None, a, b).ratio() >= 0.6)
+    same_kind = bool(found.get("kind")) and found["kind"] == row.get("kind")
+
+    code = (found.get("code") or "").upper()
+    if code and (row.get("code") or "").upper() == code:
+        if shared:
+            return f"same code {code}, same offer ({', '.join(sorted(shared))})"
+        if same_kind or alike:
+            return f"same code {code}"
+        return None            # one campaign code over two different offers
+    if shared:
+        return f"same offer ({', '.join(sorted(shared))})"
+    if alike:
+        return "the same announcement, sent again"
+    return None
+
+
+def _norm(t: str) -> str:
+    """Titles for comparison: no emoji, punctuation or filler."""
+    t = re.sub(r"[^a-z0-9 ]+", " ", (t or "").lower())
+    return re.sub(r"\b(the|a|an|is|are|for|at|on|in|our|your|new|now|this|week|and)\b", " ", t).strip()
+
+
 def store_candidate(supabase_url: str, service_key: str, announcement_id: str, facility_id: int,
                     venue: str, subject: str, body: str, sent_at: str, client=None) -> str:
-    """Add a candidate for this announcement. Idempotent: one per announcement id."""
+    """Add a candidate for this announcement, unless the offer is already tracked.
+    Idempotent: one row per announcement id, one row per offer."""
     found = detect(subject, body)
     if not found:
         return "no offer"
     import httpx
+    hdr = {"apikey": service_key, "Authorization": f"Bearer {service_key}",
+           "Content-Type": "application/json"}
+    get = (client or httpx).get
+    post = (client or httpx).post
+    patch = (client or httpx).patch
+
+    # Is this the same offer as one already on the shortlist for this venue?
+    try:
+        r = get(f"{supabase_url}/rest/v1/promos", headers=hdr, timeout=20, params={
+            "select": "id,title,code,signals,seen_announcements,status",
+            "facility_id": f"eq.{facility_id}",
+            "status": "in.(candidate,live)"})
+        existing = r.json() if r.status_code == 200 else []
+    except Exception:
+        existing = []
+    for row in existing:
+        why = _same_offer(found, subject, row)
+        if not why:
+            continue
+        seen = list(row.get("seen_announcements") or [])
+        if announcement_id in seen:
+            return f"already tracked ({why})"
+        seen.append(announcement_id)
+        try:
+            patch(f"{supabase_url}/rest/v1/promos", headers={**hdr, "Prefer": "return=minimal"},
+                  params={"id": f"eq.{row['id']}"}, json={"seen_announcements": seen}, timeout=20)
+        except Exception:
+            pass
+        return f"attached to the offer already tracked ({why})"
+
     row = {"facility_id": facility_id, "venue_name": venue, "title": (subject or "Offer")[:120],
            "summary": found["summary"], "kind": found["kind"], "code": found["code"],
            "signals": found["signals"], "ends_hint": found["ends_hint"],
            "status": "candidate", "source": "announcement", "announcement_id": announcement_id,
-           "starts_at": sent_at}
-    hdr = {"apikey": service_key, "Authorization": f"Bearer {service_key}",
-           "Content-Type": "application/json", "Prefer": "resolution=ignore-duplicates,return=minimal"}
-    post = (client or httpx).post
-    r = post(f"{supabase_url}/rest/v1/promos?on_conflict=announcement_id", headers=hdr, json=row, timeout=20)
+           "seen_announcements": [announcement_id], "starts_at": sent_at}
+    r = post(f"{supabase_url}/rest/v1/promos?on_conflict=announcement_id",
+             headers={**hdr, "Prefer": "resolution=ignore-duplicates,return=minimal"},
+             json=row, timeout=20)
     if r.status_code in (200, 201, 204):
         return f"candidate ({found['kind']}: {', '.join(found['signals'][:3])})"
     return f"candidate NOT stored (HTTP {r.status_code}: {r.text[:120]})"
