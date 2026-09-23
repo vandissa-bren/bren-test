@@ -1546,8 +1546,13 @@ async def get_announcements(facility_id: int):
             f"{SUPABASE_URL}/rest/v1/announcements",
             params={
                 "facility_id": f"eq.{facility_id}",
+                # Newest first by when it arrived. `announcement_id` is
+                # abs(hash(...)) in fetch_announcements_gmail.py, so ordering
+                # by it was effectively random. `hidden` is the What's On off
+                # switch; the venue page should honour it too.
+                "hidden": "eq.false",
                 "select": "announcement_id,title,date_str,body_html,body_text,url,fetched_at",
-                "order": "announcement_id.desc",
+                "order": "fetched_at.desc",
                 "limit": "20",
             },
             headers=headers,
