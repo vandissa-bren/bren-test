@@ -230,53 +230,7 @@ async def _read_from_supabase(platform: str, attempts: int = 3) -> list[dict]:
 # In-memory cache for live court fetches (facility_id+date -> {blocks, expires})
 _live_courts_cache: dict[str, dict] = {}
 
-PBP_SLUG_MAP: dict[int, str] = {
-    597:  "nplpickleball",
-    885:  "sportswellpickleballpalace",
-    1009: "easternindoorpickleballclub",
-    1379: "pickleholic",
-    1355: "statepickleballcentre",
-    1383: "MelbournePickleClub",
-    1485: "picklehaus",
-    755:  "leveluppickleballknoxcity",
-    1584: "theroompickleball",
-    1461: "therealdill",
-    1532: "pickleplex",
-    1557: "dinkndrivepickleballclub",
-    1119: "swingandserve",
-    1487: "Pickle-Playground",
-    1664: "TheRallyPickleball",
-    1714: "RunwayPickleball",
-    1733: "pickleballpowerhouse",
-    1696: "picklezone",
-    1770: "rayapickleballclub",
-    1783: "PICKLE4REAL",
-    1883: "TheJarHQ",
-}
 
-VENUE_NAMES: dict[int, str] = {
-    597:  "The Jar | South Melbourne",
-    885:  "SportsWell | Pickleball Palace",
-    1009: "Eastern Indoor Pickleball Club",
-    1379: "PICKLEHOLIC",
-    1355: "State Pickleball Centre",
-    1383: "Melbourne Pickle Club",
-    1485: "Pickle Haus",
-    755:  "Level Up Pickleball Knox City",
-    1584: "The Room Pickleball",
-    1461: "The Real Dill | Ravenhall",
-    1532: "PicklePlex",
-    1557: "Dink & Drive Pickleball Club",
-    1119: "Swing & Serve",
-    1487: "Pickle Playground",
-    1664: "The Rally Pickleball | Altona",
-    1714: "Runway Pickleball",
-    1733: "Pickleball Powerhouse",
-    1696: "Picklezone",
-    1770: "Raya Pickleball Club",
-    1783: "PICKLE4REAL",
-    1883: "The Jar HQ | Maidstone",
-}
 
 VENUE_SURFACES: dict[int, list[str]] = {
     885: ["pickleball"],
@@ -294,9 +248,8 @@ VENUE_SURFACES: dict[int, list[str]] = {
 
 # ── Venue identity ──────────────────────────────────────────────────────────
 #
-# PBP_SLUG_MAP / VENUE_NAMES above are superseded by venue_registry and have
-# no remaining consumers. They are kept only until the scrapers and frontend
-# have migrated too, then deleted. Do not add to them.
+# Every venue comes from venue_registry, which reads the one list the site
+# publishes (frontend public/venues.json). This file keeps no venue list.
 
 def registry_slug(facility_id) -> str | None:
     """
