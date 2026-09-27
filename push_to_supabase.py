@@ -35,55 +35,12 @@ SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 PROXY_URL = os.environ.get("PROXY_URL") or None
 DAYS_AHEAD = 14
 
-PBP_SLUG_MAP: dict[int, str] = {
-    597:  "nplpickleball",
-    885:  "sportswellpickleballpalace",
-    1009: "easternindoorpickleballclub",
-    1379: "pickleholic",
-    1355: "statepickleballcentre",
-    1383: "MelbournePickleClub",
-    1485: "picklehaus",
-    755:  "leveluppickleballknoxcity",
-    1584: "theroompickleball",
-    1461: "therealdill",
-    1532: "pickleplex",
-    1557: "dinkndrivepickleballclub",
-    1119: "swingandserve",
-    1487: "Pickle-Playground",
-    1664: "TheRallyPickleball",
-    1714: "RunwayPickleball",
-    1733: "pickleballpowerhouse",
-    1770: "rayapickleballclub",
-    1783: "PICKLE4REAL",
-    1696: "picklezone",
-    1883: "TheJarHQ",
-    1826: "pickleballparadise",
-}
-
-VENUE_NAMES: dict[int, str] = {
-    597:  "The Jar | South Melbourne",
-    885:  "SportsWell | Pickleball Palace",
-    1009: "Eastern Indoor Pickleball Club",
-    1379: "PICKLEHOLIC",
-    1355: "State Pickleball Centre",
-    1383: "Melbourne Pickle Club",
-    1485: "Pickle Haus",
-    755:  "Level Up Pickleball Knox City",
-    1584: "The Room Pickleball",
-    1461: "The Real Dill | Ravenhall",
-    1532: "PicklePlex",
-    1557: "Dink & Drive Pickleball Club",
-    1119: "Swing & Serve",
-    1487: "Pickle Playground",
-    1664: "The Rally Pickleball | Altona",
-    1714: "Runway Pickleball",
-    1733: "Pickleball Powerhouse",
-    1770: "Raya Pickleball Club",
-    1783: "PICKLE4REAL",
-    1696: "Picklezone",
-    1883: "The Jar HQ | Maidstone",
-    1826: "Pickleball Paradise",
-}
+# The venues to scrape: every active Play By Point venue in the one list the
+# site publishes (frontend public/venues.json), read through venue_registry.
+# To add a venue, add it there -- nothing here needs editing.
+import venue_registry as _registry
+PBP_SLUG_MAP: dict[int, str] = {v.facility_id: v.slug for v in _registry.active_venues()}
+VENUE_NAMES: dict[int, str] = {v.facility_id: v.name for v in _registry.active_venues()}
 
 
 def _sec_to_hhmm(sec: int) -> str:
