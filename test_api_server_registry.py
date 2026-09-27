@@ -8,7 +8,9 @@ Does not import api_server (it opens network clients and needs live env), so
 it checks the source for map consumers and exercises the registry helpers
 directly against the same snapshot the server loads.
 """
-import re, sys
+import os, re, sys
+# The committed venues.json, not the live site, so results do not depend on the network.
+os.environ.setdefault("VENUE_SOURCE_URL", "")
 import venue_registry as reg
 
 failures = []
@@ -23,8 +25,8 @@ print("\n-- no venue map consumers remain (criterion 3) --")
 for name in ("PBP_SLUG_MAP", "VENUE_NAMES"):
     hits = re.findall(rf"{name}\.(get|items|values|keys)|{name}\[", code)
     check(f"no {name} reads", not hits, hits)
-    check(f"{name} still defined (deleted after ALL consumers migrate)",
-          f"{name}" in code)
+    check(f"{name} deleted now that every consumer reads the registry",
+          not re.search(rf"^{name}\b", code, re.M))
 check("helpers are used instead",
       code.count("registry_slug(") + code.count("active_slug_map(")
       + code.count("registry_name(") + code.count("bookable_slug(") >= 8)
@@ -42,7 +44,7 @@ check("no facility map is keyed by clinic_id",
       "PBP_SLUG_MAP.get(req.clinic_id" not in code)
 
 print("\n-- registry helpers behave (criteria 4, 5) --")
-check("active_slug_map covers 21 venues", len(reg.active_venues()) == 21)
+check("active_slug_map covers 22 venues", len(reg.active_venues()) == 22)
 check("SportsWell is included (absent from the scraper's own map)",
       885 in {v.facility_id for v in reg.active_venues()})
 check("delisted 1826 excluded from active",
