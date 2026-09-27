@@ -168,15 +168,41 @@ def extract_body(msg):
     return body[:2000]
 
 
+def _norm_slug(x):
+    return x.lower().replace("-", "").replace("_", "")
+
+
+def _registry_venue_for_sender(slug):
+    """
+    A venue not in the maps above, recognised by its Play By Point slug from
+    the one venue list (venue_registry). PBP sends a venue's emails from
+    <slug>@playbypoint.com, so a newly added venue is matched without editing
+    this file. The hand-written maps still win: they carry aliases and the
+    names existing announcements were stored under.
+    """
+    try:
+        import venue_registry
+        for v in venue_registry.active_venues():
+            if _norm_slug(v.slug) == slug:
+                return v
+    except Exception as e:
+        print(f"    venue_registry unavailable ({e})")
+    return None
+
+
 def extract_venue_name(sender, subject, body):
     # Some venues send via a subdomain (e.g. mailing.playbypoint.com) rather
     # than the bare domain -- match either.
     sender_match = re.search(r"([\w\-]+)@(?:[\w\-]+\.)?playbypoint\.com", sender)
     if sender_match:
-        slug = sender_match.group(1).lower().replace("-", "").replace("_", "")
+        slug = _norm_slug(sender_match.group(1))
         for key, name in VENUE_NAME_MAP.items():
-            if key.lower().replace("-", "").replace("_", "") == slug:
+            if _norm_slug(key) == slug:
                 return name
+        v = _registry_venue_for_sender(slug)
+        if v:
+            FACILITY_ID_MAP.setdefault(v.name, v.facility_id)
+            return v.name
     first_line = body.strip().split("\n")[0].strip()
     for name in FACILITY_ID_MAP:
         if name.lower() in first_line.lower() or first_line.lower() in name.lower():
