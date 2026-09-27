@@ -20,15 +20,10 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://stwohmddmdwttasbyblt.supa
 # a file that went to a public repo.
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 
-PBP_SLUG_MAP = {
-    597: "nplpickleball", 885: "sportswellpickleballpalace", 1009: "easternindoorpickleballclub",
-    1379: "pickleholic", 1355: "statepickleballcentre", 1383: "MelbournePickleClub",
-    1485: "picklehaus", 755: "leveluppickleballknoxcity", 1584: "theroompickleball",
-    1461: "therealdill", 1532: "pickleplex", 1557: "dinkndrivepickleballclub",
-    1119: "swingandserve", 1487: "Pickle-Playground", 1664: "TheRallyPickleball",
-    1714: "RunwayPickleball", 1733: "pickleballpowerhouse", 1770: "rayapickleballclub",
-    1783: "PICKLE4REAL", 1696: "picklezone",
-}
+# Slugs come from venue_registry (the site's public/venues.json). A venue it
+# does not know is skipped -- never sent with another venue's slug, which is
+# what the old `.get(fid, "nplpickleball")` default did for 15 of 22 venues.
+import venue_registry
 
 def _load_cookies():
     raw = os.environ.get("PBP_COOKIES_JSON", "")
@@ -92,7 +87,11 @@ async def main():
 
     for record in records:
         fid = record["data"].get("id")
-        slug = PBP_SLUG_MAP.get(fid, "nplpickleball")
+        v = venue_registry.resolve(fid)
+        if not isinstance(v, venue_registry.Venue) or v.status != "active":
+            print(f"  skipping {fid}: not an active venue in the registry")
+            continue
+        slug = v.slug
         name = record["data"].get("name", str(fid))
         sessions_today = [s for s in record["data"].get("sessions", []) if s.get("date") in date_strs]
         if not sessions_today:
