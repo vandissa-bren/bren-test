@@ -4,7 +4,9 @@ registry and that fetcher routing partitions the estate.
 
 Run: python3 test_scraper_registry.py
 """
-import re, sys
+import os, re, sys
+# The committed venues.json, not the live site, so results do not depend on the network.
+os.environ.setdefault("VENUE_SOURCE_URL", "")
 import venue_registry as reg
 
 failures = []
