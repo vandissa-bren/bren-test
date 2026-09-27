@@ -18,58 +18,10 @@ DAYS_START = int(os.environ.get("DAYS_START", "0"))
 # forever. Catches rate changes and promos starting/ending automatically.
 PRICE_REFRESH_HOURS = int(os.environ.get("PRICE_REFRESH_HOURS", "24"))
 
-PBP_SLUG_MAP = {
-    597:  "nplpickleball",
-    1009: "easternindoorpickleballclub",
-    1379: "pickleholic",
-    1355: "statepickleballcentre",
-    1383: "MelbournePickleClub",
-    1485: "picklehaus",
-    755:  "leveluppickleballknoxcity",
-    1584: "theroompickleball",
-    1461: "therealdill",
-    1532: "pickleplex",
-    1557: "dinkndrivepickleballclub",
-    1119: "swingandserve",
-    1487: "Pickle-Playground",
-    1664: "TheRallyPickleball",
-    1714: "RunwayPickleball",
-    1733: "pickleballpowerhouse",
-    1696: "picklezone",
-    1770: "rayapickleballclub",
-    1783: "PICKLE4REAL",
-    1883: "TheJarHQ",
-    1826: "pickleballparadise",
-}
 
-VENUE_NAMES = {
-    597:  "The Jar | South Melbourne",
-    1009: "Eastern Indoor Pickleball Club",
-    1379: "PICKLEHOLIC",
-    1355: "State Pickleball Centre",
-    1383: "Melbourne Pickle Club",
-    1485: "Pickle Haus",
-    755:  "Level Up Pickleball Knox City",
-    1584: "The Room Pickleball",
-    1461: "The Real Dill | Ravenhall",
-    1532: "PicklePlex",
-    1557: "Dink & Drive Pickleball Club",
-    1119: "Swing & Serve",
-    1487: "Pickle Playground",
-    1664: "The Rally Pickleball | Altona",
-    1714: "Runway Pickleball",
-    1733: "Pickleball Powerhouse",
-    1696: "Picklezone",
-    1770: "Raya Pickleball Club",
-    1783: "Pickle4Real",
-    1883: "The Jar HQ | Maidstone",
-    1826: "Pickleball Paradise",
-}
 
 # Venues that use non-pickleball surface names for court hire
-# PBP_SLUG_MAP and VENUE_NAMES above are superseded by venue_registry and
-# have no remaining consumers here. Kept until the frontend migrates too,
-# then deleted. Do not add to them.
+# Venues come from venue_registry (the site's public/venues.json).
 
 def _venue_name(facility_id) -> str:
     import venue_registry
