@@ -17,6 +17,8 @@ DAYS_START = int(os.environ.get("DAYS_START", "0"))
 # How old a cached price can get before we refetch it, instead of trusting it
 # forever. Catches rate changes and promos starting/ending automatically.
 PRICE_REFRESH_HOURS = int(os.environ.get("PRICE_REFRESH_HOURS", "24"))
+# Court-hire log rows per record_court_slots call.
+COURT_LOG_CHUNK = 2000
 
 
 
@@ -63,17 +65,32 @@ def get_shift(sec: int, target_date: date = None) -> str:
     return shift
 
 
-async def fetch_blocks_for_surface(api, facility_id: int, target_date: date, surface: str, errors: list = None) -> tuple:
+async def fetch_blocks_for_surface(api, facility_id: int, target_date: date, surface: str, errors: list = None, universe: dict = None) -> tuple:
     """Fetch court_slots for one surface type. Returns ({court_key: [secs]}, {sec: real_pbp_shift}).
 
     C5, 17 Sep 2026: any error is also appended to `errors` when a list is
     given, so the caller can tell an incomplete day from a genuinely empty one.
+
+    Court-hire log, 2 Oct 2026: when `universe` is a dict, every slot of the day
+    PlayByPoint lists -- free OR taken -- is recorded into it as {sec: shift}.
+    A taken slot is the one the log needs most, and it never reaches
+    court_slots, which holds free courts only.
     """
     court_slots = {}
     sec_shift_map = {}
     try:
         hours_data = await api.available_hours(facility_id, target_date, surface=surface)
         all_slots = (hours_data or {}).get("available_hours", []) if isinstance(hours_data, dict) else []
+
+        if universe is not None:
+            for s in all_slots:
+                if isinstance(s, dict) and isinstance(s.get("seconds_from_midnight"), (int, float)):
+                    shift = s.get("shift")
+                    if shift and target_date.weekday() >= 5:
+                        shift = f"{shift}_weekend"
+                    sec = int(s["seconds_from_midnight"])
+                    if shift or sec not in universe:
+                        universe[sec] = shift
 
         valid_secs = []
         for s in all_slots:
@@ -304,7 +321,48 @@ def apply_prices_to_blocks(blocks: list, court_prices: dict) -> list:
     return result
 
 
-async def fetch_court_blocks_for_venue(api, facility_id: int, target_date: date, user_id: int, existing_prices: dict, existing_fetched_at: dict = None, errors: list = None) -> tuple:
+def court_slot_rows(facility_id, target_date: date, universe: dict, court_slots: dict,
+                    valid_ids: set, observed_at: datetime, now_local: datetime = None) -> list:
+    """The court-hire log rows for one venue-day: one per 30-minute slot.
+
+    universe     {sec: shift} -- every slot PlayByPoint listed, free or taken
+    court_slots  {"court_id|name": [secs free]} -- from fetch_blocks_for_surface
+    valid_ids    the venue's bookable court ids (its inventory)
+
+    Slots that have already started are left out: PlayByPoint stops offering a
+    started slot, and logging it would record a booking that never happened.
+    Courts outside the inventory are left out, the same rule the blocks follow.
+    """
+    now_local = now_local or datetime.now(ZoneInfo("Australia/Melbourne"))
+    free_by_sec: dict = {}
+    for court_key, secs in court_slots.items():
+        court_id = court_key.split("|", 1)[0]
+        if str(court_id) not in valid_ids:
+            continue
+        for sec in secs:
+            free_by_sec.setdefault(int(sec), set()).add(str(court_id))
+
+    rows = []
+    for sec in sorted(set(universe) | set(free_by_sec)):
+        if target_date == now_local.date():
+            now_sec = now_local.hour * 3600 + now_local.minute * 60 + now_local.second
+            if sec <= now_sec:
+                continue
+        elif target_date < now_local.date():
+            continue
+        rows.append({
+            "facility_id": int(facility_id),
+            "slot_date": target_date.isoformat(),
+            "slot_start": sec_to_hhmm(sec),
+            "free_court_ids": sorted(free_by_sec.get(sec, set())),
+            "n_courts": len(valid_ids),
+            "shift": universe.get(sec),
+            "observed_at": observed_at.isoformat(),
+        })
+    return rows
+
+
+async def fetch_court_blocks_for_venue(api, facility_id: int, target_date: date, user_id: int, existing_prices: dict, existing_fetched_at: dict = None, errors: list = None, slot_log: list = None) -> tuple:
     """
     Fetch available court blocks for one venue on one date.
     Returns (blocks_with_prices, updated_court_prices, updated_fetched_at).
@@ -314,6 +372,10 @@ async def fetch_court_blocks_for_venue(api, facility_id: int, target_date: date,
     empty return with no errors means the venue genuinely has nothing free;
     an empty return WITH errors means the day could not be read, and the
     caller must not store it.
+
+    Court-hire log, 2 Oct 2026: when `slot_log` is a list, this day's slot rows
+    (court_slot_rows) are appended to it. The caller keeps them only when the
+    day read without errors -- a court we failed to read must never look booked.
     """
     try:
         # Surfaces come from the reviewed classification, not from
@@ -353,12 +415,19 @@ async def fetch_court_blocks_for_venue(api, facility_id: int, target_date: date,
 
         combined_slots: dict = {}
         combined_shift_map: dict = {}
+        universe: dict = {}
+        observed_at = datetime.now(timezone.utc)
         for surface in surfaces:
-            slots, sec_shift_map = await fetch_blocks_for_surface(api, facility_id, target_date, surface, errors)
+            slots, sec_shift_map = await fetch_blocks_for_surface(
+                api, facility_id, target_date, surface, errors, universe=universe)
             for k, v in slots.items():
                 combined_slots.setdefault(k, []).extend(v)
             combined_shift_map.update(sec_shift_map)
             await asyncio.sleep(0.5)
+
+        if slot_log is not None:
+            slot_log.extend(court_slot_rows(
+                facility_id, target_date, universe, combined_slots, valid_ids, observed_at))
 
         blocks = court_slots_to_blocks(combined_slots, combined_shift_map)
         before = len(blocks)
@@ -420,6 +489,7 @@ async def main():
             records_by_fid[fid] = record
 
     results_by_venue = {}
+    court_log_rows: list = []
 
     # Venue selection comes from the registry, which is also what decides
     # this scraper is responsible for them. SportsWell, Raya and Pickle4Real
@@ -454,10 +524,14 @@ async def main():
                 for target_date in dates:
                     date_str = target_date.isoformat()
                     date_errors = []
+                    day_slot_rows = []
                     blocks, updated_prices, updated_fetched_at = await fetch_court_blocks_for_venue(
                         api, fid, target_date, user_id, updated_prices, updated_fetched_at,
-                        errors=date_errors,
+                        errors=date_errors, slot_log=day_slot_rows,
                     )
+                    # Court-hire log: only a day read without any error.
+                    if not date_errors:
+                        court_log_rows.extend(day_slot_rows)
                     results_by_venue[fid]["court_prices"] = updated_prices
                     results_by_venue[fid]["court_prices_fetched_at"] = updated_fetched_at
                     if date_errors:
@@ -598,6 +672,31 @@ async def main():
                      if not total else ""))
 
         await asyncio.gather(*[patch_venue(record) for record in records])
+
+        # Court-hire log (record_court_slots, 2 Oct 2026). Sent after the cache
+        # is saved, so a log problem can never cost the app its availability.
+        # A failed write still fails the run: history missed here is gone.
+        court_log_result = {"extended": 0, "inserted": 0}
+        if court_log_rows and not os.environ.get("SKIP_COURT_LOG"):
+            for i in range(0, len(court_log_rows), COURT_LOG_CHUNK):
+                chunk = court_log_rows[i:i + COURT_LOG_CHUNK]
+                try:
+                    r = await client.post(
+                        f"{SUPABASE_URL}/rest/v1/rpc/record_court_slots",
+                        headers=headers, json={"p_rows": chunk})
+                except Exception as e:
+                    save_failed.append(("court_slot_states", f"{type(e).__name__}: {e}"))
+                    print(f"  COURT LOG FAILED: {type(e).__name__}: {e}")
+                    break
+                if r.status_code != 200:
+                    save_failed.append(("court_slot_states", f"HTTP {r.status_code}"))
+                    print(f"  COURT LOG FAILED: HTTP {r.status_code} {r.text[:200]}")
+                    break
+                out = r.json() or {}
+                for k in court_log_result:
+                    court_log_result[k] += int(out.get(k) or 0)
+        print(f"  Court log: {len(court_log_rows)} slots read, "
+              f"{court_log_result['inserted']} new states, {court_log_result['extended']} unchanged")
 
     # Per-cycle summary. Warming was previously silent on success, so a venue
     # that stopped producing blocks surfaced as a user reporting empty
