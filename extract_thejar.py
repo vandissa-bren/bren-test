@@ -3262,12 +3262,21 @@ class PlayByPointAPI:
                         "refresh, or set --mode=hybrid for auto-refresh."
                     )
                 if status == 403:
-                    raise PermissionError(
-                        f"403 Forbidden for {path}. Almost certainly "
-                        "Cloudflare blocking the request (TLS fingerprint "
-                        "mismatch). Install curl_cffi: "
-                        "pip install curl_cffi"
-                    )
+                    # Two different refusals, with opposite fixes. Say which.
+                    # Cloudflare answers with a challenge page and a
+                    # `cf-mitigated` header; PlayByPoint itself answers a
+                    # signed-out request with `null`. (Run pbp_probe.py.)
+                    body = (resp.text or "") if hasattr(resp, "text") else ""
+                    if resp.headers.get("cf-mitigated") or "Just a moment" in body:
+                        why = ("Cloudflare challenged the request (this machine "
+                               "or its fingerprint looks like a bot) -- new "
+                               "cookies will not fix this")
+                    elif body.strip() in ("null", ""):
+                        why = ("PlayByPoint says the session is signed out -- "
+                               "PBP_COOKIES_JSON has probably expired")
+                    else:
+                        why = f"body: {body[:80]!r}"
+                    raise PermissionError(f"403 Forbidden for {path}: {why}")
                 if status >= 400:
                     raise RuntimeError(
                         f"HTTP {status} for {path}: "
@@ -3919,6 +3928,10 @@ class PlayByPointAPI:
         try:
             resp = await self._client.get(path)
             if resp.status_code != 200:
+                body = resp.text or ""
+                logger.warning(
+                    "Program page {} answered {}{}", slug, resp.status_code,
+                    " (Cloudflare challenge)" if resp.headers.get("cf-mitigated") or "Just a moment" in body else "")
                 return None
             return resp.text
         except Exception as exc:
