@@ -1,0 +1,22 @@
+name: PBP Probe
+# Run by hand when the scrapers start failing with 403s. Says whether
+# Cloudflare is challenging GitHub's runners or the PBP_COOKIES_JSON login has
+# expired -- they need different fixes. Prints status codes only, never a cookie.
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install curl_cffi
+      - name: Probe PlayByPoint
+        env:
+          PBP_COOKIES_JSON: ${{ secrets.PBP_COOKIES_JSON }}
+        run: python pbp_probe.py
