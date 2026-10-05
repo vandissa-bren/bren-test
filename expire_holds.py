@@ -68,18 +68,38 @@ def log(msg):
     print(f"{datetime.now(timezone.utc).isoformat(timespec='seconds')} {msg}", flush=True)
 
 
+def melbourne_now() -> datetime:
+    """Melbourne wall-clock time, naive. This compared the session's Melbourne
+    start with `datetime.now()`, the container's own clock, which is UTC on
+    Railway: held requests were released about eleven hours after the start,
+    and a host could still approve (and charge) all evening. From the
+    live-session audit, 5 Oct 2026. Same rule as api_server._melbourne_now."""
+    utc = datetime.now(timezone.utc)
+    try:
+        from zoneinfo import ZoneInfo
+        return utc.astimezone(ZoneInfo("Australia/Melbourne")).replace(tzinfo=None)
+    except Exception:
+        std = (utc + timedelta(hours=10)).replace(tzinfo=None)
+
+        def first_sunday(year, month):
+            d = datetime(year, month, 1)
+            return d + timedelta(days=(6 - d.weekday()) % 7)
+
+        on = first_sunday(std.year, 10) + timedelta(hours=2)
+        off = first_sunday(std.year, 4) + timedelta(hours=2)
+        return std + timedelta(hours=1) if (std >= on or std < off) else std
+
+
 def session_started(sess) -> bool:
     """Melbourne local time, matching every other date rule in this schema."""
     date_s, time_s = sess.get("date"), sess.get("start_time")
     if not date_s or not time_s:
         return False
     try:
-        # Naive local, compared against local now. The database does the same
-        # arithmetic with `AT TIME ZONE 'Australia/Melbourne'`.
-        starts = datetime.fromisoformat(f"{date_s}T{time_s}:00")
+        starts = datetime.fromisoformat(f"{date_s}T{time_s[:5]}:00")
     except ValueError:
         return False
-    return datetime.now() >= starts
+    return melbourne_now() >= starts
 
 
 def release_abandoned_holds(client, accounts):
@@ -220,8 +240,10 @@ def main():
         # cannot express as a comparison.
         r = client.get(
             f"{SUPABASE_URL}/rest/v1/session_participants"
-            "?status=eq.pending&paid=is.false&payment_intent_id=not.is.null"
-            "&select=id,session_id,user_id,payment_intent_id,joined_at",
+            # Waitlist places too: once the session starts nobody else will be
+            # promoted, and their hold sat on the card for a week.
+            "?status=in.(pending,waitlist)&paid=is.false&payment_intent_id=not.is.null"
+            "&select=id,session_id,user_id,status,payment_intent_id,joined_at",
             headers=HEADERS,
         )
         r.raise_for_status()
@@ -270,6 +292,11 @@ def main():
             joined = datetime.fromisoformat(h["joined_at"].replace("Z", "+00:00"))
             stale = joined <= cutoff
 
+            # A queue place is only released once the session has started:
+            # before then it is the player's way in, and the waitlist worker
+            # owns its hold.
+            if h.get("status") == "waitlist" and not started:
+                continue
             if not (started or stale):
                 continue
 
