@@ -151,9 +151,18 @@ async def supabase_upsert(records: list[dict]) -> None:
                 existing_by_id[row["id"]] = row["data"]
 
         # Merge court_prices, shift_map, by_date into record["data"]
+        today_iso = date.today().isoformat()
         for record in records:
             row_id = record.get("id")
+            # Not a column: the programs this run could not read, whose
+            # stored sessions are carried over rather than dropped.
+            keep_slugs = set(record.pop("_keep_slugs", ()) or ())
             existing_data = existing_by_id.get(row_id, {})
+            if existing_data and keep_slugs and "data" in record:
+                kept = [s for s in (existing_data.get("sessions") or [])
+                        if s.get("program_slug") in keep_slugs
+                        and str(s.get("date") or "") >= today_iso]
+                record["data"]["sessions"] = (record["data"].get("sessions") or []) + kept
             if existing_data and "data" in record:
                 inner = record["data"]
                 if "court_prices" not in inner and "court_prices" in existing_data:
@@ -203,6 +212,12 @@ async def scrape_pbp_venue(
         # the cost of the package, not of one occurrence, so copying it onto
         # each session would misrepresent it as a per-session price.
         "program_pricing": {},
+        # ── private bookkeeping, removed before anything is written ──
+        # A scrape that could not read PlayByPoint must not be mistaken for
+        # a venue with nothing on. See run_once.
+        "_list_failed": False,      # the clinic list itself could not be read
+        "_clinics_tried": 0,        # clinics in range that we tried to read
+        "_failed_slugs": [],        # program slugs whose page could not be read
     }
 
     date_strs = {d.isoformat() for d in dates}
@@ -220,6 +235,7 @@ async def scrape_pbp_venue(
                 stubs = (resp or {}).get("clinics") or [] if isinstance(resp, dict) else (resp or [])
             except Exception as e:
                 console.print(f"    [yellow]clinic list error for {name}: {e}[/yellow]")
+                result["_list_failed"] = True
                 return result
 
             for stub in stubs:
@@ -242,10 +258,17 @@ async def scrape_pbp_venue(
                 if not has_upcoming:
                     continue
 
+                result["_clinics_tried"] += 1
                 try:
                     # Fetch HTML page — only source for lesson dates/times
                     html = await api.program_detail_html(program_slug)
+                    if not html:
+                        # Non-200 (a 403 from Cloudflare, a redirect to sign
+                        # in). Said plainly rather than as a NoneType error.
+                        raise RuntimeError("program page could not be read")
                     props = _extract_react_props_from_html(html)
+                    if props is None:
+                        raise RuntimeError("program page had no session data (signed out or challenged?)")
                     lessons_raw = props.get("sessions") or props.get("clinic_lessons") or []
 
                     # Metadata
@@ -363,9 +386,11 @@ async def scrape_pbp_venue(
                         })
                 except Exception as e:
                     console.print(f"    [yellow]clinic {clinic_id} error for {name}: {e}[/yellow]")
+                    result["_failed_slugs"].append(program_slug)
 
     except Exception as e:
         console.print(f"    [red]error for {name}: {e}[/red]")
+        result["_list_failed"] = True
 
     return result
 
@@ -392,10 +417,33 @@ async def run_once():
             r = await scrape_pbp_venue(cookies, user_id, fid, VENUE_NAMES.get(fid, f"Venue {fid}"), slug, dates)
             pbp_results.append(r)
 
-        records = []
+        # ══ A FAILED READ IS NOT AN EMPTY VENUE ══════════════════════════
+        # On 6 Oct every program page came back refused (403s; PBP sign-in
+        # or Cloudflare) while the public clinic list still answered. Each
+        # venue then held zero sessions, the run printed ✓ and pushed them,
+        # and the stored catalogue was replaced with nothing: the site's
+        # sessions went, and the roster capture found none to read.
+        #
+        # Now: a venue whose list failed, or whose every program failed, is
+        # NOT SAVED and its stored row is left as it was. A venue where only
+        # some programs failed is saved with those programs' stored sessions
+        # carried over. And when no venue could be read the run exits
+        # non-zero, so the workflow goes red instead of green.
+        records, not_saved, partial = [], [], []
         for r in pbp_results:
             if not isinstance(r, dict):
                 continue
+            list_failed = r.pop("_list_failed", False)
+            tried = r.pop("_clinics_tried", 0)
+            failed_slugs = sorted(set(r.pop("_failed_slugs", [])))
+            if list_failed or (tried and len(failed_slugs) >= tried):
+                not_saved.append(r["name"])
+                console.print(f"  [red]✗ NOT SAVED[/red] {r['name']} · "
+                              f"{'clinic list unreadable' if list_failed else f'all {tried} programs unreadable'}"
+                              " -- stored sessions kept")
+                continue
+            if failed_slugs:
+                partial.append(r["name"])
             records.append({
                 "id": f"pbp-{r['id']}",
                 "venue_name": VENUE_NAMES.get(r["id"], r["name"]),
@@ -403,13 +451,23 @@ async def run_once():
                 "date": date.today().isoformat(),
                 "data": r,
                 "updated_at": datetime.utcnow().isoformat(),
+                "_keep_slugs": failed_slugs,
             })
-            console.print(f"  [green]✓[/green] {r['name']} · {sum(len(v) for v in r['by_date'].values())} blocks · {len(r['sessions'])} sessions")
+            note = f" · {len(failed_slugs)} of {tried} programs unreadable, their stored sessions kept" if failed_slugs else ""
+            console.print(f"  [green]✓[/green] {r['name']} · {sum(len(v) for v in r['by_date'].values())} blocks · {len(r['sessions'])} sessions{note}")
 
         # Any failure propagates: a scrape that cannot persist is a failed
         # run, and the workflow must go red rather than green.
         await supabase_upsert(records)
-        console.print(f"[green]✓ Pushed {len(records)} PBP venues to Supabase[/green]\n")
+        if records:
+            console.print(f"[green]✓ Pushed {len(records)} PBP venues to Supabase[/green]\n")
+        if not_saved:
+            console.print(f"[red]{len(not_saved)} venue(s) NOT SAVED: {', '.join(not_saved)}[/red]")
+        if partial:
+            console.print(f"[yellow]{len(partial)} venue(s) partly read: {', '.join(partial)}[/yellow]")
+        if pbp_results and not records:
+            console.print("[red]EVERY VENUE FAILED -- nothing written; exiting non-zero so the run shows as failed[/red]")
+            sys.exit(1)
 
 
     console.print(f"Sync complete · {datetime.now().strftime('%H:%M:%S')}")
