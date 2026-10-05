@@ -20,6 +20,7 @@ import asyncio
 import httpx
 import venue_registry
 import json
+import re
 import logging
 import os
 from datetime import date, datetime, timedelta
@@ -1653,6 +1654,145 @@ async def live_courts(
 
 # ── Stripe ────────────────────────────────────────────────────────────────────
 
+# ══ WHO IS CALLING, AND WHEN IS MELBOURNE ═══════════════════════════════════
+# The payment routes trusted their body: the payer, the host and the amount
+# all came from the phone, and capture/cancel had no caller at all. From the
+# live-session audit (5 Oct 2026). Each route now asks Supabase whose sign-in
+# came with the request, and reads everything about the session from the
+# session itself.
+
+try:
+    from zoneinfo import ZoneInfo
+    _MELB = ZoneInfo("Australia/Melbourne")
+except Exception:  # no tz database on the host
+    _MELB = None
+
+
+def _melbourne_now() -> datetime:
+    """Melbourne wall-clock time, naive, to compare with a session's date and
+    start time. The container's own clock is UTC on Railway, which is what put
+    expire_holds about eleven hours late.
+
+    Without a tz database, Victoria's rule is applied directly: daylight time
+    from 2am on the first Sunday in October to 3am on the first Sunday in
+    April."""
+    from datetime import timezone as _tz
+    utc = datetime.now(_tz.utc)
+    if _MELB is not None:
+        return utc.astimezone(_MELB).replace(tzinfo=None)
+    std = (utc + timedelta(hours=10)).replace(tzinfo=None)
+
+    def first_sunday(year: int, month: int) -> datetime:
+        d = datetime(year, month, 1)
+        return d + timedelta(days=(6 - d.weekday()) % 7)
+
+    y = std.year
+    dst_on = first_sunday(y, 10) + timedelta(hours=2)
+    dst_off = first_sunday(y, 4) + timedelta(hours=2)   # 3am daylight = 2am standard
+    in_dst = std >= dst_on or std < dst_off
+    return std + timedelta(hours=1) if in_dst else std
+
+
+def _session_starts(sess: dict) -> Optional[datetime]:
+    d, t = sess.get("date"), (sess.get("start_time") or "")
+    if not d or not t:
+        return None
+    try:
+        return datetime.fromisoformat(f"{d}T{t[:5]}:00")
+    except ValueError:
+        return None
+
+
+def _session_started(sess: dict) -> bool:
+    starts = _session_starts(sess)
+    return starts is not None and _melbourne_now() >= starts
+
+
+def _price_cents(price) -> int:
+    """'$18', '18.50', 'Free' -> cents. The same reading the app makes."""
+    if not price or str(price).strip().lower() == "free":
+        return 0
+    digits = "".join(ch for ch in str(price) if ch.isdigit() or ch == ".")
+    try:
+        return int(round(float(digits) * 100))
+    except ValueError:
+        return 0
+
+
+def _svc_headers() -> dict:
+    return {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"}
+
+
+async def _caller_id(authorization: Optional[str]) -> Optional[str]:
+    """The signed-in user behind this request, or None. Supabase checks the
+    token; nothing here decodes it."""
+    if not authorization or not authorization.lower().startswith("bearer "):
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(
+                f"{SUPABASE_URL}/auth/v1/user",
+                headers={"apikey": SUPABASE_SERVICE_KEY, "Authorization": authorization},
+            )
+        if r.status_code != 200:
+            return None
+        return (r.json() or {}).get("id")
+    except Exception:
+        return None
+
+
+async def _session_row(session_id: str) -> dict:
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.get(
+            f"{SUPABASE_URL}/rest/v1/created_sessions?id=eq.{session_id}"
+            "&select=id,user_id,title,price,is_official,require_approval,lifecycle,date,start_time,max_spots",
+            headers=_svc_headers(),
+        )
+    rows = r.json() if r.status_code == 200 else []
+    if not rows:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return rows[0]
+
+
+async def _stripe_account_for(sess: dict) -> Optional[str]:
+    """None for an official session (the platform's own account); otherwise
+    the host's connected account, which every direct charge lives on."""
+    if sess.get("is_official"):
+        return None
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.get(
+            f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{sess.get('user_id')}"
+            "&select=stripe_account_id,stripe_onboarded",
+            headers=_svc_headers(),
+        )
+    prof = (r.json() or [{}])[0] if r.status_code == 200 and r.json() else {}
+    if not prof.get("stripe_account_id"):
+        raise HTTPException(status_code=400, detail="Host has not completed Stripe setup")
+    return prof["stripe_account_id"]
+
+
+async def _approved_count(session_id: str) -> int:
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.get(
+            f"{SUPABASE_URL}/rest/v1/session_participants?session_id=eq.{session_id}"
+            "&status=eq.approved&select=id",
+            headers={**_svc_headers(), "Prefer": "count=exact", "Range": "0-0"},
+        )
+    rng = r.headers.get("content-range", "")
+    try:
+        return int(rng.split("/")[-1])
+    except ValueError:
+        return len(r.json() or [])
+
+
+def _admission_refusal(sess: dict) -> Optional[str]:
+    if sess.get("lifecycle") and sess.get("lifecycle") != "scheduled":
+        return "This session was cancelled."
+    if _session_started(sess):
+        return "This session has already started."
+    return None
+
+
 class StripeConnectRequest(BaseModel):
     user_id: str
     return_url: str = "https://picklematch.com.au/profile"
@@ -1661,8 +1801,10 @@ class StripeConnectRequest(BaseModel):
 class PaymentIntentRequest(BaseModel):
     user_id: str
     session_id: str
-    host_user_id: str
-    amount: int  # in cents
+    # IGNORED. Older clients send the host and the amount; both are now read
+    # from the session, so a phone can't choose who is paid or how much.
+    host_user_id: Optional[str] = None
+    amount: Optional[int] = None  # in cents
     currency: str = "aud"
     description: str = "PickleMatch session"
     # WHAT THE PAYMENT IS FOR, not how to take it. The server derives
@@ -1674,6 +1816,11 @@ class PaymentIntentRequest(BaseModel):
 class CaptureRequest(BaseModel):
     session_id: str
     payment_intent_id: str
+
+
+class ApproveRequest(BaseModel):
+    session_id: str
+    user_id: str
 
 @app.get("/api/stripe/config")
 async def stripe_config():
@@ -1762,93 +1909,84 @@ async def stripe_status(user_id: str):
         return {"onboarded": False, "account_id": account_id, "error": str(e)}
 
 @app.post("/api/stripe/payment_intent")
-async def create_payment_intent(req: PaymentIntentRequest):
-    """Create a PaymentIntent for a player joining a session."""
+async def create_payment_intent(req: PaymentIntentRequest, authorization: Optional[str] = Header(None)):
+    """Create a PaymentIntent for a player joining, requesting or queueing.
+
+    ══ THE SESSION DECIDES, NOT THE PHONE ═══════════════════════════════════
+    The payer must be the signed-in caller. The amount is the session's price
+    and the money goes to the session's host. Nothing is created for a session
+    that has started, been cancelled, or (for a straight join) filled: the
+    database refuses those bookings, and by then the card had been charged.
+    Every intent is recorded in `payment_intents_issued`, which is what the
+    database checks a booking's payment against.
+    """
     if not STRIPE_SECRET_KEY:
         raise HTTPException(status_code=500, detail="Stripe not configured")
-    svc_headers = {
-        "apikey": SUPABASE_SERVICE_KEY,
-        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
-    }
-    # Check if this is an official PickleMatch session
-    is_official = False
-    requires_approval = False
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        r = await client.get(
-            f"{SUPABASE_URL}/rest/v1/created_sessions?id=eq.{req.session_id}&select=is_official,require_approval",
-            headers=svc_headers,
-        )
-        session_data = r.json()[0] if r.json() else {}
-        is_official = session_data.get("is_official", False)
-        requires_approval = session_data.get("require_approval", False)
+    caller = await _caller_id(authorization)
+    if not caller or caller != req.user_id:
+        raise HTTPException(status_code=401, detail="Please sign in again to pay.")
+
+    sess = await _session_row(req.session_id)
+    refusal = _admission_refusal(sess)
+    if refusal:
+        raise HTTPException(status_code=409, detail=refusal)
+    amount = _price_cents(sess.get("price"))
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="This session is free.")
 
     # ══ HOLD OR CHARGE ═══════════════════════════════════════════════════
     # AUTHORISE NOW, CAPTURE LATER wherever the place is not yet the player's:
-    # the card is held, and captured when it becomes theirs — or cancelled,
-    # and nothing is ever taken. A player charged for a place they never got
-    # has to be refunded, which is the failure this avoids.
-    #
-    # TWO PATHS NEED A HOLD, NOT ONE. This read `requires_approval` alone,
-    # which was correct while approval was the only reason to wait. A WAITLIST
-    # join also waits — for a place to open — and on an approval-off session it
-    # was therefore CHARGED at once, while the client recorded it as a hold.
-    # The worker recovered those with "ALREADY CAPTURED"; the intent should not
-    # have needed recovering.
     #
     #     join, approval off      automatic
     #     join, approval on       manual — captured when the host approves
+    #     request                 manual — the player is outside the session's
+    #                             DUPR range, so the database makes it a
+    #                             request even with approval off
     #     waitlist, either way    manual — captured when a place opens
-    is_waitlist = (req.purpose or "join").strip().lower() == "waitlist"
-    capture_method = "manual" if (requires_approval or is_waitlist) else "automatic"
+    purpose = (req.purpose or "join").strip().lower()
+    if purpose not in ("join", "waitlist", "request"):
+        purpose = "join"
+    requires_approval = bool(sess.get("require_approval"))
+    capture_method = "manual" if (requires_approval or purpose in ("waitlist", "request")) else "automatic"
 
-    if is_official:
-        intent = stripe.PaymentIntent.create(
-            amount=req.amount,
-            currency=req.currency,
-            description=req.description,
-            metadata={
-                "session_id": req.session_id,
-                "player_user_id": req.user_id,
-                "host_user_id": req.host_user_id,
-            },
-            capture_method=capture_method,
-        )
-        return {
-            "client_secret": intent.client_secret,
-            "payment_intent_id": intent.id,
-            "account_id": None,
-            # The caller cannot tell a hold from a capture, and it writes
-            # `paid` from this result. Told, rather than left to guess.
-            "capture_method": capture_method,
-        }
+    if purpose == "join" and not requires_approval and sess.get("max_spots") is not None:
+        if await _approved_count(req.session_id) >= int(sess["max_spots"]):
+            raise HTTPException(status_code=409, detail="This session is full.")
 
-    # Get host's Stripe account for Connect payment
+    account_id = await _stripe_account_for(sess)
+    metadata = {"session_id": req.session_id, "player_user_id": caller, "host_user_id": sess.get("user_id")}
+    kwargs = dict(amount=amount, currency=req.currency, description=req.description,
+                  metadata=metadata, capture_method=capture_method)
+    if account_id:
+        kwargs["stripe_account"] = account_id
+    intent = stripe.PaymentIntent.create(**kwargs)
+
+    # RECORDED, OR NOT OFFERED. A booking can only carry an intent the database
+    # can find here; an unrecorded one would be refused after the player paid.
     async with httpx.AsyncClient(timeout=10.0) as client:
-        r = await client.get(
-            f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{req.host_user_id}&select=stripe_account_id,stripe_onboarded",
-            headers=svc_headers,
+        w = await client.post(
+            f"{SUPABASE_URL}/rest/v1/payment_intents_issued",
+            headers={**_svc_headers(), "Content-Type": "application/json", "Prefer": "return=minimal"},
+            json={"intent_id": intent.id, "session_id": req.session_id, "user_id": caller,
+                  "amount_cents": amount, "capture_method": capture_method, "purpose": purpose},
         )
-        profile = r.json()[0] if r.json() else {}
-        account_id = profile.get("stripe_account_id")
-        if not account_id or not profile.get("stripe_onboarded"):
-            raise HTTPException(status_code=400, detail="Host has not completed Stripe setup")
+    if w.status_code >= 300:
+        try:
+            if account_id:
+                stripe.PaymentIntent.cancel(intent.id, stripe_account=account_id)
+            else:
+                stripe.PaymentIntent.cancel(intent.id)
+        except stripe.error.StripeError:
+            pass
+        logging.error("payment_intents_issued write failed: %s", w.text[:200])
+        raise HTTPException(status_code=500, detail="Couldn't start the payment. Please try again.")
 
-    intent = stripe.PaymentIntent.create(
-        amount=req.amount,
-        currency=req.currency,
-        description=req.description,
-        metadata={
-            "session_id": req.session_id,
-            "player_user_id": req.user_id,
-            "host_user_id": req.host_user_id,
-        },
-        stripe_account=account_id,
-        capture_method=capture_method,
-    )
     return {
         "client_secret": intent.client_secret,
         "payment_intent_id": intent.id,
         "account_id": account_id,
+        # The caller cannot tell a hold from a capture, and it writes
+        # `paid` from this result. Told, rather than left to guess.
         "capture_method": capture_method,
     }
 
@@ -1880,85 +2018,166 @@ async def _connected_account_for_session(session_id: str, svc_headers: dict) -> 
         return account_id
 
 
-@app.post("/api/stripe/capture")
-async def capture_payment(req: CaptureRequest):
-    """Take money that has been held.
+async def _require_host(authorization: Optional[str], sess: dict) -> str:
+    caller = await _caller_id(authorization)
+    if not caller:
+        raise HTTPException(status_code=401, detail="Please sign in again.")
+    if caller != sess.get("user_id"):
+        raise HTTPException(status_code=403, detail="Only the host can do that.")
+    return caller
 
-    Called when a host approves. Everything before this point is an
-    authorisation: the funds are reserved and nothing has moved.
 
-    The database is NOT written here. Capturing fires
-    `payment_intent.succeeded`, and the webhook already sets `paid`, `paid_at`
-    and `amount_paid` from it — writing them here as well would be a second
-    author of the same fact.
-
-    Idempotent by Stripe's own behaviour: capturing an already-captured intent
-    returns an error naming that, which is reported rather than retried.
-    """
-    if not STRIPE_SECRET_KEY:
-        raise HTTPException(status_code=500, detail="Stripe not configured")
-    svc_headers = {
-        "apikey": SUPABASE_SERVICE_KEY,
-        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
-    }
-    account_id = await _connected_account_for_session(req.session_id, svc_headers)
-    try:
-        intent = stripe.PaymentIntent.capture(
-            req.payment_intent_id,
-            stripe_account=account_id,
+async def _participant(session_id: str, user_id: str) -> Optional[dict]:
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.get(
+            f"{SUPABASE_URL}/rest/v1/session_participants?session_id=eq.{session_id}"
+            f"&user_id=eq.{user_id}&select=id,status,paid,payment_intent_id",
+            headers=_svc_headers(),
         )
-    except stripe.error.StripeError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    # WRITTEN HERE, because nothing else writes it. The webhook was the
-    # intended author and has never received an event: it listens on the
+    rows = r.json() if r.status_code == 200 else []
+    return rows[0] if rows else None
+
+
+async def _record_capture(intent) -> None:
+    # WRITTEN HERE, because nothing else writes it. The webhook listens on the
     # PLATFORM account while every payment is a direct charge on the host's
-    # connected one, so `payment_intent.succeeded` has fired zero times since
-    # the endpoint was created.
-    #
-    # Synchronous suits this better anyway. The host approves, the money moves,
-    # and the row says so in the same round trip — rather than whenever Stripe
-    # gets round to delivering. The webhook is still worth fixing, as the way
-    # to hear about disputes, expired holds and failed captures; it is not the
-    # right place to learn that a payment the server just made succeeded.
+    # connected one, so `payment_intent.succeeded` never arrives.
     amount = intent.amount_received / 100
     async with httpx.AsyncClient(timeout=10.0) as client:
         await client.patch(
-            f"{SUPABASE_URL}/rest/v1/session_participants"
-            f"?payment_intent_id=eq.{req.payment_intent_id}",
-            headers={**svc_headers, "Content-Type": "application/json"},
-            json={
-                "paid": True,
-                "paid_at": datetime.utcnow().isoformat(),
-                "amount_paid": amount,
-            },
+            f"{SUPABASE_URL}/rest/v1/session_participants?payment_intent_id=eq.{intent.id}",
+            headers={**_svc_headers(), "Content-Type": "application/json"},
+            json={"paid": True, "paid_at": datetime.utcnow().isoformat(), "amount_paid": amount},
         )
-    return {
-        "captured": True,
-        "amount": amount,
-        "status": intent.status,
-    }
+
+
+@app.post("/api/host/approve")
+async def approve_request(req: ApproveRequest, authorization: Optional[str] = Header(None)):
+    """A host approves a request: check, take the hold, then admit.
+
+    ══ CHECK BEFORE TAKING THE MONEY ════════════════════════════════════════
+    The app used to capture and then ask the database to approve, which it
+    refuses once the session has started, been cancelled or filled — so the
+    player paid for a place they didn't get. `approval_blocker` asks the
+    database the same question first, as the host, without writing.
+
+    ══ AND IF THE ANSWER CHANGES IN BETWEEN ═════════════════════════════════
+    The approval is written as the host, so the database applies its own
+    rules again. If it refuses after the capture, the full amount goes into
+    the refund ledger and `settle_refunds.py` pays it back.
+    """
+    sess = await _session_row(req.session_id)
+    await _require_host(authorization, sess)
+    as_host = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": authorization,
+               "Content-Type": "application/json"}
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        b = await client.post(f"{SUPABASE_URL}/rest/v1/rpc/approval_blocker", headers=as_host,
+                              json={"p_session_id": req.session_id, "p_user_id": req.user_id})
+    if b.status_code >= 300:
+        raise HTTPException(status_code=502, detail="Couldn't check the request. Try again in a moment.")
+    blocker = b.json()
+    if blocker:
+        raise HTTPException(status_code=409, detail=f"{blocker}.".replace("..", "."))
+
+    row = await _participant(req.session_id, req.user_id)
+    if not row:
+        raise HTTPException(status_code=409, detail="That request no longer exists.")
+
+    captured = False
+    intent_id = row.get("payment_intent_id")
+    if intent_id and not row.get("paid"):
+        account_id = await _stripe_account_for(sess)
+        try:
+            intent = (stripe.PaymentIntent.capture(intent_id, stripe_account=account_id)
+                      if account_id else stripe.PaymentIntent.capture(intent_id))
+            await _record_capture(intent)
+            captured = True
+        except stripe.error.StripeError as e:
+            # ALREADY CAPTURED IS A SUCCESS: a payment taken at request time, or
+            # a retry after a half-finished approval.
+            if not re.search(r"already been captured|already captured", str(e), re.I):
+                raise HTTPException(status_code=400, detail=str(e)
+                                    or "Their payment could not be taken, so they have not been approved.")
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        u = await client.patch(
+            f"{SUPABASE_URL}/rest/v1/session_participants?session_id=eq.{req.session_id}"
+            f"&user_id=eq.{req.user_id}&status=eq.pending",
+            headers={**as_host, "Prefer": "return=representation"},
+            json={"status": "approved"},
+        )
+    ok = u.status_code < 300 and bool(u.json())
+    if not ok:
+        detail = "That request could not be approved."
+        try:
+            detail = (u.json() or {}).get("message") or detail
+        except Exception:
+            pass
+        if captured:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                await client.post(f"{SUPABASE_URL}/rest/v1/rpc/refund_unapproved_capture",
+                                  headers={**_svc_headers(), "Content-Type": "application/json"},
+                                  json={"p_session_id": req.session_id, "p_user_id": req.user_id})
+            detail = f"{detail.rstrip('.')}. Their payment will be refunded."
+        raise HTTPException(status_code=409, detail=detail)
+    return {"approved": True}
+
+
+@app.post("/api/stripe/capture")
+async def capture_payment(req: CaptureRequest, authorization: Optional[str] = Header(None)):
+    """Take a held payment. Kept for older clients: host only, the intent must
+    belong to a pending request on this session, and only while it could still
+    be approved. New clients use /api/host/approve, which also admits."""
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(status_code=500, detail="Stripe not configured")
+    sess = await _session_row(req.session_id)
+    await _require_host(authorization, sess)
+    refusal = _admission_refusal(sess)
+    if refusal:
+        raise HTTPException(status_code=409, detail=refusal)
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.get(
+            f"{SUPABASE_URL}/rest/v1/session_participants?session_id=eq.{req.session_id}"
+            f"&payment_intent_id=eq.{req.payment_intent_id}&status=eq.pending&select=id",
+            headers=_svc_headers(),
+        )
+    if r.status_code != 200 or not r.json():
+        raise HTTPException(status_code=409, detail="That payment isn't for a request on this session.")
+    account_id = await _stripe_account_for(sess)
+    try:
+        intent = (stripe.PaymentIntent.capture(req.payment_intent_id, stripe_account=account_id)
+                  if account_id else stripe.PaymentIntent.capture(req.payment_intent_id))
+    except stripe.error.StripeError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    await _record_capture(intent)
+    return {"captured": True, "amount": intent.amount_received / 100, "status": intent.status}
 
 
 @app.post("/api/stripe/cancel")
-async def cancel_payment(req: CaptureRequest):
-    """Release a hold without taking anything.
+async def cancel_payment(req: CaptureRequest, authorization: Optional[str] = Header(None)):
+    """Release a hold without taking anything — when a host declines.
 
-    Called when a host declines. The authorisation disappears and the player
-    is never charged — so there is no refund to owe, chase or reconcile, which
-    is the whole reason for holding rather than capturing at request.
-    """
+    Host only, and only an intent that belongs to a request or queue place on
+    this session that hasn't been paid: anyone with a payment reference could
+    release someone else's hold before."""
     if not STRIPE_SECRET_KEY:
         raise HTTPException(status_code=500, detail="Stripe not configured")
-    svc_headers = {
-        "apikey": SUPABASE_SERVICE_KEY,
-        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
-    }
-    account_id = await _connected_account_for_session(req.session_id, svc_headers)
-    try:
-        intent = stripe.PaymentIntent.cancel(
-            req.payment_intent_id,
-            stripe_account=account_id,
+    sess = await _session_row(req.session_id)
+    await _require_host(authorization, sess)
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.get(
+            f"{SUPABASE_URL}/rest/v1/session_participants?session_id=eq.{req.session_id}"
+            f"&payment_intent_id=eq.{req.payment_intent_id}&select=id,status,paid",
+            headers=_svc_headers(),
         )
+    rows = r.json() if r.status_code == 200 else []
+    if not rows or rows[0].get("paid") or rows[0].get("status") not in ("pending", "waitlist", "rejected"):
+        raise HTTPException(status_code=409, detail="That hold isn't one you can release.")
+    account_id = await _stripe_account_for(sess)
+    try:
+        intent = (stripe.PaymentIntent.cancel(req.payment_intent_id, stripe_account=account_id)
+                  if account_id else stripe.PaymentIntent.cancel(req.payment_intent_id))
     except stripe.error.StripeError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return {"cancelled": True, "status": intent.status}
