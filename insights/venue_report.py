@@ -104,6 +104,12 @@ def attach_titles(s, c):
            .agg(titles=("title", lambda x: sorted(set(x))), skill=("skill_level", "first"), dur=("dur_h", "median"))
            .reset_index())
     fx = {(r.venue_id, r.dow, r.start, r.type): r for r in fx.itertuples()}
+    # the same without the type: the app's titled rows carried no type and the
+    # server's typed rows no title (20261017100000), so the typed match often missed
+    fa = (c.groupby(["venue_id", "dow", "start"])
+           .agg(titles=("title", lambda x: sorted(set(x.dropna()))), skill=("skill_level", "first"), dur=("dur_h", "median"))
+           .reset_index())
+    fa = {(r.venue_id, r.dow, r.start): r for r in fa.itertuples()}
     titles, skills, durs, how = [], [], [], []
     for r in s.itertuples():
         if r.session_key in by_key.index and isinstance(by_key.loc[r.session_key]["title"] if not isinstance(by_key.loc[r.session_key], pd.DataFrame) else by_key.loc[r.session_key].iloc[0]["title"], str):
@@ -112,6 +118,8 @@ def attach_titles(s, c):
             titles.append(row["title"]); skills.append(row["skill_level"]); durs.append(row["dur_h"]); how.append("key")
             continue
         f = fx.get((r.venue_id, r.dow, r.hm, r.session_type))
+        if f is None or len(f.titles) != 1:
+            f = fa.get((r.venue_id, r.dow, r.hm))
         if f is not None and len(f.titles) == 1:
             titles.append(f.titles[0]); skills.append(f.skill); durs.append(f.dur); how.append("fixture")
         else:
@@ -125,8 +133,8 @@ def attach_titles(s, c):
         s["dur_h"] = own.where(own > 0, s["dur_h"])
     terms = [parse(t, ty if isinstance(ty, str) else None, sk if isinstance(sk, str) else None) if isinstance(t, str) and t else None
              for t, ty, sk in zip(s["title"], s["session_type"], s["skill_level"])]
-    s["family"] = [t["family"] if t else None for t in terms]
-    s["fmt"] = [session_format(t) for t in terms]
+    s["fmt"] = [session_format(t) if t else type_format(ty) for t, ty in zip(terms, s["session_type"])]
+    s["family"] = [t["family"] if t else FORMAT_FAMILY.get(f) for t, f in zip(terms, s["fmt"])]
     s["label"] = [t["label"] if t else None for t in terms]
     s["band_lo"] = [t["band"][0] if t and t["band"] else np.nan for t in terms]
     s["band_hi"] = [t["band"][1] if t and t["band"] else np.nan for t in terms]
@@ -136,6 +144,34 @@ def attach_titles(s, c):
     s["daypart"] = np.select([s["hour"] < 9, s["hour"] < 17], ["early", "day"], "evening")
     s["weekend"] = s["dow"] >= 5
     return s
+
+
+FORMAT_FAMILY = {"round_robin": "competitive", "ladder": "competitive", "league": "competitive",
+                 "match_play": "competitive", "learn_to_play": "learning", "coaching": "learning",
+                 "clinic": "learning", "open_play": "social", "social": "social"}
+
+
+def type_format(raw_type):
+    """A session with no title at all: the venue's type, only where it says
+    something specific. "Open Play" and "Event" alone stay unknown, since venues
+    use them for match play and round robins too. Same rule as ins_family's
+    untitled branch (20261017100000)."""
+    ty = (raw_type if isinstance(raw_type, str) else "").strip().lower()
+    if not ty:
+        return None
+    if "dupr" in ty:
+        return "match_play"
+    if re.search(r"round\s*robin", ty):
+        return "round_robin"
+    if re.search(r"ladder|league|tournament|competition|championship", ty):
+        return "league"
+    if re.search(r"new to|learn|intro|beginner", ty):
+        return "learn_to_play"
+    if re.search(r"coach|lesson|clinic|academy|junior|skill|pathway|program", ty):
+        return "clinic"
+    if "social" in ty:
+        return "social"
+    return None
 
 
 def session_format(t):
