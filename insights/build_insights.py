@@ -143,6 +143,7 @@ def shareable(d: dict, net: dict) -> dict:
     d["net"] = net
     d["levelFit"] = [r for r in d.get("levelFit", []) if r["v"] in ids]
     d["levelClass"] = [r for r in d.get("levelClass", []) if r["v"] is None or r["v"] in ids]
+    d["levelMix"] = [r for r in d.get("levelMix", []) if r["v"] in ids and r["players"] >= MIN_GROUP]
     if d.get("prev"):
         p = dict(d["prev"])
         p["sessions"] = [x for x in p["sessions"] if x[0] in ids]
