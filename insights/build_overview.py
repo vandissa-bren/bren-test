@@ -102,6 +102,45 @@ def level_fit(okv, vmap, cls=None, min_players=MIN_GROUP):
     return sorted(rows, key=lambda x: (x["v"], x["median"]))
 
 
+def _spread(per: pd.Series) -> dict:
+    return {"p10": round(float(per.quantile(.10)), 2), "p25": round(float(per.quantile(.25)), 2),
+            "median": round(float(per.median()), 2),
+            "p75": round(float(per.quantile(.75)), 2), "p90": round(float(per.quantile(.90)), 2)}
+
+
+def level_by_class(okv, cls, min_players=MIN_GROUP):
+    """What "Beginner", "Intermediate" and "Advanced" mean at each venue: for every
+    venue and every level class its sessions state (read from the title, so a
+    session called "Beginner Social" counts as well as one called "2.0-2.5"),
+    the ratings of the players booked into them. One rating per player (their
+    median across those sessions). Also the same for the whole city (v = null),
+    as the reference row. The stated range is the venue's most common numeric
+    range for that class, when its titles give one. Under `min_players` rated
+    players: left out."""
+    g = okv[okv["rating"].notna()].copy()
+    g["cls"] = g["session_key"].map(cls)
+    g = g[g["cls"].isin(["beginner", "intermediate", "advanced", "all levels"])]
+    rows = []
+    for (fid, c), grp in list(g.groupby(["fid", "cls"])) + [((None, c), x) for c, x in g.groupby("cls")]:
+        per = grp.groupby("pbp_user_id")["rating"].median()
+        if len(per) < min_players:
+            continue
+        ver = grp.groupby("pbp_user_id")["rating"].apply(lambda s: any(_verified(x) for x in s))
+        banded = grp.dropna(subset=["band_lo", "band_hi"]).drop_duplicates("session_key")
+        lo = hi = inside = None
+        if fid is not None and len(banded):
+            lo, hi = banded.groupby(["band_lo", "band_hi"]).size().sort_values(ascending=False).index[0]
+            lo, hi = round(float(lo), 2), round(float(min(hi, 6.0)), 2)
+            inside = round(100 * float(((per >= lo - 0.01) & (per <= hi + 0.01)).mean()), 1)
+        labels = grp.drop_duplicates("session_key")["label"].dropna().value_counts()
+        rows.append({"v": None if fid is None else int(fid), "cls": str(c),
+                     "sessions": int(grp["session_key"].nunique()), "players": int(len(per)),
+                     "verified": int(ver.sum()), **_spread(per),
+                     "lo": lo, "hi": hi, "inside": inside,
+                     "labels": [str(x) for x in labels.index[:3]] if fid is not None else []})
+    return sorted(rows, key=lambda x: (x["cls"], x["v"] is not None, x["median"]))
+
+
 def prev_summary(data_dir: Path) -> dict:
     """The period before, for "compared with": each finished session in compact
     form (same groups as the main sessions list, so the page can filter both the
@@ -294,7 +333,8 @@ def main():
         vmap[fid].update(extra)
     net = {k: v for k, v in net.items() if k != "venues"}
     data = {"city": city, "venues": venues, "sessions": sess, "links": links, "players": city_players,
-            "ranges": ranges, "travel": travel, "levelFit": level_fit(okv, vmap, dict(zip(s["session_key"], s["level_class"])))}
+            "ranges": ranges, "travel": travel, "levelFit": level_fit(okv, vmap, dict(zip(s["session_key"], s["level_class"]))),
+            "levelClass": level_by_class(okv, dict(zip(s["session_key"], s["level_class"])))}
     return data, net
 
 
