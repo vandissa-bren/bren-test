@@ -1,7 +1,7 @@
 """
 build_overview.py -- the dataset behind the Melbourne overview prototype.
 
-Same inputs and rules as report_dd.py / report_more.py (imported). Venues are
+Same inputs and rules as venue_report.py / report_more.py (imported). Venues are
 named; players appear only as counts, and no group under 5 players is shown.
 Returns (data, network); build_insights.py publishes them.
 """
@@ -12,7 +12,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-import report_dd as R
+import venue_report as R
 import report_more as M
 
 HERE = Path(__file__).resolve().parent
@@ -44,8 +44,7 @@ def area_of(lat, lng):
     return "West", km
 
 
-def clean_name(n):
-    return n.replace(" | ", " ").replace("Dink & Drive Pickleball Club", "Dink & Drive")
+clean_name = R.short_name
 
 
 def r1(x):
@@ -192,7 +191,7 @@ def main():
     ranges = [dict(x, venue=clean_name(R.name(x["fid"]))) for x in more["level_ranges"]]
     for x in ranges:
         x["p25"], x["p75"] = round(x["p25"], 2), round(x["p75"], 2)
-    travel = [x for x in more["travel"]["rows"] if x["dim"] != "dd"]
+    travel = [x for x in more["travel"]["rows"] if x["dim"] != "venue"]
 
     city = {
         "from": str(start.tz_convert(R.MEL).date()), "to": str(end.tz_convert(R.MEL).date()), "days": days,
