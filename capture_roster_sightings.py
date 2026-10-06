@@ -28,7 +28,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from extract_thejar import PlayByPointAPI
+from extract_thejar import PlayByPointAPI, _extract_react_props_from_html
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://stwohmddmdwttasbyblt.supabase.co").rstrip("/")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY") or os.environ.get("SUPABASE_SERVICE_KEY", "")
@@ -38,6 +38,10 @@ PBP_BASE = os.environ.get("PBP_BASE_OVERRIDE") or "https://app.playbypoint.com"
 # empty. The band that actually moves is the near future.
 DAYS_START = int(os.environ.get("ROSTER_DAYS_START", "0"))
 DAYS_AHEAD = int(os.environ.get("ROSTER_DAYS_AHEAD", "21"))
+# Waitlists: for sessions that are full at this read, the programme page's
+# waitlist_count (the roster endpoint doesn't carry it; waitlist_probe.py,
+# 6 Oct). One page per programme per run, at most this many.
+WAITLIST_PAGES = int(os.environ.get("ROSTER_WAITLIST_PAGES", "60"))
 
 
 def supabase_headers() -> dict:
@@ -120,6 +124,30 @@ async def fetch_roster(api, lesson_id) -> list[dict] | None:
         for u in (rd or {}).get("users", [])
         if u.get("id") is not None
     ]
+
+
+async def read_waitlists(api, slugs) -> tuple[dict, int]:
+    """Waitlist length per lesson id, from each programme's page. A programme
+    whose waitlist is switched off gives None for its sessions (not 0: there
+    can't be a queue). Pages that can't be read are skipped and counted."""
+    out, failed = {}, 0
+    for slug in list(slugs)[:WAITLIST_PAGES]:
+        try:
+            html = await api.program_detail_html(slug)
+            props = _extract_react_props_from_html(html) if html else None
+        except Exception:
+            props = None
+        if not props:
+            failed += 1
+            continue
+        off = props.get("enableWaitlist") is False or props.get("waitlist") is False
+        for ls in (props.get("sessions") or props.get("clinic_lessons") or []):
+            if not isinstance(ls, dict) or ls.get("id") is None:
+                continue
+            n = ls.get("waitlist_count")
+            out[str(ls["id"])] = None if off or not isinstance(n, int) or n < 0 else n
+        await asyncio.sleep(0.3)
+    return out, failed
 
 
 async def main():
@@ -206,6 +234,21 @@ async def main():
                         "coaches": t.get("coaches"),
                     })
                 await asyncio.sleep(0.3)
+
+            # Waitlists for the sessions that are full right now (only full
+            # sessions have one). Sent with the fill-log reading as "waitlist";
+            # the fill log keeps it from 20261018100000.
+            full_keys = {o["session_key"] for o in inv_observations if o["spots_left"] == 0}
+            full = {str(t["lesson_id"]): t.get("program_slug") for t in targets
+                    if f"pbp-{t['lesson_id']}" in full_keys}
+            slugs = {s for s in full.values() if s}
+            waits, wfail = (await read_waitlists(api, slugs)) if slugs and not os.environ.get("SKIP_WAITLIST") else ({}, 0)
+            for o in inv_observations:
+                lid = o["session_key"][4:]
+                if lid in full and lid in waits:
+                    o["waitlist"] = waits[lid]
+            print(f"Waitlists: {len(full)} full sessions, {len(slugs)} programme pages "
+                  f"({wfail} unreadable), {sum(1 for o in inv_observations if (o.get('waitlist') or 0) > 0)} with people waiting")
 
         # Send everything we read (including genuine empties -> departures) in
         # one RPC call. Sessions we could NOT read are omitted, so a fetch
