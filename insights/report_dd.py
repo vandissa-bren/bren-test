@@ -1,0 +1,382 @@
+"""
+report_dd.py -- every figure behind the Dink & Drive example report.
+
+Inputs: data/sessions.csv, data/rosters.csv, data/catalogue.csv (2 Oct 2026
+exports) and backend/venues.json. Titles, levels and formats are read with the
+feed model's own catalogue_terms (via title_terms), so the report and the feed
+agree. Output: report_dd.json.
+
+Ratings on rosters are PlayByPoint's: 1.0 = unrated and 2.0 = an unconfirmed
+default spike (the model's rule), both dropped; above 6.0 dropped as noise.
+What's left is mostly self-rated half steps (2.5, 3.0, 3.5) plus a few DUPR.
+"""
+import json, os, re
+from math import radians, sin, cos, asin, sqrt
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+from catalogue_terms import session_terms as parse
+
+HERE = Path(__file__).resolve().parent
+MEL = "Australia/Melbourne"
+FID = 1557
+NOW = None  # set from the data
+# Where the exports are read from and the working files go (build_insights.py sets both).
+DATA = Path(os.environ.get("INSIGHTS_DATA", HERE / "data"))
+WORK = Path(os.environ.get("INSIGHTS_WORK", HERE / "work"))
+
+
+def registry():
+    data = json.loads((HERE.parent / "venues.json").read_text())
+    if isinstance(data, dict):
+        data = data.get("venues", data)
+    if isinstance(data, dict):
+        data = list(data.values())
+    return {int(v["id"]): v for v in data if isinstance(v, dict) and str(v.get("id", "")).isdigit()}
+
+
+REG = registry()
+
+
+def km(a, b):
+    a, b = REG.get(int(a)), REG.get(int(b))
+    if not a or not b or not a.get("lat") or not b.get("lat"):
+        return np.nan
+    dl, dn = radians(b["lat"] - a["lat"]), radians(b["lng"] - a["lng"])
+    h = sin(dl / 2) ** 2 + cos(radians(a["lat"])) * cos(radians(b["lat"])) * sin(dn / 2) ** 2
+    return 2 * 6371 * asin(sqrt(h))
+
+
+def name(fid):
+    n = REG.get(int(fid), {}).get("name", str(fid))
+    return n.replace(" | ", " ").replace("Dink & Drive Pickleball Club", "Dink & Drive")
+
+
+def pct(a, b):
+    return None if not b else round(100.0 * a / b, 1)
+
+
+def load():
+    s = pd.read_csv(DATA / "sessions.csv", na_values=["null"])
+    r = pd.read_csv(DATA / "rosters.csv", na_values=["null"])
+    c = pd.read_csv(DATA / "catalogue.csv", na_values=["null"])
+    for col in ("starts_at", "first_obs", "last_obs", "first_full_at"):
+        s[col] = pd.to_datetime(s[col], utc=True, errors="coerce", format="mixed")
+    for col in ("first_seen", "last_seen"):
+        r[col] = pd.to_datetime(r[col], utc=True, errors="coerce", format="mixed")
+    s["fid"] = s["venue_id"].str.extract(r"(\d+)$")[0].astype(float)
+    c["key"] = "pbp-" + c["lesson_id"].astype(str)
+    c["title"] = c["title"].str.strip()
+    return s, r, c
+
+
+def attach_titles(s, c):
+    """Title for every session: its own catalogue row, else the weekly fixture at
+    the same venue, weekday, start time and type (venues repeat these)."""
+    loc = s["starts_at"].dt.tz_convert(MEL)
+    s["dow"], s["hm"] = loc.dt.dayofweek, loc.dt.strftime("%H:%M")
+    s["hour"] = loc.dt.hour
+    c["dow"] = pd.to_datetime(c["date"]).dt.dayofweek
+    c["dur_h"] = (pd.to_datetime(c["end_time"], format="%H:%M", errors="coerce")
+                  - pd.to_datetime(c["start"], format="%H:%M", errors="coerce")).dt.total_seconds() / 3600
+    by_key = c.set_index("key")
+    fx = (c.groupby(["venue_id", "dow", "start", "type"])
+           .agg(titles=("title", lambda x: sorted(set(x))), skill=("skill_level", "first"), dur=("dur_h", "median"))
+           .reset_index())
+    fx = {(r.venue_id, r.dow, r.start, r.type): r for r in fx.itertuples()}
+    titles, skills, durs, how = [], [], [], []
+    for r in s.itertuples():
+        if r.session_key in by_key.index and isinstance(by_key.loc[r.session_key]["title"] if not isinstance(by_key.loc[r.session_key], pd.DataFrame) else by_key.loc[r.session_key].iloc[0]["title"], str):
+            row = by_key.loc[r.session_key]
+            row = row.iloc[0] if isinstance(row, pd.DataFrame) else row
+            titles.append(row["title"]); skills.append(row["skill_level"]); durs.append(row["dur_h"]); how.append("key")
+            continue
+        f = fx.get((r.venue_id, r.dow, r.hm, r.session_type))
+        if f is not None and len(f.titles) == 1:
+            titles.append(f.titles[0]); skills.append(f.skill); durs.append(f.dur); how.append("fixture")
+        else:
+            titles.append(None); skills.append(None); durs.append(np.nan); how.append(None)
+    s["title"], s["skill_level"], s["dur_h"], s["title_how"] = titles, skills, durs, how
+    terms = [parse(t, ty if isinstance(ty, str) else None, sk if isinstance(sk, str) else None) if isinstance(t, str) and t else None
+             for t, ty, sk in zip(s["title"], s["session_type"], s["skill_level"])]
+    s["family"] = [t["family"] if t else None for t in terms]
+    s["fmt"] = [t["format"] if t else None for t in terms]
+    s["label"] = [t["label"] if t else None for t in terms]
+    s["band_lo"] = [t["band"][0] if t and t["band"] else np.nan for t in terms]
+    s["band_hi"] = [t["band"][1] if t and t["band"] else np.nan for t in terms]
+    s["level_class"] = [level_class(t) for t in terms]
+    s["price_n"] = s["price"].str.extract(r"(\d+(?:\.\d+)?)")[0].astype(float)
+    s["price_hr"] = s["price_n"] / s["dur_h"]
+    s["daypart"] = np.select([s["hour"] < 9, s["hour"] < 17], ["early", "day"], "evening")
+    s["weekend"] = s["dow"] >= 5
+    return s
+
+
+def level_class(t):
+    if not t:
+        return None
+    if t["all_levels"]:
+        return "all levels"
+    if not t["band"]:
+        return None
+    lo, hi = t["band"]
+    hi = min(hi, 4.5)
+    mid = (lo + hi) / 2
+    return "beginner" if mid < 2.75 else "intermediate" if mid < 3.5 else "advanced"
+
+
+def finished(s):
+    f = s[(s["starts_at"] < NOW) & s["capacity"].gt(0) & s["spots_at_start"].notna()
+          & (s["spots_at_start"] <= s["capacity"])].copy()
+    f["fill"] = 1 - f["spots_at_start"] / f["capacity"]
+    f["booked"] = f["capacity"] - f["spots_at_start"]
+    f["sold_out"] = f["spots_at_start"] == 0
+    f["so_h"] = np.where(f["sold_out"] & (f["first_full_at"] > f["first_obs"]),
+                         (f["starts_at"] - f["first_full_at"]).dt.total_seconds() / 3600, np.nan)
+    return f
+
+
+def rosters(s, r):
+    m = r.merge(s[["session_key", "fid", "starts_at", "title", "family", "label", "band_lo", "band_hi",
+                   "dow", "hour", "hm"]], on="session_key", how="left")
+    m = m[m["fid"].notna()].copy()
+    g = m.groupby("session_key")
+    last_pass = g["last_seen"].transform("max")
+    m["cancelled"] = (m["last_seen"] < last_pass) & (m["last_seen"] < m["starts_at"])
+    m["rating"] = m["rating_at_time"].where(~m["rating_at_time"].isin([1.0, 2.0]) & (m["rating_at_time"] <= 6.0))
+    return m
+
+
+def headline(fin_dd):
+    days = (fin_dd["starts_at"].max() - fin_dd["starts_at"].min()).days + 1
+    return {"finished": len(fin_dd), "days": days,
+            "avg_fill": round(100 * fin_dd["fill"].mean(), 1),
+            "sold_out": int(fin_dd["sold_out"].sum()),
+            "takings": round(float((fin_dd["price_n"] * fin_dd["booked"]).sum())),
+            "empty_value": round(float((fin_dd["price_n"] * fin_dd["spots_at_start"]).sum())),
+            "empty_places": int(fin_dd["spots_at_start"].sum())}
+
+
+def by_title(fin_dd, m_dd):
+    out = []
+    for t, g in fin_dd.groupby(fin_dd["title"].fillna("(title unknown)")):
+        rr = m_dd[(m_dd["title"] == t) & ~m_dd["cancelled"]]["rating"].dropna()
+        lo, hi = g["band_lo"].iloc[0], g["band_hi"].iloc[0]
+        within = None
+        if len(rr) and not np.isnan(lo):
+            within = pct(int(((rr >= lo - 0.01) & (rr <= hi + 0.01)).sum()), len(rr))
+        out.append({"title": t, "label": g["label"].iloc[0], "family": g["family"].iloc[0],
+                    "format": g["fmt"].iloc[0], "times": ", ".join(sorted(set(g["hm"]))),
+                    "n": len(g), "fill": round(100 * g["fill"].mean(), 1), "sold_out": int(g["sold_out"].sum()),
+                    "so_h_median": None if g["so_h"].dropna().empty else round(float(g["so_h"].median()), 1),
+                    "capacity": float(g["capacity"].median()),
+                    "price": float(g["price_n"].median()) if g["price_n"].notna().any() else None,
+                    "price_hr": None if g["price_hr"].dropna().empty else round(float(g["price_hr"].median()), 2),
+                    "takings": round(float((g["price_n"] * g["booked"]).sum())),
+                    "empty_value": round(float((g["price_n"] * g["spots_at_start"]).sum())),
+                    "ratings_n": int(len(rr)), "rating_median": None if rr.empty else float(rr.median()),
+                    "rating_p25": None if rr.empty else float(rr.quantile(.25)),
+                    "rating_p75": None if rr.empty else float(rr.quantile(.75)),
+                    "rated_within_label": within})
+    return sorted(out, key=lambda x: -x["n"])
+
+
+def players(m, s):
+    dd = m[(m["fid"] == FID) & ~m["cancelled"]]
+    ids = dd["pbp_user_id"].unique()
+    f = dd.groupby("pbp_user_id").size()
+    buckets = {"1 session": int((f == 1).sum()), "2 sessions": int((f == 2).sum()),
+               "3-4 sessions": int(f.between(3, 4).sum()), "5+ sessions": int((f >= 5).sum())}
+    top = f.sort_values(ascending=False)
+    allp = m[m["pbp_user_id"].isin(ids) & ~m["cancelled"]]
+    share = allp.assign(here=allp["fid"] == FID).groupby("pbp_user_id")["here"].mean()
+    loyalty = {"mostly here (over 80%)": int((share > 0.8).sum()),
+               "split (50-80%)": int(share.between(0.5, 0.8).sum()),
+               "mostly elsewhere (under 50%)": int((share < 0.5).sum())}
+    # retention, low data: players whose first Dink & Drive session (since capture)
+    # started 18-24 Sep; did they book another Dink & Drive session after it?
+    first = dd.sort_values("starts_at").drop_duplicates("pbp_user_id")
+    w1 = first[(first["starts_at"] >= pd.Timestamp("2026-09-17 14:00", tz="UTC"))
+               & (first["starts_at"] < pd.Timestamp("2026-09-24 14:00", tz="UTC"))]
+    later = dd.merge(w1[["pbp_user_id", "starts_at"]].rename(columns={"starts_at": "first_at"}), on="pbp_user_id")
+    came_back = later[later["starts_at"] > later["first_at"]]["pbp_user_id"].unique()
+    # by what their first session was
+    path = []
+    for fam, g in w1.groupby(w1["family"].fillna("unknown")):
+        back = g["pbp_user_id"].isin(came_back).sum()
+        path.append({"first_session": fam, "players": len(g), "came_back": int(back), "share": pct(back, len(g))})
+    rated = dd["rating"].dropna()
+    return {"players": len(ids), "bookings": int(len(dd)), "frequency": buckets,
+            "top20_share": pct(int(top.head(max(1, int(len(top) * 0.2))).sum()), int(top.sum())),
+            "loyalty": loyalty,
+            "retention": {"first_week_players": len(w1), "came_back": int(len(came_back)),
+                          "share": pct(len(came_back), len(w1)), "by_first_session": path},
+            "ratings": {"rows": int(len(dd)), "rated": int(len(rated)), "share": pct(len(rated), len(dd)),
+                        "dist": {str(k): int(v) for k, v in rated.value_counts().sort_index().items()}}}
+
+
+def travellers(m, s):
+    """The traveller tree from the catalogue doc, on two weeks of data."""
+    ok = m[~m["cancelled"]]
+    ids = ok[ok["fid"] == FID]["pbp_user_id"].unique()
+    allp = ok[ok["pbp_user_id"].isin(ids)]
+    home = (allp.groupby(["pbp_user_id", "fid"]).size().reset_index(name="n")
+            .sort_values(["pbp_user_id", "n"], ascending=[True, False]).drop_duplicates("pbp_user_id"))
+    home["km"] = home["fid"].map(lambda f: km(FID, f))
+    trav = home[(home["fid"] != FID) & (home["km"] > 5)]
+    near_dd = {f for f in REG if f != FID and km(FID, f) <= 5}
+    out, classes = [], {"product draw": 0, "preference draw": 0, "location anchor": 0, "session draw": 0}
+    for row in trav.itertuples():
+        pid, hfid = row.pbp_user_id, row.fid
+        home_area = {f for f in REG if km(hfid, f) <= 5} | {hfid}
+        mine = allp[(allp["pbp_user_id"] == pid) & (allp["fid"] == FID)]
+        # Q1: was the same kind of session on near home, same day, within an hour?
+        same_near = False
+        for v in mine.itertuples():
+            day = v.starts_at.tz_convert(MEL).date()
+            cand = s[(s["fid"].isin(home_area)) & (s["starts_at"].dt.tz_convert(MEL).dt.date == day)
+                     & ((s["starts_at"] - v.starts_at).abs() <= pd.Timedelta(hours=1))
+                     & (s["family"] == v.family)]
+            if not np.isnan(v.band_lo):
+                cand = cand[(cand["band_lo"] <= v.band_hi) & (cand["band_hi"] >= v.band_lo)]
+            if len(cand):
+                same_near = True
+                break
+        slots = set(zip(mine["dow"], mine["hour"]))
+        workhours = all(d < 5 and (6 <= h < 9 or 12 <= h < 14 or 17 <= h < 20) for d, h in slots)
+        other_near = allp[(allp["pbp_user_id"] == pid) & allp["fid"].isin(near_dd)].shape[0] > 0
+        if not same_near:
+            cls = "product draw"
+        elif len(slots) > 1:
+            cls = "preference draw"
+        elif workhours and not other_near:
+            cls = "location anchor"
+        else:
+            cls = "session draw"
+        classes[cls] += 1
+        out.append({"home": name(hfid), "km": round(row.km, 1), "dd_sessions": len(mine), "class": cls,
+                    "titles": sorted(set(mine["title"].dropna()))})
+    homes = pd.Series([o["home"] for o in out]).value_counts().to_dict()
+    draws = pd.Series([t for o in out if o["class"] == "product draw" for t in o["titles"]]).value_counts().to_dict()
+    return {"players": len(ids), "travellers": len(out), "classes": classes, "homes": homes,
+            "product_draw_sessions": draws, "km_median": round(float(trav["km"].median()), 1) if len(trav) else None}
+
+
+def rivals(m, s, fin):
+    ok = m[~m["cancelled"]]
+    ids = ok[ok["fid"] == FID]["pbp_user_id"].unique()
+    allp = ok[ok["pbp_user_id"].isin(ids)]
+    total = len(allp)
+    shared = (allp[allp["fid"] != FID].groupby("fid")
+              .agg(sessions=("session_key", "size"), players=("pbp_user_id", "nunique")).reset_index())
+    dd_sessions = s[(s["fid"] == FID) & s["family"].notna()]
+    out = []
+    for row in shared.sort_values("sessions", ascending=False).head(6).itertuples():
+        f = int(row.fid)
+        theirs = s[(s["fid"] == f) & s["family"].notna()]
+        clash = 0
+        for v in dd_sessions.itertuples():
+            c = theirs[(theirs["starts_at"].dt.tz_convert(MEL).dt.date == v.starts_at.tz_convert(MEL).date())
+                       & ((theirs["starts_at"] - v.starts_at).abs() <= pd.Timedelta(hours=1))
+                       & (theirs["family"] == v.family)]
+            if not np.isnan(v.band_lo):
+                c = c[(c["band_lo"] <= v.band_hi) & (c["band_hi"] >= v.band_lo) | c["band_lo"].isna()]
+            clash += bool(len(c))
+        ff = fin[fin["fid"] == f]
+        out.append({"fid": f, "name": name(f), "km": round(km(FID, f), 1),
+                    "shared_players": int(row.players), "shared_sessions": int(row.sessions),
+                    "shared_play_pct": pct(int(row.sessions), total),
+                    "head_to_head_pct": pct(clash, len(dd_sessions)),
+                    "avg_fill": None if ff.empty else round(100 * ff["fill"].mean(), 1),
+                    "sessions_logged": int((s["fid"] == f).sum())})
+    return {"dd_players": len(ids), "their_sessions": total, "venues": out}
+
+
+def jar_compare(s, fin):
+    """Public facts, side by side: what Dink & Drive and The Jar South Melbourne run."""
+    rows = []
+    for f in (FID, 597):
+        g = s[(s["fid"] == f) & s["title"].notna()]
+        weeks = max(1.0, (g["starts_at"].max() - g["starts_at"].min()).days / 7)
+        mix = (g.groupby(["family", "level_class"], dropna=False).size() / weeks).round(1)
+        rows.append({"venue": name(f), "sessions_per_week": round(len(g) / weeks, 1),
+                     "price_hr_median": round(float(g["price_hr"].median()), 2) if g["price_hr"].notna().any() else None,
+                     "mix": {f"{a or 'unknown'} / {b or 'no level'}": float(v) for (a, b), v in mix.items()}})
+    return rows
+
+
+def similar(fin, family, level, daypart, weekend):
+    """Other venues' finished sessions of the same kind: the market's answer to
+    'would this fill?'. Dink & Drive's own sessions are left out."""
+    fin = fin[fin["fid"] != FID]
+    g = fin[(fin["family"] == family) & (fin["level_class"] == level)
+            & (fin["daypart"] == daypart) & (fin["weekend"] == weekend)]
+    if g.empty:
+        return {"n": 0}
+    return {"n": len(g), "venues": int(g["fid"].nunique()), "median_fill": round(100 * g["fill"].median(), 1),
+            "p25": round(100 * g["fill"].quantile(.25), 1), "p75": round(100 * g["fill"].quantile(.75), 1),
+            "sold_out_share": pct(int(g["sold_out"].sum()), len(g))}
+
+
+def early_social(fin):
+    g = fin[(fin["fid"] != FID) & (fin["family"] == "social") & (fin["daypart"] == "early") & ~fin["weekend"]]
+    return {"n": len(g), "venues": int(g["fid"].nunique()),
+            "median_fill": None if g.empty else round(100 * g["fill"].median(), 1)}
+
+
+def price_position(fin):
+    out = []
+    dd = fin[(fin["fid"] == FID) & fin["price_hr"].notna()]
+    for (fam, lvl), g in dd.groupby(["family", "level_class"]):
+        mk = fin[(fin["family"] == fam) & (fin["level_class"] == lvl) & fin["price_hr"].notna() & (fin["fid"] != FID)]
+        if mk.empty:
+            continue
+        out.append({"family": fam, "level": lvl, "dd_price_hr": round(float(g["price_hr"].median()), 2),
+                    "market_price_hr": round(float(mk["price_hr"].median()), 2),
+                    "market_p25": round(float(mk["price_hr"].quantile(.25)), 2),
+                    "market_p75": round(float(mk["price_hr"].quantile(.75)), 2),
+                    "market_n": len(mk), "dd_fill": round(100 * g["fill"].mean(), 1),
+                    "market_fill": round(100 * mk["fill"].mean(), 1)})
+    return out
+
+
+def main():
+    global NOW
+    s, r, c = load()
+    NOW = max(s["last_obs"].max(), r["last_seen"].max())
+    s = attach_titles(s, c)
+    fin = finished(s)
+    fin_dd = fin[fin["fid"] == FID]
+    m = rosters(s, r)
+    m_dd = m[m["fid"] == FID]
+    out = {
+        "as_of": str(NOW),
+        "title_coverage": s[s["fid"] == FID]["title_how"].value_counts(dropna=False).to_dict(),
+        "headline": headline(fin_dd),
+        "sessions": by_title(fin_dd, m_dd),
+        "players": players(m, s),
+        "travellers": travellers(m, s),
+        "rivals": rivals(m, s, fin),
+        "jar_compare": jar_compare(s, fin),
+        "price_position": price_position(fin),
+        "similar": {
+            "beginner social, weekday evening": similar(fin, "social", "beginner", "evening", False),
+            "beginner social, weekday day": similar(fin, "social", "beginner", "day", False),
+            "intermediate social, weekday evening": similar(fin, "social", "intermediate", "evening", False),
+            "intermediate social, weekday day": similar(fin, "social", "intermediate", "day", False),
+            "advanced social, weekday evening": similar(fin, "social", "advanced", "evening", False),
+            "advanced social, weekday day": similar(fin, "social", "advanced", "day", False),
+            "competitive, weekday evening, intermediate": similar(fin, "competitive", "intermediate", "evening", False),
+            "any social, early morning weekday": early_social(fin),
+            "learning, early morning weekday": similar(fin, "learning", None, "early", False),
+        },
+    }
+    (WORK / "report_dd.json").write_text(json.dumps(out, indent=1, default=str))
+    return out
+
+
+if __name__ == "__main__":
+    o = main()
+    print(json.dumps({k: o[k] for k in ("title_coverage", "headline")}, indent=1, default=str))
