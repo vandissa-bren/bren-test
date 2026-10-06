@@ -192,6 +192,37 @@ async def supabase_upsert(records: list[dict]) -> None:
                 f"Supabase write failed ({resp.status_code}): {resp.text[:300]}"
             )
 
+async def record_listing_horizon(rows: list[dict]) -> None:
+    """How far ahead each program is listed, one row per program per day
+    (listing_horizon, 20261016130000). Never fails the run: a missed day is
+    a gap in a trend, not lost sessions."""
+    if not rows:
+        return
+    from zoneinfo import ZoneInfo as _ZI
+    today = datetime.now(_ZI("Australia/Melbourne")).date().isoformat()
+    # One row per venue and program: a program read twice keeps its furthest date.
+    best = {}
+    for r in rows:
+        k = (r["facility_id"], r["program_slug"])
+        if k not in best or (r["furthest_date"], r["lessons_ahead"]) > (best[k]["furthest_date"], best[k]["lessons_ahead"]):
+            best[k] = r
+    body = [{**r, "observed_on": today} for r in best.values()]
+    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
+               "Content-Type": "application/json",
+               "Prefer": "resolution=merge-duplicates,return=minimal"}
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                f"{SUPABASE_URL}/rest/v1/listing_horizon?on_conflict=facility_id,program_slug,observed_on",
+                json=body, headers=headers)
+        if resp.status_code in (200, 201, 204):
+            console.print(f"  Listing horizon: {len(body)} programs recorded")
+        else:
+            console.print(f"  [yellow]Listing horizon NOT recorded: HTTP {resp.status_code} {resp.text[:200]}[/yellow]")
+    except Exception as e:
+        console.print(f"  [yellow]Listing horizon NOT recorded: {type(e).__name__}: {e}[/yellow]")
+
+
 async def scrape_pbp_venue(
     cookies: dict,
     user_id: int,
@@ -218,6 +249,7 @@ async def scrape_pbp_venue(
         "_list_failed": False,      # the clinic list itself could not be read
         "_clinics_tried": 0,        # clinics in range that we tried to read
         "_failed_slugs": [],        # program slugs whose page could not be read
+        "_listing": [],             # how far ahead each program is listed (see run_once)
     }
 
     date_strs = {d.isoformat() for d in dates}
@@ -270,6 +302,19 @@ async def scrape_pbp_venue(
                     if props is None:
                         raise RuntimeError("program page had no session data (signed out or challenged?)")
                     lessons_raw = props.get("sessions") or props.get("clinic_lessons") or []
+
+                    # How far ahead the venue lists this program: every future
+                    # lesson date it publishes, not just the ones in our window
+                    # (listing_horizon, 20261016130000). Melbourne's date, since
+                    # the job runs overnight UTC.
+                    from zoneinfo import ZoneInfo as _ZI
+                    _today = datetime.now(_ZI("Australia/Melbourne")).date().isoformat()
+                    _future = sorted(str(l.get("lesson_date")) for l in lessons_raw
+                                     if isinstance(l, dict) and re.match(r"^\d{4}-\d{2}-\d{2}$", str(l.get("lesson_date") or ""))
+                                     and str(l.get("lesson_date")) >= _today)
+                    if _future:
+                        result["_listing"].append({"program_slug": program_slug, "furthest_date": _future[-1],
+                                                   "lessons_ahead": len(_future)})
 
                     # Metadata
                     raw_desc = props.get("description") or ""
@@ -342,6 +387,11 @@ async def scrape_pbp_venue(
                         # so unlike package pricing they belong on the session.
                         lesson_tiers = _pricing_tiers(lesson.get("individual_prices"))
 
+                        # Who coaches it, as PlayByPoint lists it (teacher_names).
+                        # Kept for the fill log and insights: per-coach fill.
+                        coaches = [str(n).strip() for n in (lesson.get("teacher_names") or [])
+                                   if n and str(n).strip()]
+
                         # Roster
                         roster = []
                         if lid:
@@ -383,6 +433,7 @@ async def scrape_pbp_venue(
                             # field is always present and callers need no
                             # special-casing. `price` above is unchanged.
                             "price_tiers": lesson_tiers,
+                            "coaches": coaches,
                         })
                 except Exception as e:
                     console.print(f"    [yellow]clinic {clinic_id} error for {name}: {e}[/yellow]")
@@ -430,12 +481,15 @@ async def run_once():
         # carried over. And when no venue could be read the run exits
         # non-zero, so the workflow goes red instead of green.
         records, not_saved, partial = [], [], []
+        listing_rows = []   # listing_horizon rows, written after the venues
         for r in pbp_results:
             if not isinstance(r, dict):
                 continue
             list_failed = r.pop("_list_failed", False)
             tried = r.pop("_clinics_tried", 0)
             failed_slugs = sorted(set(r.pop("_failed_slugs", [])))
+            for row in r.pop("_listing", []):
+                listing_rows.append({"facility_id": int(r["id"]), **row})
             if list_failed or (tried and len(failed_slugs) >= tried):
                 not_saved.append(r["name"])
                 console.print(f"  [red]✗ NOT SAVED[/red] {r['name']} · "
@@ -465,6 +519,7 @@ async def run_once():
             console.print(f"[red]{len(not_saved)} venue(s) NOT SAVED: {', '.join(not_saved)}[/red]")
         if partial:
             console.print(f"[yellow]{len(partial)} venue(s) partly read: {', '.join(partial)}[/yellow]")
+        await record_listing_horizon(listing_rows)
         if pbp_results and not records:
             console.print("[red]EVERY VENUE FAILED -- nothing written; exiting non-zero so the run shows as failed[/red]")
             sys.exit(1)
