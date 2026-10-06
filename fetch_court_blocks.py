@@ -9,6 +9,11 @@ import os
 from datetime import date, timedelta, datetime, timezone
 from zoneinfo import ZoneInfo
 
+# The court-hire log rows (court_slot_rows) and the court-rate log live in
+# court_log.py, shared with fetch_sportswell.py. Imported here under the same
+# names, so fetch_court_blocks.court_slot_rows still works.
+from court_log import court_slot_rows, record_court_rates
+
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 PBP_COOKIES_JSON = os.environ["PBP_COOKIES_JSON"]
@@ -319,47 +324,6 @@ def apply_prices_to_blocks(blocks: list, court_prices: dict) -> list:
             "shift": shift,
         })
     return result
-
-
-def court_slot_rows(facility_id, target_date: date, universe: dict, court_slots: dict,
-                    valid_ids: set, observed_at: datetime, now_local: datetime = None) -> list:
-    """The court-hire log rows for one venue-day: one per 30-minute slot.
-
-    universe     {sec: shift} -- every slot PlayByPoint listed, free or taken
-    court_slots  {"court_id|name": [secs free]} -- from fetch_blocks_for_surface
-    valid_ids    the venue's bookable court ids (its inventory)
-
-    Slots that have already started are left out: PlayByPoint stops offering a
-    started slot, and logging it would record a booking that never happened.
-    Courts outside the inventory are left out, the same rule the blocks follow.
-    """
-    now_local = now_local or datetime.now(ZoneInfo("Australia/Melbourne"))
-    free_by_sec: dict = {}
-    for court_key, secs in court_slots.items():
-        court_id = court_key.split("|", 1)[0]
-        if str(court_id) not in valid_ids:
-            continue
-        for sec in secs:
-            free_by_sec.setdefault(int(sec), set()).add(str(court_id))
-
-    rows = []
-    for sec in sorted(set(universe) | set(free_by_sec)):
-        if target_date == now_local.date():
-            now_sec = now_local.hour * 3600 + now_local.minute * 60 + now_local.second
-            if sec <= now_sec:
-                continue
-        elif target_date < now_local.date():
-            continue
-        rows.append({
-            "facility_id": int(facility_id),
-            "slot_date": target_date.isoformat(),
-            "slot_start": sec_to_hhmm(sec),
-            "free_court_ids": sorted(free_by_sec.get(sec, set())),
-            "n_courts": len(valid_ids),
-            "shift": universe.get(sec),
-            "observed_at": observed_at.isoformat(),
-        })
-    return rows
 
 
 async def fetch_court_blocks_for_venue(api, facility_id: int, target_date: date, user_id: int, existing_prices: dict, existing_fetched_at: dict = None, errors: list = None, slot_log: list = None) -> tuple:
@@ -697,6 +661,10 @@ async def main():
                     court_log_result[k] += int(out.get(k) or 0)
         print(f"  Court log: {len(court_log_rows)} slots read, "
               f"{court_log_result['inserted']} new states, {court_log_result['extended']} unchanged")
+        # Court-hire rates over time (record_court_rates, 20261016110000): the
+        # rates just saved, logged as states. Never fails the run.
+        if not os.environ.get("SKIP_COURT_LOG"):
+            print("  " + await record_court_rates(client, SUPABASE_URL, headers))
 
     # Per-cycle summary. Warming was previously silent on success, so a venue
     # that stopped producing blocks surfaced as a user reporting empty
