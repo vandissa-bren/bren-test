@@ -13,6 +13,10 @@ Runs once a day (see .github/workflows/build_insights.yml). For each window
   4. stores it in insights_builds (one row per window). Only admins can read it,
      through admin_insights_full().
 
+The window before is exported too and summarised in data["prev"] (compact
+sessions and player counts), so the page can show "compared with the period
+before" for any filter.
+
 Environment: SUPABASE_URL, SUPABASE_SERVICE_KEY (or SUPABASE_KEY).
 Optional: INSIGHTS_WINDOWS="7,28,90".
 
@@ -120,6 +124,12 @@ def shareable(d: dict, net: dict) -> dict:
     net["groups"] = [g for g in net.get("groups", []) if g["size"] >= MIN_GROUP]
     net["glinks"] = [l for l in net.get("glinks", []) if l["n"] >= MIN_GROUP]
     d["net"] = net
+    d["levelFit"] = [r for r in d.get("levelFit", []) if r["v"] in ids]
+    if d.get("prev"):
+        p = dict(d["prev"])
+        p["sessions"] = [x for x in p["sessions"] if x[0] in ids]
+        p["venuePlayers"] = {k: n for k, n in p.get("venuePlayers", {}).items() if int(k) in ids}
+        d["prev"] = p
     return d
 
 
@@ -138,11 +148,15 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--csv", help="build from CSV exports in this folder instead of Supabase")
     ap.add_argument("--out", help="write the result here instead of storing it")
+    ap.add_argument("--csv-prev", help="with --csv: CSV exports of the period before, for data['prev']")
     a = ap.parse_args()
 
     if a.csv:
         with tempfile.TemporaryDirectory() as w:
             d, net = build(Path(a.csv), Path(w))
+            if a.csv_prev:
+                import build_overview as B
+                d["prev"] = B.prev_summary(Path(a.csv_prev))
         out = clean(dict(shareable(d, net), window={"days": None, "builtAt": datetime.now(timezone.utc).isoformat()}))
         Path(a.out or "insights.json").write_text(json.dumps(out, separators=(",", ":"), default=str))
         print(f"{len(out['venues'])} venues, {len(out['sessions'])} sessions -> {a.out or 'insights.json'}")
@@ -167,6 +181,19 @@ def main() -> int:
                         print(f"{days}d: no sessions between {frm} and {to}; skipped")
                         continue
                     d, net = build(data_dir, work_dir)
+                    # the period before, the same length
+                    prev_dir = Path(tmp) / "prev"
+                    prev_dir.mkdir()
+                    # (the page only compares when this covers the whole period: early on
+                    # the log doesn't reach back far enough for the 90-day one)
+                    try:
+                        p_frm, p_to = frm - timedelta(days=days), frm - timedelta(days=1)
+                        pn = export(client, url, h, p_frm, p_to, prev_dir)
+                        if pn["sessions"]:
+                            import build_overview as B
+                            d["prev"] = dict(B.prev_summary(prev_dir), asked=[str(p_frm), str(p_to)])
+                    except Exception as e:
+                        print(f"{days}d: previous period skipped ({type(e).__name__}: {e})")
                 out = clean(dict(shareable(d, net), window={
                     "days": days, "from": str(frm), "to": str(to),
                     "builtAt": datetime.now(timezone.utc).isoformat(), "exported": n}))
