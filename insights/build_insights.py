@@ -125,6 +125,7 @@ def shareable(d: dict, net: dict) -> dict:
     net["glinks"] = [l for l in net.get("glinks", []) if l["n"] >= MIN_GROUP]
     d["net"] = net
     d["levelFit"] = [r for r in d.get("levelFit", []) if r["v"] in ids]
+    d["levelClass"] = [r for r in d.get("levelClass", []) if r["v"] is None or r["v"] in ids]
     if d.get("prev"):
         p = dict(d["prev"])
         p["sessions"] = [x for x in p["sessions"] if x[0] in ids]
