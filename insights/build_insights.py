@@ -7,7 +7,7 @@ Runs once a day (see .github/workflows/build_insights.yml). For each window
   1. exports sessions, rosters and the catalogue from Supabase through three
      service-only functions (insights_export_sessions / _rosters / _catalogue),
   2. runs the same analysis as the Melbourne overview prototype
-     (build_overview.py -> report_dd, report_more, timing_preview, network),
+     (build_overview.py -> venue_report, report_more, timing_preview, network),
   3. keeps the aggregate view only -- venues named, players only as counts,
      no player rows or ties, groups / shared-player links of 5 or more --
   4. stores it in insights_builds (one row per window). Only admins can read it,
@@ -94,13 +94,13 @@ def build(data_dir: Path, work_dir: Path):
     import importlib
     os.environ["INSIGHTS_DATA"] = str(data_dir)
     os.environ["INSIGHTS_WORK"] = str(work_dir)
-    import report_dd as R
+    import venue_report as R
     R.DATA, R.WORK = data_dir, work_dir
     import report_more as M
     import build_overview as B
     importlib.reload(M)
     importlib.reload(B)
-    M.main()                      # writes report_more.json, which build_overview reads
+    M.main()                      # market-wide only; writes report_more.json, which build_overview reads
     return B.main()
 
 
