@@ -308,7 +308,8 @@ _FORMATS = (
     ("coaching", r"\bcoach(?:ing|ed)?\b|\blesson\b"),
     ("clinic", r"\bclinic\b|\bdrill[sz]?\b|\bskill[sz]\b|\bboot\s*camp\b|\bdevelopment\b|\baccelerate\b|"
                r"\bacademy\b|\bprogram(?:me)?\b|\bpathway\b|\bjuniors?\b|\bkids?\b|\byouth\b"),
-    ("match_play", r"\bmatch\s*play\b|\bset\s+pairs\b|\bfixed\s+partners?\b|\bpower\s+play\b|\bcompetitive\b"),
+    ("match_play", r"\bmatch\s*play\b|\bset\s+pairs\b|\bfixed\s+partners?\b|\bpower\s+play\b|\bcompetitive\b|"
+                   r"\brally\s+to\s+the\s+top\b"),
     ("open_play", r"\bopen\s+play\b"),
     ("social", r"\bsocials?\b"),
 )
