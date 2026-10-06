@@ -1,0 +1,22 @@
+name: Waitlist Probe
+# Run by hand. Finds which PlayByPoint field carries a session's waitlist
+# length, before the fill log starts keeping it. Prints field names, counts and
+# numbers only: never a name, an email or a cookie. Saves nothing.
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install httpx curl_cffi loguru python-dotenv rich supabase typer tenacity
+      - name: Probe waitlist fields
+        env:
+          PBP_COOKIES_JSON: ${{ secrets.PBP_COOKIES_JSON }}
+        run: python waitlist_probe.py
