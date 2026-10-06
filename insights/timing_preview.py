@@ -6,7 +6,7 @@ PlayByPoint market, from three exports:
   rosters.csv    roster_sightings as stored (query 2)
   catalogue.csv  today's catalogue sessions, for titles and levels (query 3)
 
-Usage: python3 timing_preview.py <dir with the CSVs> [facility_id] > preview.json
+Usage: python3 timing_preview.py <dir with the CSVs> <facility_id> > preview.json
 
 Every figure carries its sample size. The data-quality checks from the
 catalogue's testing list run first and are reported alongside.
@@ -294,7 +294,7 @@ def rivals(rows, reg, fid, k=4):
     return {"players": len(mine), "their_sessions": total, "venues": out}
 
 
-def main(d, fid=1557):
+def main(d, fid):
     s, r, c = load(Path(d))
     now = max(s["last_obs"].max(), r["last_seen"].max())
     reg = registry()
@@ -340,6 +340,6 @@ def main(d, fid=1557):
 
 
 if __name__ == "__main__":
-    d = sys.argv[1]
-    fid = int(sys.argv[2]) if len(sys.argv) > 2 else 1557
-    print(json.dumps(main(d, fid), indent=1, default=str))
+    if len(sys.argv) != 3 or not sys.argv[2].isdigit():
+        sys.exit("usage: python3 timing_preview.py <dir with the CSVs> <facility_id>")
+    print(json.dumps(main(sys.argv[1], int(sys.argv[2])), indent=1, default=str))
