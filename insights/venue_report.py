@@ -316,9 +316,40 @@ def level_class(t):
     return "beginner" if mid < 2.75 else "intermediate" if mid < 3.5 else "advanced"
 
 
+PULLED_GAP_H = 24      # last reading this long before the start ...
+PULLED_SEEN_H = 12     # ... while the venue's other sessions were read this much later
+
+
+def pulled(s):
+    """Sessions the venue took down before they ran. The fill log's last
+    reading of such a session is days before its start, while its venue's
+    other sessions kept being read: the capture job was running, the session
+    was no longer listed. (A capture outage stops every session at the venue,
+    so it isn't counted.) Before 7 Oct these counted as finished, with the
+    fill they had when they vanished."""
+    out = pd.Series(False, index=s.index)
+    if "last_obs_before" not in s:
+        return out
+    lob = pd.to_datetime(s["last_obs_before"], utc=True, errors="coerce", format="mixed")
+    naive = lambda x: x.dt.tz_convert("UTC").dt.tz_localize(None)
+    cand = s.assign(_lob=lob)[s["fid"].notna() & lob.notna() & ((s["starts_at"] - lob) > pd.Timedelta(hours=PULLED_GAP_H))]
+    for fid, g in cand.groupby("fid"):
+        v = s["fid"] == fid
+        ts = np.sort(naive(pd.concat([s.loc[v, "first_obs"], s.loc[v, "last_obs"], lob[v]]).dropna()).values)
+        if not len(ts):
+            continue
+        lo = naive(g["_lob"] + pd.Timedelta(hours=PULLED_SEEN_H)).values
+        hi = naive(g["starts_at"]).values
+        i = np.searchsorted(ts, lo, side="left")
+        seen = (i < len(ts)) & (ts[np.minimum(i, len(ts) - 1)] < hi)
+        out.loc[g.index[seen]] = True
+    return out
+
+
 def finished(s):
+    gone = pulled(s)
     f = s[(s["starts_at"] < NOW) & s["capacity"].gt(0) & s["spots_at_start"].notna()
-          & (s["spots_at_start"] <= s["capacity"])].copy()
+          & (s["spots_at_start"] <= s["capacity"]) & ~gone].copy()
     f["fill"] = 1 - f["spots_at_start"] / f["capacity"]
     f["booked"] = f["capacity"] - f["spots_at_start"]
     f["sold_out"] = f["spots_at_start"] == 0
