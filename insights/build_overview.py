@@ -202,6 +202,82 @@ def money(g) -> dict:
     }
 
 
+# ── timing (Sessions › Timing, the venue page): the timing preview's rules ──
+CLOCK = [("early", 0, 9), ("morning", 9, 12), ("midday", 12, 17), ("evening", 17, 21), ("late", 21, 24)]
+LEAD_EDGES = [1, 2, 4, 8]          # same day · 1 day · 2–3 · 4–7 · 8+ (timing_preview.LEAD_BUCKETS)
+CANCEL_EDGES = [2, 24, 72]         # under 2 h · 2–24 h · 1–3 days · 3+ days before the start
+
+
+def timing(tl, f):
+    """Bookings in the window's finished sessions, summed per venue × kind ×
+    level so the page's filters apply. Counts of bookings, never players:
+      b   bookings (roster places held at some point)   c   dropped out
+      cb  when they dropped out, hours before the start (CANCEL_EDGES)
+      fr  places freed in sessions that had sold out    rb  of those, rebooked
+      l   how far ahead, for bookings we watched long enough to know (LEAD_EDGES)
+      k   when they booked: day × part of day (CLOCK), bookings we saw happen
+    Cancellations already exclude gaps in our own capture (timing_preview)."""
+    key = f.set_index("session_key")[["fid", "fgroup", "lvl"]]
+    x = tl[tl["session_key"].isin(key.index)].drop(columns=["fid"], errors="ignore").join(key, on="session_key")
+    if x.empty:
+        return []
+    x["fid"] = x["fid"].astype(int)
+    last_booking = x.groupby("session_key")["first_seen"].transform("max")
+    x["_freed"] = x["cancelled"] & x["ever_full"]
+    x["_rebooked"] = x["_freed"] & (last_booking > x["last_seen"])
+    lead = x["lead_days"].where(x["exact"], np.maximum(x["lead_days"], 8))
+    x["_lb"] = np.where(x["lead_ok"] & (x["lead_days"] > 0), np.searchsorted(LEAD_EDGES, lead, side="right"), -1)
+    x["_cb"] = np.where(x["cancelled"], np.searchsorted(CANCEL_EDGES, x["cancel_hours_before"].fillna(0), side="right"), -1)
+    loc = x["first_seen"].dt.tz_convert(R.MEL)
+    part = np.searchsorted([b[2] for b in CLOCK], loc.dt.hour, side="right")
+    x["_k"] = np.where(x["exact"] & (x["lead_days"] > 0), loc.dt.dayofweek * len(CLOCK) + part, -1)
+    out = []
+    for (v, fm, lv), g in x.groupby(["fid", "fgroup", "lvl"]):
+        cnt = lambda col, n: [int(c) for c in np.bincount(g[col][g[col] >= 0].astype(int), minlength=n)[:n]]
+        out.append({"v": int(v), "fmt": fm, "lvl": lv, "b": int(len(g)), "c": int(g["cancelled"].sum()),
+                    "cb": cnt("_cb", len(CANCEL_EDGES) + 1), "fr": int(g["_freed"].sum()), "rb": int(g["_rebooked"].sum()),
+                    "l": cnt("_lb", len(LEAD_EDGES) + 1), "k": cnt("_k", 7 * len(CLOCK))})
+    return out
+
+
+def quality(s, f, tl, start, end, vmap):
+    """What each venue's listings say and leave out, and how well we read
+    them. Counts; the page turns them into shares. Listing: sessions logged
+    in the window, pulled before they ran, moved, repriced; of the finished
+    ones with a title, those stating no level; fixtures (same day and time,
+    3+ runs) and those whose title varies. Our data: finished sessions with a
+    title, an end time, a roster read, a roster that matches places taken
+    (within 1), and a last reading within 6 h of the start."""
+    gone = R.pulled(s)
+    w = s[s["fid"].notna() & (s["starts_at"] >= start) & (s["starts_at"] <= end) & (s["starts_at"] < R.NOW)].copy()
+    w["fid"] = w["fid"].astype(int)
+    w["_gone"] = gone.reindex(w.index).fillna(False)
+    lob = pd.to_datetime(f["last_obs_before"], utc=True, errors="coerce", format="mixed") if "last_obs_before" in f else pd.Series(pd.NaT, index=f.index)
+    fresh = (f["starts_at"] - lob) <= pd.Timedelta(hours=6)
+    held = tl[~tl["cancelled"]].groupby("session_key").size()
+    roster = f["session_key"].map(held)
+    out = {}
+    for fid in vmap:
+        ww, ff = w[w["fid"] == fid], f[f["fid"] == fid]
+        if not len(ff):
+            continue
+        titled = ff[ff["title"].notna()]
+        fx = titled.groupby(["dow", "hm"])["title"].agg(["size", "nunique"])
+        fx = fx[fx["size"] >= 3]
+        rr = roster[ff.index]
+        has = rr.notna()
+        out[str(fid)] = {
+            "logged": int(len(ww)), "pulled": int(ww["_gone"].sum()),
+            "moved": int((ww["n_start_times"] > 1).sum()), "repriced": int((ww["n_prices"] > 1).sum()),
+            "fin": int(len(ff)), "titled": int(len(titled)), "noLevel": int((titled["lvl"] == "no level stated").sum()),
+            "fixtures": int(len(fx)), "mixed": int((fx["nunique"] > 1).sum()),
+            "withEnd": int(ff["end_time"].notna().sum()) if "end_time" in ff else 0,
+            "rostered": int(has.sum()), "matched": int(((ff["booked"] - rr).abs() <= 1)[has].sum()),
+            "fresh": int(fresh[ff.index].sum()),
+        }
+    return out
+
+
 DAYPARTS = [("early", 0, 9), ("morning", 9, 12), ("midday", 12, 17), ("evening", 17, 20), ("late", 20, 24)]
 
 
@@ -408,7 +484,8 @@ def main():
     data = {"city": city, "venues": venues, "sessions": sess, "links": links, "players": city_players,
             "ranges": ranges, "travel": travel, "levelFit": level_fit(okv, vmap, dict(zip(s["session_key"], s["level_class"]))),
             "levelClass": level_by_class(okv, dict(zip(s["session_key"], s["level_class"]))),
-            "market": {str(fid): market(m, s, fin, okv, fid) for fid, v in vmap.items() if v.get("tracked")}}
+            "market": {str(fid): market(m, s, fin, okv, fid) for fid, v in vmap.items() if v.get("tracked")},
+            "timing": timing(tl, f), "quality": quality(s, f, tl, start, end, vmap)}
     return data, net
 
 
