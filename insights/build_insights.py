@@ -40,7 +40,7 @@ COLS = {
     "sessions": ["session_key", "session_date", "start_time", "capacity", "price", "status", "starts_at",
                  "venue_id", "session_type", "first_obs", "last_obs", "n_obs", "n_obs_before", "last_obs_before",
                  "spots_at_start", "first_full_at", "spots_7d", "spots_3d", "spots_1d", "n_prices",
-                 "n_start_times", "venue_name"],
+                 "n_start_times", "venue_name", "end_time"],
     "rosters": ["pbp_user_id", "session_key", "lesson_id", "session_date", "first_seen", "last_seen",
                 "rating_at_time"],
     "catalogue": ["venue_id", "venue_name", "lesson_id", "title", "type", "category", "skill_level",
