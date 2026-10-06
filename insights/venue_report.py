@@ -87,7 +87,14 @@ def load():
     s["fid"] = s["venue_id"].str.extract(r"(\d+)$")[0].astype(float)
     c["key"] = "pbp-" + c["lesson_id"].astype(str)
     c["title"] = c["title"].str.strip()
+    global PROGRAMS
+    pf = DATA / "programs.csv"
+    PROGRAMS = pd.read_csv(pf, na_values=["null"]) if pf.exists() else pd.DataFrame(
+        columns=["venue_id", "program_slug", "tiers", "lessons_ahead_max"])
     return s, r, c
+
+
+PROGRAMS = pd.DataFrame(columns=["venue_id", "program_slug", "tiers", "lessons_ahead_max"])
 
 
 def attach_titles(s, c):
@@ -139,7 +146,12 @@ def attach_titles(s, c):
     s["band_lo"] = [t["band"][0] if t and t["band"] else np.nan for t in terms]
     s["band_hi"] = [t["band"][1] if t and t["band"] else np.nan for t in terms]
     s["level_class"] = [level_class(t) for t in terms]
-    s["price_n"] = s["price"].str.extract(r"(\d+(?:\.\d+)?)")[0].astype(float)
+    # the session's programme: its own logged one, else its listing's
+    if "program_slug" not in s:
+        s["program_slug"] = np.nan
+    slug_by_key = c.dropna(subset=["program_slug"]).drop_duplicates("key").set_index("key")["program_slug"]
+    s["program_slug"] = s["program_slug"].fillna(s["session_key"].map(slug_by_key))
+    s = session_prices(s)
     s["price_hr"] = s["price_n"] / s["dur_h"]
     s["daypart"] = np.select([s["hour"] < 9, s["hour"] < 17], ["early", "day"], "evening")
     s["weekend"] = s["dow"] >= 5
@@ -173,6 +185,110 @@ def type_format(raw_type):
     if "social" in ty:
         return "social"
     return None
+
+
+# ── what one session costs ─────────────────────────────────────────────────
+SEASON = re.compile(r"\bleague\b|\bseason\b|\bseries\b|\bterm\b|\bcourse\b|\bprogram(?:me)?\b|\b\d+\s*-?\s*weeks?\b|\b\d+\s*-?\s*wks?\b", re.I)
+WEEKS = re.compile(r"\b(\d{1,2})\s*-?\s*(?:weeks?|wks?|sessions|classes|lessons)\b", re.I)
+
+
+def _tiers(raw):
+    if isinstance(raw, list):
+        return [t for t in raw if isinstance(t, dict)]
+    if isinstance(raw, str) and raw.strip().startswith("["):
+        try:
+            return [t for t in json.loads(raw) if isinstance(t, dict)]
+        except ValueError:
+            return []
+    return []
+
+
+def _num(x):
+    try:
+        v = float(x)
+        return v if v >= 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _per_session(t):
+    """A tier's price for one session: as it is when PlayByPoint says it buys a
+    session, split across its lessons when it's a pack of several, else None
+    (a commitment whose length the record doesn't say)."""
+    p, unit, n = _num(t.get("price")), t.get("lesson_unit"), _num(t.get("lessons"))
+    if p is None:
+        return None
+    if unit == "session" or (unit is None and (n is None or n <= 1)):
+        return p
+    if n and n > 1:
+        return p / n
+    return None
+
+
+def session_prices(s):
+    """Per-session prices, casual and member (insights only; the app keeps its
+    own resolver). Some venues list a whole season as the price ($200 for a
+    six-week league), which made takings and $/hour wrong.
+
+    In order, for the casual price (anything not member-only):
+      1. the session's own price records (price_tiers, logged from 6 Oct):
+         the listed price if it's one of the per-session records, else the
+         lowest per-session record, else a pack split into its sessions;
+      2. the programme's published packages, split the same way;
+      3. the listed price, when nothing marks it as a season. A season (title
+         says league / season / series / term / N weeks, or the price is over
+         3× the venue's typical session) is split by the weeks in its title,
+         else by the most sessions its programme has listed; with neither, it
+         is left out (price_n blank, price_basis "season").
+    The member price is the lowest member record per session, the same way,
+    only where the venue publishes member tiers. price_basis says which rule
+    applied: tier, package, listed, season-weeks, season-listing, season."""
+    listed = s["price"].astype(str).str.extract(r"(\d+(?:\.\d+)?)")[0].astype(float)
+    typical = listed.groupby(s["fid"]).transform("median")
+    prog = {}
+    for row in PROGRAMS.itertuples():
+        prog[(str(row.venue_id), str(row.program_slug))] = (_tiers(row.tiers), _num(row.lessons_ahead_max))
+    tiers_col = s["price_tiers"] if "price_tiers" in s else pd.Series([None] * len(s), index=s.index)
+    out_p, out_m, basis = [], [], []
+    for i, lp, typ, raw, vid, slug, title in zip(s.index, listed, typical, tiers_col, s["venue_id"], s["program_slug"],
+                                                 s["title"] if "title" in s else [None] * len(s)):
+        own = _tiers(raw)
+        ptiers, ahead = prog.get((str(vid), str(slug)), ([], None))
+        casual = [t for t in own if t.get("player_category") != "member"]
+        member = [t for t in own + ptiers if t.get("player_category") == "member"]
+        price, how = None, None
+        per = [p for p in (_per_session(t) for t in casual if t.get("lesson_unit") in ("session", None)) if p is not None]
+        if per:
+            price, how = (lp if lp == lp and any(abs(lp - p) < 0.01 for p in per) else min(per)), "tier"
+        if price is None:
+            packs = [p for p in (_per_session(t) for t in casual + [t for t in ptiers if t.get("player_category") != "member"]
+                                 if _num(t.get("lessons")) and _num(t.get("lessons")) > 1) if p is not None]
+            if packs:
+                price, how = min(packs), "package"
+        if price is None and lp == lp:
+            text = title if isinstance(title, str) else ""
+            seasonal = bool(SEASON.search(text)) or (typ == typ and typ > 0 and lp > 3 * typ and lp > 40)
+            if not seasonal:
+                price, how = lp, "listed"
+            else:
+                m = WEEKS.search(text)
+                if m and 2 <= int(m.group(1)) <= 52:
+                    price, how = lp / int(m.group(1)), "season-weeks"
+                elif ahead and ahead >= 2 and lp > 2 * (typ if typ == typ else 0):
+                    price, how = lp / ahead, "season-listing"
+                elif lp <= 40 and not (typ == typ and lp > 3 * typ):
+                    price, how = lp, "listed"
+                else:
+                    how = "season"
+        mp = [p for p in (_per_session(t) for t in member) if p is not None]
+        mprice = min(mp) if mp else None
+        if mprice is not None and price is not None and mprice > price:
+            mprice = price
+        out_p.append(price); out_m.append(mprice); basis.append(how)
+    s["price_n"] = pd.Series(out_p, index=s.index, dtype=float)
+    s["mprice_n"] = pd.Series(out_m, index=s.index, dtype=float)
+    s["price_basis"] = basis
+    return s
 
 
 def session_format(t):
@@ -290,6 +406,53 @@ def players(m, s, fid):
                         "dist": {str(k): int(v) for k, v in rated.value_counts().sort_index().items()}}}
 
 
+_DAY_IX: dict = {}
+
+
+def _day_index(s):
+    """Sessions by (venue, Melbourne date), built once per sessions frame: the
+    traveller and rival checks look up one venue-day at a time."""
+    key = id(s)
+    if key not in _DAY_IX:
+        x = s[s["fid"].notna() & s["family"].notna()].copy()
+        x["_day"] = x["starts_at"].dt.tz_convert(MEL).dt.date
+        _DAY_IX.clear()
+        _DAY_IX[key] = {(int(f), d): g for (f, d), g in x.groupby([x["fid"].astype(int), "_day"])}
+    return _DAY_IX[key]
+
+
+def _clashes(ix, fids, v):
+    """Is there a session of the same kind, and an overlapping level band, at
+    one of `fids` on the same day within an hour of session `v`?"""
+    day = v.starts_at.tz_convert(MEL).date()
+    for f in fids:
+        c = ix.get((int(f), day))
+        if c is None:
+            continue
+        c = c[((c["starts_at"] - v.starts_at).abs() <= pd.Timedelta(hours=1)) & (c["family"] == v.family)]
+        if not np.isnan(v.band_lo):
+            c = c[((c["band_lo"] <= v.band_hi) & (c["band_hi"] >= v.band_lo)) | c["band_lo"].isna()]
+        if len(c):
+            return True
+    return False
+
+
+def _clashes_strict(ix, fids, v):
+    """As _clashes, but a candidate with no level band doesn't count when the
+    session states one (the traveller rule, unchanged)."""
+    day = v.starts_at.tz_convert(MEL).date()
+    for f in fids:
+        c = ix.get((int(f), day))
+        if c is None:
+            continue
+        c = c[((c["starts_at"] - v.starts_at).abs() <= pd.Timedelta(hours=1)) & (c["family"] == v.family)]
+        if not np.isnan(v.band_lo):
+            c = c[(c["band_lo"] <= v.band_hi) & (c["band_hi"] >= v.band_lo)]
+        if len(c):
+            return True
+    return False
+
+
 def travellers(m, s, fid):
     """The traveller tree from the catalogue doc: why players whose home venue is
     over 5 km away come to this venue."""
@@ -301,26 +464,20 @@ def travellers(m, s, fid):
     home["km"] = home["fid"].map(lambda f: km(fid, f))
     trav = home[(home["fid"] != fid) & (home["km"] > 5)]
     near_here = {f for f in REG if f != fid and km(fid, f) <= 5}
+    ix = _day_index(s)
+    by_player = {k: g for k, g in allp.groupby("pbp_user_id")}
     out, classes = [], {"product draw": 0, "preference draw": 0, "location anchor": 0, "session draw": 0}
     for row in trav.itertuples():
         pid, hfid = row.pbp_user_id, row.fid
         home_area = {f for f in REG if km(hfid, f) <= 5} | {hfid}
-        mine = allp[(allp["pbp_user_id"] == pid) & (allp["fid"] == fid)]
+        theirs = by_player.get(pid)
+        mine = theirs[theirs["fid"] == fid]
         # Q1: was the same kind of session on near home, same day, within an hour?
-        same_near = False
-        for v in mine.itertuples():
-            day = v.starts_at.tz_convert(MEL).date()
-            cand = s[(s["fid"].isin(home_area)) & (s["starts_at"].dt.tz_convert(MEL).dt.date == day)
-                     & ((s["starts_at"] - v.starts_at).abs() <= pd.Timedelta(hours=1))
-                     & (s["family"] == v.family)]
-            if not np.isnan(v.band_lo):
-                cand = cand[(cand["band_lo"] <= v.band_hi) & (cand["band_hi"] >= v.band_lo)]
-            if len(cand):
-                same_near = True
-                break
+        # (A session with no family can't be matched, as before.)
+        same_near = any(_clashes_strict(ix, home_area, v) for v in mine.itertuples() if isinstance(v.family, str))
         slots = set(zip(mine["dow"], mine["hour"]))
         workhours = all(d < 5 and (6 <= h < 9 or 12 <= h < 14 or 17 <= h < 20) for d, h in slots)
-        other_near = allp[(allp["pbp_user_id"] == pid) & allp["fid"].isin(near_here)].shape[0] > 0
+        other_near = theirs["fid"].isin(near_here).any()
         if not same_near:
             cls = "product draw"
         elif len(slots) > 1:
@@ -346,18 +503,11 @@ def rivals(m, s, fin, fid):
     shared = (allp[allp["fid"] != fid].groupby("fid")
               .agg(sessions=("session_key", "size"), players=("pbp_user_id", "nunique")).reset_index())
     here = s[(s["fid"] == fid) & s["family"].notna()]
+    ix = _day_index(s)
     out = []
     for row in shared.sort_values("sessions", ascending=False).head(6).itertuples():
         f = int(row.fid)
-        theirs = s[(s["fid"] == f) & s["family"].notna()]
-        clash = 0
-        for v in here.itertuples():
-            c = theirs[(theirs["starts_at"].dt.tz_convert(MEL).dt.date == v.starts_at.tz_convert(MEL).date())
-                       & ((theirs["starts_at"] - v.starts_at).abs() <= pd.Timedelta(hours=1))
-                       & (theirs["family"] == v.family)]
-            if not np.isnan(v.band_lo):
-                c = c[(c["band_lo"] <= v.band_hi) & (c["band_hi"] >= v.band_lo) | c["band_lo"].isna()]
-            clash += bool(len(c))
+        clash = sum(_clashes(ix, [f], v) for v in here.itertuples())
         ff = fin[fin["fid"] == f]
         out.append({"fid": f, "name": name(f), "km": round(km(fid, f), 1),
                     "shared_players": int(row.players), "shared_sessions": int(row.sessions),
