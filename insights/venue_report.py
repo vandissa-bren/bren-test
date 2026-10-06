@@ -120,7 +120,7 @@ def attach_titles(s, c):
     terms = [parse(t, ty if isinstance(ty, str) else None, sk if isinstance(sk, str) else None) if isinstance(t, str) and t else None
              for t, ty, sk in zip(s["title"], s["session_type"], s["skill_level"])]
     s["family"] = [t["family"] if t else None for t in terms]
-    s["fmt"] = [t["format"] if t else None for t in terms]
+    s["fmt"] = [session_format(t) for t in terms]
     s["label"] = [t["label"] if t else None for t in terms]
     s["band_lo"] = [t["band"][0] if t and t["band"] else np.nan for t in terms]
     s["band_hi"] = [t["band"][1] if t and t["band"] else np.nan for t in terms]
@@ -130,6 +130,18 @@ def attach_titles(s, c):
     s["daypart"] = np.select([s["hour"] < 9, s["hour"] < 17], ["early", "day"], "evening")
     s["weekend"] = s["dow"] >= 5
     return s
+
+
+def session_format(t):
+    """The format a session is grouped under. A social or open-play session whose
+    results go to DUPR ("DUPR Doubles", "DUPR Recorded Session") is match play:
+    its family is already competitive (catalogue_terms.play_family, F116), and
+    the format now says so too. Same rule as ins_family in the live insights."""
+    if not t:
+        return None
+    if t["family"] == "competitive" and t["format"] in ("social", "open_play"):
+        return "match_play"
+    return t["format"]
 
 
 def level_class(t):
