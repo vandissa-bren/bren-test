@@ -102,6 +102,67 @@ def level_fit(okv, vmap, cls=None, min_players=MIN_GROUP):
     return sorted(rows, key=lambda x: (x["v"], x["median"]))
 
 
+def level_mix(okv, cls, min_rated=MIN_GROUP, top=60):
+    """Sessions where levels mix most (Players › Levels). For each session with
+    5+ rated players, the spread of their ratings (10th to 90th percentile);
+    for each title at a venue, the median spread over those sessions, and the
+    ratings of everyone who played it (one rating per player, their median).
+    Titles need 2+ such sessions, or 10+ rated players from one.
+    outside: of those players, the share whose rating sits outside the level
+    the title states. Widest first."""
+    g = okv[okv["rating"].notna() & okv["title"].notna()]
+    if g.empty:
+        return []
+    per = g.groupby("session_key")["rating"].agg(n="size", p10=lambda x: x.quantile(.1), p90=lambda x: x.quantile(.9))
+    per = per[per["n"] >= min_rated].copy()
+    per["spread"] = per["p90"] - per["p10"]
+    meta = g.drop_duplicates("session_key").set_index("session_key")[["fid", "title", "label", "band_lo", "band_hi"]]
+    per = per.join(meta)
+    rows = []
+    for (fid, title), grp in per.groupby(["fid", "title"]):
+        pl = g[g["session_key"].isin(grp.index)].groupby("pbp_user_id")["rating"].median()
+        # one session of five players is too thin to call a pattern
+        if len(pl) < MIN_GROUP or (len(grp) < 2 and len(pl) < 10):
+            continue
+        lo, hi = grp["band_lo"].iloc[0], grp["band_hi"].iloc[0]
+        has_band = not (isinstance(lo, float) and np.isnan(lo))
+        kinds = pd.Series([cls.get(k) for k in grp.index], dtype=object).dropna()
+        rows.append({
+            "v": int(fid), "title": str(title), "label": grp["label"].iloc[0] if isinstance(grp["label"].iloc[0], str) else None,
+            "cls": str(kinds.mode().iloc[0]) if len(kinds) else None,
+            "lo": round(float(lo), 2) if has_band else None, "hi": round(float(min(hi, 6.0)), 2) if has_band else None,
+            "sessions": int(len(grp)), "players": int(len(pl)), "spread": round(float(grp["spread"].median()), 2),
+            "p10": round(float(pl.quantile(.1)), 2), "p25": round(float(pl.quantile(.25)), 2), "median": round(float(pl.median()), 2),
+            "p75": round(float(pl.quantile(.75)), 2), "p90": round(float(pl.quantile(.9)), 2),
+            "outside": round(100 * float(((pl < lo - 0.01) | (pl > hi + 0.01)).mean()), 1) if has_band else None,
+        })
+    return sorted(rows, key=lambda x: -x["spread"])[:top]
+
+
+def level_supply(okv, f, vmap):
+    """Levels nobody near a player runs (Players › Levels). For each area (and
+    the city): its players by rating class, placed by their usual venue (where
+    most of their bookings are), against the places its sessions offered at
+    each stated level. Player counts under 5 are held back (None)."""
+    home = (okv.groupby(["pbp_user_id", "fid"]).size().reset_index(name="n")
+            .sort_values(["pbp_user_id", "n", "fid"], ascending=[True, False, True]).drop_duplicates("pbp_user_id"))
+    rating = okv.groupby("pbp_user_id")["rating"].median()
+    home["area"] = home["fid"].map(lambda x: vmap.get(int(x), {}).get("area"))
+    home["cls"] = home["pbp_user_id"].map(rating).map(M.rating_class)
+    fa = f.assign(area=f["fid"].map(lambda x: vmap.get(int(x), {}).get("area")))
+    hold = lambda n: int(n) if n >= MIN_GROUP else None
+    out = []
+    for area in [None] + sorted({v.get("area") for v in vmap.values() if v.get("tracked") and v.get("area")}):
+        h = home if area is None else home[home["area"] == area]
+        s = fa if area is None else fa[fa["area"] == area]
+        pc = h["cls"].value_counts()
+        out.append({"area": area,
+                    "players": {k: hold(pc.get(k, 0)) for k in ("beginner", "intermediate", "advanced", "unrated")},
+                    "places": {k: int(v) for k, v in s.groupby("lvl")["capacity"].sum().items()},
+                    "sessions": {k: int(v) for k, v in s.groupby("lvl").size().items()}})
+    return out
+
+
 def _spread(per: pd.Series) -> dict:
     return {"p10": round(float(per.quantile(.10)), 2), "p25": round(float(per.quantile(.25)), 2),
             "median": round(float(per.median()), 2),
@@ -298,200 +359,4 @@ def market(m, s, fin, ok, fid) -> dict:
                   "classes": {k: hold(n) for k, n in tr["classes"].items()},
                   "homes": [[k, n] for k, n in homes[:6]], "draws": [[k, n] for k, n in draws[:5]]}
     price = [{"family": x["family"], "level": x["level"], "here": x["venue_price_hr"], "market": x["market_price_hr"],
-              "p25": x["market_p25"], "p75": x["market_p75"], "n": x["market_n"], "fill": x["venue_fill"], "marketFill": x["market_fill"]}
-             for x in R.price_position(fin, fid)]
-    # when its players play somewhere else: bookings at other venues by day and part of day
-    ids = ok[ok["fid"] == fid]["pbp_user_id"].unique()
-    allp = ok[ok["pbp_user_id"].isin(ids)]
-    away = allp[allp["fid"] != fid]
-    cells = []
-    for d in range(7):
-        for name, lo, hi in DAYPARTS:
-            x = away[(away["dow"] == d) & (away["hour"] >= lo) & (away["hour"] < hi)]
-            n = x["pbp_user_id"].nunique()
-            if n >= MIN_GROUP:
-                cells.append([d, name, int(len(x)), int(n)])
-    return {"rivals": rivals, "travellers": travellers, "price": price,
-            "away": {"bookings": int(len(away)), "of": int(len(allp)), "cells": cells}}
-
-
-def main():
-    s, r, c = R.load()
-    R.NOW = max(s["last_obs"].max(), r["last_seen"].max())
-    s = R.attach_titles(s, c)
-    fin = R.finished(s)
-    m = R.rosters(s, r)
-    rated = m[m["rating"].notna()]
-    five = rated.assign(f=rated["rating"] == 5.0).groupby("fid")["f"].mean()
-    m.loc[m["fid"].isin(set(five[five > 0.5].index)) & (m["rating"] == 5.0), "rating"] = np.nan
-    ok = m[~m["cancelled"] & m["fid"].notna()]
-
-    start = fin["starts_at"].min()
-    end = fin["starts_at"].max()
-    days = (end - start).days + 1
-    weeks = days / 7
-
-    # ── venues (registry: all 43, tracked or not) ──
-    reg = registry_all()
-    venues = []
-    for v in reg:
-        if not v.get("lat"):
-            continue
-        area, km = area_of(v["lat"], v["lng"])
-        fid = int(v["id"]) if str(v.get("id", "")).isdigit() else None
-        venues.append({"id": fid if fid else v.get("id"), "name": clean_name(v["name"]), "area": area,
-                       "kmCbd": round(km, 1), "lat": v["lat"], "lng": v["lng"],
-                       "courts": v.get("courtCount"), "suburb": v.get("city"),
-                       "pbp": v.get("platform") == "playbypoint", "status": v.get("status")})
-    vmap = {v["id"]: v for v in venues if isinstance(v["id"], int)}
-
-    # ── session rows ──
-    f = fin[fin["fid"].notna()].copy()
-    f["fid"] = f["fid"].astype(int)
-    f = f[f["fid"].isin(vmap)]
-    f["fgroup"] = f["fmt"].map(M.FORMAT_GROUP).fillna("Unknown")
-    f["lvl"] = f["level_class"].fillna("no level stated")
-    if "waitlist_max" not in f:
-        f["waitlist_max"] = np.nan
-    loc = f["starts_at"].dt.tz_convert(R.MEL)
-    f["date"] = loc.dt.strftime("%Y-%m-%d")
-    f["slot"] = np.where(f["weekend"], "Weekend", "Weekday " + f["daypart"].map(
-        {"early": "before 9am", "day": "9am–5pm", "evening": "after 5pm"}))
-    # fill 7 / 3 / 1 days out, each where we were watching the session by then
-    # (a session listed 5 days ahead has a 3- and 1-day figure, not a 7-day one)
-    def stage(col, days):
-        ok = (f["first_obs"] <= f["starts_at"] - pd.Timedelta(days=days)) & f[col].notna() & f[col].le(f["capacity"])
-        return pd.Series(np.where(ok, (100 * (1 - f[col] / f["capacity"])).round(1), np.nan), index=f.index)
-    f7, f3, f1 = stage("spots_7d", 7), stage("spots_3d", 3), stage("spots_1d", 1)
-    opt = lambda v: None if v != v else float(v)
-    sess = []
-    for i, x in enumerate(f.itertuples()):
-        sess.append({
-            "i": i, "v": int(x.fid), "date": x.date, "dow": int(x.dow), "hm": x.hm, "hour": int(x.hour),
-            "slot": x.slot, "fmt": x.fgroup, "lvl": x.lvl, "label": x.label if isinstance(x.label, str) else None,
-            "title": x.title if isinstance(x.title, str) else None,
-            "cap": int(x.capacity), "booked": int(x.booked), "fill": round(100 * x.fill, 1),
-            "so": bool(x.sold_out), "soH": r1(x.so_h),
-            "price": r1(x.price_n), "pph": r1(x.price_hr),
-            # per-session member price where published; length in hours; how the
-            # price was worked out (venue_report.session_prices); longest waitlist
-            "mprice": r1(x.mprice_n), "dur": r1(x.dur_h), "pb": x.price_basis,
-            "wl": int(x.waitlist_max) if x.waitlist_max == x.waitlist_max and x.waitlist_max is not None else None,
-            "f7": opt(f7.loc[x.Index]), "f3": opt(f3.loc[x.Index]), "f1": opt(f1.loc[x.Index]),
-        })
-
-    # ── per-venue player facts ──
-    okv = ok[ok["fid"].isin(vmap)].copy()
-    okv["fid"] = okv["fid"].astype(int)
-    per = okv.groupby(["pbp_user_id", "fid"]).size().reset_index(name="n")
-    tot = per.groupby("pbp_user_id")["n"].sum()
-    per["share"] = per["n"] / per["pbp_user_id"].map(tot)
-    home = per.sort_values(["pbp_user_id", "n", "fid"], ascending=[True, False, True]).drop_duplicates("pbp_user_id").set_index("pbp_user_id")["fid"]
-    canc = m[m["fid"].isin(vmap)].copy()
-    canc["fid"] = canc["fid"].astype(int)
-
-    # lead time and cancellations: the timing preview's own rules (same as the report)
-    import timing_preview as TP
-    raw = R.load()[1]
-    tl = TP.build(s, raw, R.NOW)
-
-    # publish horizon: sessions first seen 3+ days after capture began (so first sighting ~ listing)
-    cap0 = s["first_obs"].min()
-    pub = s[s["fid"].notna() & (s["first_obs"] > cap0 + pd.Timedelta(days=3))].copy()
-    pub["ahead"] = (pub["starts_at"] - pub["first_obs"]).dt.total_seconds() / 86400
-
-    for fid, v in vmap.items():
-        g = f[f["fid"] == fid]
-        p = per[per["fid"] == fid]
-        v["tracked"] = len(g) > 0
-        if not len(g):
-            continue
-        logged = s[(s["fid"] == fid) & (s["starts_at"] >= start) & (s["starts_at"] <= end)]
-        lv = okv[okv["fid"] == fid]
-        cc = canc[canc["fid"] == fid]
-        rr = lv["rating"].dropna()
-        tlv = tl[tl["fid"] == fid]
-        lp = TP.lead_profile(tlv)
-        pb = pub[pub["fid"] == fid]["ahead"]
-        homes_here = home[home == fid].index
-        away = [km for km in (R.km(fid, h) for h in home[home.index.isin(p["pbp_user_id"])]) if not np.isnan(km)]
-        v.update({
-            "sessions": int(len(g)), "perWeek": round(len(logged) / weeks, 1),
-            "offered": int(g["capacity"].sum()), "taken": int(g["booked"].sum()),
-            "fill": round(100 * g["fill"].mean(), 1), "soldOut": round(100 * g["sold_out"].mean(), 1),
-            "soH": r1(g["so_h"].median()) if g["so_h"].notna().any() else None,
-            "empty": int(g["spots_at_start"].sum()),
-            "pph": r1(g["price_hr"].median()) if g["price_hr"].notna().any() else None,
-            **money(g),
-            "players": int(p["pbp_user_id"].nunique()),
-            "repeat": round(100 * (p["n"] >= 2).mean(), 1) if len(p) else None,
-            "loyal": round(100 * (p["share"] > 0.8).mean(), 1) if len(p) else None,
-            "homeHere": int(len(homes_here)),
-            "fromAfar": round(100 * np.mean([km > 5 for km in away]), 1) if away else None,
-            "cancel": round(100 * tlv["cancelled"].mean(), 1) if len(tlv) else None,
-            "lead": (lp["median_days"] if isinstance(lp["median_days"], (int, float)) else 8.0) if lp["n"] >= 20 else None,
-            "leadN": int(lp["n"]),
-            "lastMinute": lp["last_minute_share"] if lp["n"] >= 20 else None,
-            "listed": r1(pb.median()) if len(pb) >= 5 else None,
-            "rated": int(len(rr)), "avgRating": round(float(rr.mean()), 2) if len(rr) >= 10 else None,
-            "titled": round(100 * g["title"].notna().mean(), 1),
-        })
-
-    # ── network: players shared between venue pairs ──
-    vs = okv.groupby("pbp_user_id")["fid"].apply(lambda x: sorted(set(x)))
-    pairs = {}
-    for lst in vs:
-        for a_i in range(len(lst)):
-            for b_i in range(a_i + 1, len(lst)):
-                k = (lst[a_i], lst[b_i])
-                pairs[k] = pairs.get(k, 0) + 1
-    links = [{"a": a, "b": b, "n": n} for (a, b), n in pairs.items() if n >= MIN_GROUP]
-
-    # ── city players ──
-    pl = okv.groupby("pbp_user_id").agg(n=("session_key", "size"), venues=("fid", "nunique"), rating=("rating", "median"))
-    city_players = {
-        "total": int(len(pl)),
-        "freq": {k: int(v) for k, v in {"1 session": (pl.n == 1).sum(), "2 sessions": (pl.n == 2).sum(),
-                                         "3–4 sessions": pl.n.between(3, 4).sum(), "5+ sessions": (pl.n >= 5).sum()}.items()},
-        "venues": {k: int(v) for k, v in {"1 venue": (pl.venues == 1).sum(), "2 venues": (pl.venues == 2).sum(),
-                                           "3+ venues": (pl.venues >= 3).sum()}.items()},
-        "level": {k: int(v) for k, v in pl["rating"].map(M.rating_class).value_counts().items()},
-    }
-
-    # ── reuse level ranges and travel groups ──
-    more = json.loads((R.WORK / "report_more.json").read_text())
-    ranges = [dict(x, venue=clean_name(R.name(x["fid"]))) for x in more["level_ranges"]]
-    for x in ranges:
-        x["p25"], x["p75"] = round(x["p25"], 2), round(x["p75"], 2)
-    travel = [x for x in more["travel"]["rows"] if x["dim"] != "venue"]
-
-    city = {
-        "from": str(start.tz_convert(R.MEL).date()), "to": str(end.tz_convert(R.MEL).date()), "days": days,
-        "venuesTracked": int(sum(1 for v in vmap.values() if v.get("tracked"))),
-        "venuesKnown": len(venues), "sessions": len(f), "offered": int(f["capacity"].sum()),
-        "taken": int(f["booked"].sum()), "fill": round(100 * f["fill"].mean(), 1),
-        "soldOut": round(100 * f["sold_out"].mean(), 1), "empty": int(f["spots_at_start"].sum()),
-        **money(f), "pph": r1(f["price_hr"].median()),
-        "players": int(len(pl)), "bookings": int(len(okv)),
-        "titled": round(100 * f["title"].notna().mean(), 1),
-        "unplaced": int(fin["fid"].isna().sum()),
-    }
-    # ── co-play network (players as random codes; see network.py) ──
-    import network as NET
-    f2 = f.assign(i=np.arange(len(f)), fmt=f["fgroup"])
-    net = NET.build(f2, m, ok, vmap, clean_name, lambda fid: vmap[fid]["area"])
-    for fid, extra in net["venues"].items():
-        vmap[fid].update(extra)
-    net = {k: v for k, v in net.items() if k != "venues"}
-    data = {"city": city, "venues": venues, "sessions": sess, "links": links, "players": city_players,
-            "ranges": ranges, "travel": travel, "levelFit": level_fit(okv, vmap, dict(zip(s["session_key"], s["level_class"]))),
-            "levelClass": level_by_class(okv, dict(zip(s["session_key"], s["level_class"]))),
-            "market": {str(fid): market(m, s, fin, okv, fid) for fid, v in vmap.items() if v.get("tracked")},
-            "timing": timing(tl, f), "quality": quality(s, f, tl, start, end, vmap)}
-    return data, net
-
-
-if __name__ == "__main__":
-    d, _ = main()
-    print(json.dumps(d["city"], indent=1))
-    print(len(d["sessions"]), "sessions;", len(d["links"]), "links;", len(d["venues"]), "venues")
+              "p25": x["market_p25"], "p7
