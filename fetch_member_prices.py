@@ -215,6 +215,10 @@ async def main():
                 print(f"  ✅ Saved {len(member_prices)} member prices to Supabase")
             else:
                 print(f"  ❌ Supabase update failed: {r2.status_code} {r2.text[:100]}")
+            # Court-hire rates over time (20261016110000): log the member
+            # rates just saved beside the casual ones.
+            import court_log
+            print("  " + await court_log.record_court_rates(client, SUPABASE_URL, SB_HEADERS))
 
     print("\nDone.")
 
