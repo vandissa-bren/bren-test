@@ -96,7 +96,10 @@ def collect_target_sessions(catalogue: list[dict]) -> list[dict]:
                         "status": s.get("status"),
                         "title": s.get("title"),
                         "program_slug": s.get("program_slug"),
-                        "skill_level": s.get("skill_level")})
+                        "skill_level": s.get("skill_level"),
+                        "end": s.get("end"),
+                        "price_tiers": s.get("price_tiers") or None,
+                        "coaches": s.get("coaches") or None})
     return out
 
 
@@ -192,6 +195,15 @@ async def main():
                         "status": "Full" if left == 0 else "Available",
                         "venue_id": t["row_id"],
                         "session_type": t.get("session_type"),
+                        # The fill log keeps what the listing says about the
+                        # session, so insights can read it after the listing
+                        # is gone (20261010120000, 20261016100000).
+                        "title": t.get("title"),
+                        "skill_level": t.get("skill_level"),
+                        "program_slug": t.get("program_slug"),
+                        "end_time": t.get("end"),
+                        "price_tiers": t.get("price_tiers"),
+                        "coaches": t.get("coaches"),
                     })
                 await asyncio.sleep(0.3)
 
