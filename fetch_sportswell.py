@@ -1,5 +1,13 @@
 """Fetch court blocks for geo-restricted venues and push to Supabase.
 
+6 Oct 2026 -- NOW RUNS ON GITHUB (.github/workflows/fetch_geo_courts.yml).
+The Sydney server's address was blocked by PlayByPoint (every request 403,
+from about 30 Sep), and geo_probe.py showed GitHub's runners can read all
+three venues. On GitHub the PlayByPoint session comes from PBP_COOKIES_JSON,
+the same secret the other court jobs use, and nothing is written to disk; the
+login fallback below is only for a server. The notes that follow describe the
+Sydney setup, which still works if the job is ever run there again.
+
 These venues (SportsWell, Raya, Pickle4Real) are geo-restricted by PBP and
 can only be reliably fetched from an Australian IP -- this DO server, not
 GitHub Actions runners. Hence a separate script from fetch_court_blocks.py.
@@ -249,6 +257,18 @@ def _write_private(path: str, obj: dict) -> None:
 
 
 def load_session():
+    # On GitHub: the shared PBP_COOKIES_JSON secret ({"cookies": {...}, "user_id": n}).
+    raw = os.environ.get("PBP_COOKIES_JSON")
+    if raw:
+        try:
+            d = json.loads(raw)
+            cookies = d.get("cookies") or {}
+            if cookies.get("_paybycourt_session"):
+                return {"cookies": cookies, "user_id": d.get("user_id"), "from_env": True}
+        except Exception:
+            pass
+        print("  PBP_COOKIES_JSON is set but has no usable session")
+        return None
     try:
         with open(SESSION_PATH) as f:
             s = json.load(f)
@@ -290,6 +310,9 @@ async def login(settings: dict):
         print(f"  LOGIN FAILED: HTTP {r2.status_code}, not accepted")
         return None
     session = {"cookies": jar, "obtained_at": int(time.time())}
+    if os.environ.get("PBP_COOKIES_JSON"):
+        print("  logged in again (not saved: running from PBP_COOKIES_JSON)")
+        return session
     _write_private(SESSION_PATH, session)
     print("  logged in again; new session saved")
     return session
@@ -345,7 +368,8 @@ async def main():
             uid = await api.whoami()
         if uid:
             session["user_id"] = uid
-            _write_private(SESSION_PATH, session)
+            if not session.get("from_env"):
+                _write_private(SESSION_PATH, session)
         else:
             print("  note: account number not found; prices may come back empty")
 
