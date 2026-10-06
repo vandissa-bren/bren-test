@@ -51,6 +51,88 @@ def r1(x):
     return None if x is None or (isinstance(x, float) and np.isnan(x)) else round(float(x), 1)
 
 
+def _verified(x) -> bool:
+    """A rating that looks like a real DUPR: two or three decimals that aren't a
+    half step. PlayByPoint fills whole and half numbers (2.5, 3.0) when a player
+    has no DUPR linked: those are self-rated."""
+    try:
+        c = round(float(x) * 1000)
+    except (TypeError, ValueError):
+        return False
+    return c % 500 != 0
+
+
+def level_fit(okv, vmap, cls=None, min_players=MIN_GROUP):
+    """What each level a venue runs actually draws: for every venue and every
+    level its sessions state (the label as read from the title, e.g. "3.0-3.5",
+    "3.25+", "Beginner"), the ratings of the players booked into them.
+
+    One rating per player per group (their median there), so a regular doesn't
+    count ten times. Verified = looks like a real DUPR (see _verified); the rest
+    are PlayByPoint self-ratings. Groups with fewer than `min_players` rated
+    players are left out (the 5-player rule). `cls` maps session_key to the
+    session's level class (beginner / intermediate / advanced / all levels), so
+    the page can filter these by level like everything else."""
+    rows = []
+    g = okv[okv["rating"].notna() & okv["label"].notna()].copy()
+    if g.empty:
+        return rows
+    for (fid, label), grp in g.groupby(["fid", "label"]):
+        per = grp.groupby("pbp_user_id")["rating"].median()
+        if len(per) < min_players:
+            continue
+        ver = grp.groupby("pbp_user_id")["rating"].apply(lambda s: any(_verified(x) for x in s))
+        lo, hi = grp["band_lo"].iloc[0], grp["band_hi"].iloc[0]
+        kinds = pd.Series([cls.get(k) for k in grp["session_key"].unique()] if cls else [], dtype=object).dropna()
+        has_band = not (isinstance(lo, float) and np.isnan(lo))
+        inside = None
+        if has_band:
+            inside = round(100 * float(((per >= lo - 0.01) & (per <= hi + 0.01)).mean()), 1)
+        rows.append({
+            "v": int(fid), "label": str(label),
+            "lo": round(float(lo), 2) if has_band else None, "hi": round(float(min(hi, 6.0)), 2) if has_band else None,
+            "sessions": int(grp["session_key"].nunique()), "players": int(len(per)),
+            "verified": int(ver.sum()),
+            "p10": round(float(per.quantile(.10)), 2), "p25": round(float(per.quantile(.25)), 2),
+            "median": round(float(per.median()), 2),
+            "p75": round(float(per.quantile(.75)), 2), "p90": round(float(per.quantile(.90)), 2),
+            "inside": inside,
+            "cls": str(kinds.mode().iloc[0]) if len(kinds) else None,
+        })
+    return sorted(rows, key=lambda x: (x["v"], x["median"]))
+
+
+def prev_summary(data_dir: Path) -> dict:
+    """The period before, for "compared with": each finished session in compact
+    form (same groups as the main sessions list, so the page can filter both the
+    same way), plus distinct players for the city and each venue."""
+    old = R.DATA
+    R.DATA = Path(data_dir)
+    try:
+        s, r, c = R.load()
+        R.NOW = max(s["last_obs"].max(), r["last_seen"].max())
+        s = R.attach_titles(s, c)
+        fin = R.finished(s)
+        m = R.rosters(s, r)
+    finally:
+        R.DATA = old
+    f = fin[fin["fid"].notna()].copy()
+    f["fid"] = f["fid"].astype(int)
+    f["fgroup"] = f["fmt"].map(M.FORMAT_GROUP).fillna("Unknown")
+    f["lvl"] = f["level_class"].fillna("no level stated")
+    loc = f["starts_at"].dt.tz_convert(R.MEL)
+    # rows rather than objects: a 90-day window is a few thousand sessions
+    cols = ["v", "date", "dow", "hour", "fmt", "lvl", "cap", "booked", "so"]
+    sess = [[int(x.fid), d, int(x.dow), int(x.hour), x.fgroup, x.lvl, int(x.capacity), int(x.booked), int(bool(x.sold_out))]
+            for x, d in zip(f.itertuples(), loc.dt.strftime("%Y-%m-%d"))]
+    ok = m[~m["cancelled"] & m["fid"].notna()]
+    per_v = ok.assign(fid=ok["fid"].astype(int)).groupby("fid")["pbp_user_id"].nunique()
+    return {"from": str(fin["starts_at"].min().tz_convert(R.MEL).date()) if len(fin) else None,
+            "to": str(fin["starts_at"].max().tz_convert(R.MEL).date()) if len(fin) else None,
+            "cols": cols, "sessions": sess, "players": int(ok["pbp_user_id"].nunique()),
+            "venuePlayers": {str(int(k)): int(v) for k, v in per_v.items() if v >= MIN_GROUP}}
+
+
 def main():
     s, r, c = R.load()
     R.NOW = max(s["last_obs"].max(), r["last_seen"].max())
@@ -212,7 +294,7 @@ def main():
         vmap[fid].update(extra)
     net = {k: v for k, v in net.items() if k != "venues"}
     data = {"city": city, "venues": venues, "sessions": sess, "links": links, "players": city_players,
-            "ranges": ranges, "travel": travel}
+            "ranges": ranges, "travel": travel, "levelFit": level_fit(okv, vmap, dict(zip(s["session_key"], s["level_class"])))}
     return data, net
 
 
