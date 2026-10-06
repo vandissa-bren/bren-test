@@ -153,13 +153,14 @@ FORMAT_FAMILY = {"round_robin": "competitive", "ladder": "competitive", "league"
 
 def type_format(raw_type):
     """A session with no title at all: the venue's type, only where it says
-    something specific. "Open Play" and "Event" alone stay unknown, since venues
+    something specific ("DUPR Session", "Competitive Play" are match play).
+    "Open Play" and "Event" alone stay unknown, since venues
     use them for match play and round robins too. Same rule as ins_family's
     untitled branch (20261017100000)."""
     ty = (raw_type if isinstance(raw_type, str) else "").strip().lower()
     if not ty:
         return None
-    if "dupr" in ty:
+    if "dupr" in ty or "competitive" in ty:
         return "match_play"
     if re.search(r"round\s*robin", ty):
         return "round_robin"
