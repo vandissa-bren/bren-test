@@ -1,0 +1,99 @@
+name: Fetch Geo Courts
+# Court hire for SportsWell (885), Raya (1770) and Pickle4Real (1783), the
+# venues fetch_sportswell.py reads. Moved here from the Sydney server on
+# 6 Oct 2026: that server's address was blocked by PlayByPoint (every request
+# 403 from about 30 Sep), and geo_probe.py showed GitHub's runners read all
+# three venues. Each run comes from a different address, as for
+# fetch_court_blocks.yml, which has not been blocked.
+#
+# Same windows the Sydney server ran, minutes kept off the top of the hour
+# (GitHub drops scheduled runs worst at :00):
+#   near  days 0-1    every 30 min   at :12 :42
+#   mid   days 2-7    every 2 hours  at :27
+#   far   days 8-13   every 6 hours  at :52
+# Each window has its own concurrency group, so a slow run is never doubled
+# up; the windows never share a day, and saves go through merge_availability.
+# Also writes the court-hire log and court-rate log (court_log.py).
+on:
+  schedule:
+    - cron: '12,42 * * * *'
+    - cron: '27 */2 * * *'
+    - cron: '52 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      window:
+        description: 'Which days to fetch: near (0-1), mid (2-7) or far (8-13)'
+        default: 'near'
+      dry_run:
+        description: 'Dry run: fetch everything, save nothing (1 = yes)'
+        default: '0'
+
+jobs:
+  near:
+    name: Geo courts, today + tomorrow
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    concurrency: { group: geo-courts-near, cancel-in-progress: false }
+    if: (github.event_name == 'schedule' && startsWith(github.event.schedule, '12,42')) || (github.event_name == 'workflow_dispatch' && inputs.window == 'near')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install httpx curl_cffi loguru python-dotenv rich supabase typer tenacity
+      - name: Fetch geo court hire (days 0-1)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          PBP_COOKIES_JSON: ${{ secrets.PBP_COOKIES_JSON }}
+          DAYS_START: '0'
+          DAYS_AHEAD: '2'
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || '0' }}
+        run: python -W ignore::DeprecationWarning -u fetch_sportswell.py
+
+  mid:
+    name: Geo courts, days 2-7
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    concurrency: { group: geo-courts-mid, cancel-in-progress: false }
+    if: (github.event_name == 'schedule' && startsWith(github.event.schedule, '27 ')) || (github.event_name == 'workflow_dispatch' && inputs.window == 'mid')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install httpx curl_cffi loguru python-dotenv rich supabase typer tenacity
+      - name: Fetch geo court hire (days 2-7)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          PBP_COOKIES_JSON: ${{ secrets.PBP_COOKIES_JSON }}
+          DAYS_START: '2'
+          DAYS_AHEAD: '8'
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || '0' }}
+        run: python -W ignore::DeprecationWarning -u fetch_sportswell.py
+
+  far:
+    name: Geo courts, days 8-13
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    concurrency: { group: geo-courts-far, cancel-in-progress: false }
+    if: (github.event_name == 'schedule' && startsWith(github.event.schedule, '52 ')) || (github.event_name == 'workflow_dispatch' && inputs.window == 'far')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install httpx curl_cffi loguru python-dotenv rich supabase typer tenacity
+      - name: Fetch geo court hire (days 8-13)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          PBP_COOKIES_JSON: ${{ secrets.PBP_COOKIES_JSON }}
+          DAYS_START: '8'
+          DAYS_AHEAD: '14'
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || '0' }}
+        run: python -W ignore::DeprecationWarning -u fetch_sportswell.py
