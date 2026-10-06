@@ -1,25 +1,27 @@
 """
-report_more.py -- the wider comparisons for the Dink & Drive example report
-(2 Oct 2026 request): how fast each kind of session fills, how far each player
-group travels, the player-group tree, the real rating range of each level at
-each venue, and level x format / time-slot fill matrices.
+report_more.py -- the wider comparisons: how fast each kind of session fills,
+how far each player group travels, the real rating range of each level at each
+venue, and level x format / time-slot fill matrices. Given a venue, also that
+venue against the market and its player-group tree.
 
-Same inputs and rules as report_dd.py (it is imported). Other venues are
-lettered with the report's letters (A-F = the six sharing the most Dink & Drive
-players, as in the lead-time and rivals charts); G onwards are the rest, in no
-meaningful order. Output: report_more.json.
+    python insights/report_more.py               market-wide parts only
+    python insights/report_more.py <facility_id> plus that venue's parts
+
+The daily build (build_overview.py) calls main() with no venue. Same inputs and
+rules as venue_report.py (it is imported). With a venue, other venues are
+lettered A, B, C... by how much of the venue's players' play they take, so a
+report can name them or not. Output: report_more.json.
 """
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-import report_dd as R
+import venue_report as R
 
 HERE = Path(__file__).resolve().parent
-FID = R.FID
-LETTERS = {597: "A", 1883: "B", 1461: "C", 1664: "D", 1714: "E", 1485: "F"}
 MIN_GROUP = 5          # never show a player group smaller than this
 MIN_RATINGS = 10       # rated places needed to show a venue's level range
 
@@ -32,15 +34,32 @@ FORMAT_ORDER = ["Social & open play", "Coaching & clinics", "Learn to play", "Ro
 LEVEL_ORDER = ["beginner", "intermediate", "advanced", "all levels"]
 
 
-def letter(fid, extra):
+def letters_for(ok, focus):
+    """Letters for other venues, A first, by their share of the focus venue's
+    players' sessions; venues none of them play at follow, by id."""
+    ids = ok[ok["fid"] == focus]["pbp_user_id"].unique()
+    rank = (ok[ok["pbp_user_id"].isin(ids) & (ok["fid"] != focus)]
+            .groupby("fid").size().sort_values(ascending=False, kind="stable").index.astype(int).tolist())
+    rest = sorted({int(f) for f in ok["fid"].dropna()} - set(rank) - {focus})
+    out, n = {}, 0
+    for f in rank + rest:
+        k, s = n, ""
+        while True:                      # A..Z, then AA, AB...
+            s = chr(ord("A") + k % 26) + s
+            k = k // 26 - 1
+            if k < 0:
+                break
+        out[f] = s
+        n += 1
+    return out
+
+
+def label(fid, focus, letters):
+    """The focus venue by name; others by letter when there is a focus, else by name."""
     fid = int(fid)
-    if fid == FID:
-        return "Dink & Drive"
-    if fid in LETTERS:
-        return LETTERS[fid]
-    if fid not in extra:
-        extra[fid] = chr(ord("G") + len(extra))
-    return extra[fid]
+    if focus is None:
+        return R.name(fid)
+    return R.name(fid) if fid == focus else letters.get(fid, str(fid))
 
 
 def rating_class(x):
@@ -50,7 +69,7 @@ def rating_class(x):
 
 
 # ── 1. how fast sessions fill ────────────────────────────────────────────────
-def fill_speed(fin):
+def fill_speed(fin, focus=None):
     """% full at 7 days, 3 days, 1 day before and at start, for sessions we
     watched from at least 7 days out (so every point is a real reading)."""
     w = fin[(fin["first_obs"] <= fin["starts_at"] - pd.Timedelta(days=7))
@@ -58,7 +77,7 @@ def fill_speed(fin):
     for k in ("7d", "3d", "1d"):
         w[f"f{k}"] = 1 - w[f"spots_{k}"] / w["capacity"]
     w["fgroup"] = w["fmt"].map(FORMAT_GROUP)
-    w["who"] = np.where(w["fid"] == FID, "dd", "market")
+    w["who"] = np.where(w["fid"] == focus, "venue", "market")
 
     def curve(g):
         return {"n": len(g), "d7": round(100 * g["f7d"].mean(), 1), "d3": round(100 * g["f3d"].mean(), 1),
@@ -67,12 +86,12 @@ def fill_speed(fin):
 
     out = {"by_format": [], "by_level": [], "watched": len(w)}
     for fg in FORMAT_ORDER:
-        for who in ("dd", "market"):
+        for who in ("venue", "market"):
             g = w[(w["fgroup"] == fg) & (w["who"] == who)]
             if len(g):
                 out["by_format"].append({"group": fg, "who": who, **curve(g)})
     for lv in LEVEL_ORDER:
-        for who in ("dd", "market"):
+        for who in ("venue", "market"):
             g = w[(w["level_class"] == lv) & (w["who"] == who)]
             if len(g):
                 out["by_level"].append({"group": lv, "who": who, **curve(g)})
@@ -81,7 +100,7 @@ def fill_speed(fin):
     so["fgroup"] = so["fmt"].map(FORMAT_GROUP)
     out["sellout_hours"] = []
     for fg in FORMAT_ORDER:
-        for who, gg in (("dd", so[so["fid"] == FID]), ("market", so[so["fid"] != FID])):
+        for who, gg in (("venue", so[so["fid"] == focus]), ("market", so[so["fid"] != focus])):
             g = gg[gg["fgroup"] == fg]
             if len(g):
                 out["sellout_hours"].append({"group": fg, "who": who, "n": len(g),
@@ -90,10 +109,10 @@ def fill_speed(fin):
 
 
 # ── 2. fill matrices ─────────────────────────────────────────────────────────
-def matrices(fin):
+def matrices(fin, focus=None):
     f = fin[fin["fid"].notna()].copy()
     f["fgroup"] = f["fmt"].map(FORMAT_GROUP)
-    f["who"] = np.where(f["fid"] == FID, "dd", "market")
+    f["who"] = np.where(f["fid"] == focus, "venue", "market")
     f["slot"] = np.where(f["weekend"], "Weekend", "Weekday " + f["daypart"].map(
         {"early": "before 9am", "day": "9am–5pm", "evening": "after 5pm"}))
     cells_fl, cells_sl = [], []
@@ -107,7 +126,7 @@ def matrices(fin):
 
 
 # ── 3. level ranges by venue ────────────────────────────────────────────────
-def level_ranges(m, extra):
+def level_ranges(m, focus=None, letters=None):
     ok = m[~m["cancelled"] & m["rating"].notna()].copy()
     ok["level_class"] = [R.level_class({"all_levels": False, "band": (lo, hi)}) if not np.isnan(lo) else None
                          for lo, hi in zip(ok["band_lo"], ok["band_hi"])]
@@ -117,7 +136,7 @@ def level_ranges(m, extra):
             continue
         stated = g.groupby(["band_lo", "band_hi"]).size().sort_values(ascending=False)
         lo, hi = stated.index[0]
-        out.append({"venue": letter(fid, extra), "fid": int(fid), "level": lv, "n": len(g),
+        out.append({"venue": label(fid, focus, letters or {}), "fid": int(fid), "level": lv, "n": len(g),
                     "players": int(g["pbp_user_id"].nunique()), "sessions": int(g["session_key"].nunique()),
                     "mean": round(float(g["rating"].mean()), 2), "median": float(g["rating"].median()),
                     "p25": float(g["rating"].quantile(.25)), "p75": float(g["rating"].quantile(.75)),
@@ -152,7 +171,7 @@ def player_table(m):
     return ok, p
 
 
-def travel(ok, p):
+def travel(ok, p, focus=None):
     """Each booking's distance from the player's home venue (the venue they play
     at most), for players with 2+ sessions -- one session has no trip."""
     p2 = p[p["sessions"] >= 2]
@@ -184,27 +203,29 @@ def travel(ok, p):
         g = b[b["freq"] == fq]
         if g["pbp_user_id"].nunique() >= MIN_GROUP:
             out.append(dist(g, "freq", fq))
-    # Dink & Drive's own players with 2+ sessions anywhere
-    dd_ids = ok[ok["fid"] == FID]["pbp_user_id"].unique()
-    g = b[b["pbp_user_id"].isin(dd_ids)]
-    out.append(dist(g, "dd", "Dink & Drive players"))
+    # the focus venue's own players with 2+ sessions anywhere
+    if focus is not None:
+        ids = ok[ok["fid"] == focus]["pbp_user_id"].unique()
+        g = b[b["pbp_user_id"].isin(ids)]
+        if g["pbp_user_id"].nunique() >= MIN_GROUP:
+            out.append(dist(g, "venue", f"{R.name(focus)} players"))
     return {"players_2plus": int(len(p2)), "rows": out, "bands": [x[2] for x in bands]}
 
 
-# ── 5. player-group tree for Dink & Drive ───────────────────────────────────
-def tree(ok, p, trav):
-    dd = ok[ok["fid"] == FID]
-    ids = dd["pbp_user_id"].unique()
-    f = dd.groupby("pbp_user_id").size()
+# ── 5. player-group tree for one venue ──────────────────────────────────────
+def tree(ok, p, trav, focus):
+    here = ok[ok["fid"] == focus]
+    ids = here["pbp_user_id"].unique()
+    f = here.groupby("pbp_user_id").size()
     allp = ok[ok["pbp_user_id"].isin(ids)]
-    share = allp.assign(here=allp["fid"] == FID).groupby("pbp_user_id")["here"].mean()
+    share = allp.assign(here=allp["fid"] == focus).groupby("pbp_user_id")["here"].mean()
     q = p.loc[ids]
     # level from each player's own median rating across all their sessions
     lv = q["level"].value_counts().to_dict()
     plays = q["plays"].value_counts().to_dict()
-    home_km = q["home"].map(lambda h: 0.0 if h == FID else R.km(FID, h))
-    where = {"home venue is Dink & Drive": int((q["home"] == FID).sum()),
-             "home venue within 5 km": int(((q["home"] != FID) & (home_km <= 5)).sum()),
+    home_km = q["home"].map(lambda h: 0.0 if h == focus else R.km(focus, h))
+    where = {"home venue is this venue": int((q["home"] == focus).sum()),
+             "home venue within 5 km": int(((q["home"] != focus) & (home_km <= 5)).sum()),
              "home venue over 5 km away": int((home_km > 5).sum())}
     # combined segments: how often x where else
     seg = pd.DataFrame({"freq": f, "share": share})
@@ -223,30 +244,37 @@ def tree(ok, p, trav):
             "segments": segments}
 
 
-def main():
+def main(focus=None):
+    """Market-wide comparisons; with a focus venue id, also that venue's parts."""
+    focus = None if focus is None else int(focus)
     s, r, c = R.load()
     R.NOW = max(s["last_obs"].max(), r["last_seen"].max())
     s = R.attach_titles(s, c)
     fin = R.finished(s)
     m = R.rosters(s, r)
-    # One venue lists most of its players at exactly 5.0 (227 of 271 ratings),
-    # beginners included: a default, like 1.0 and 2.0. Where over half of a
-    # venue's ratings are exactly 5.0, its 5.0s count as unrated.
+    # Some venues list most of their players at exactly 5.0, beginners included:
+    # a default, like 1.0 and 2.0. Where over half of a venue's ratings are
+    # exactly 5.0, its 5.0s count as unrated.
     rated = m[m["rating"].notna()]
     five = rated.assign(f=rated["rating"] == 5.0).groupby("fid")["f"].mean()
     default5 = set(five[five > 0.5].index)
     m.loc[m["fid"].isin(default5) & (m["rating"] == 5.0), "rating"] = np.nan
-    extra = {}
     ok, p = player_table(m)
-    trav = R.travellers(m, s)
-    out = {"fill_speed": fill_speed(fin), "matrices": matrices(fin),
-           "level_ranges": level_ranges(m, extra), "travel": travel(ok, p),
-           "tree": tree(ok, p, trav), "letters_extra": {v: k for k, v in extra.items()}}
+    letters = letters_for(ok, focus) if focus is not None else {}
+    out = {"focus": focus, "fill_speed": fill_speed(fin, focus), "matrices": matrices(fin, focus),
+           "level_ranges": level_ranges(m, focus, letters), "travel": travel(ok, p, focus)}
+    if focus is not None:
+        trav = R.travellers(m, s, focus)
+        out["tree"] = tree(ok, p, trav, focus)
+        out["letters"] = {v: k for k, v in letters.items()}
     R.WORK.mkdir(parents=True, exist_ok=True)
     (R.WORK / "report_more.json").write_text(json.dumps(out, indent=1, default=str))
     return out
 
 
 if __name__ == "__main__":
-    o = main()
+    arg = sys.argv[1] if len(sys.argv) > 1 else None
+    if arg is not None and not arg.isdigit():
+        sys.exit("usage: python insights/report_more.py [facility_id]")
+    o = main(arg)
     print(json.dumps(o, indent=1, default=str)[:12000])
