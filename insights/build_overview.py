@@ -357,9 +357,13 @@ def main():
     f["date"] = loc.dt.strftime("%Y-%m-%d")
     f["slot"] = np.where(f["weekend"], "Weekend", "Weekday " + f["daypart"].map(
         {"early": "before 9am", "day": "9am–5pm", "evening": "after 5pm"}))
-    # watched from 7+ days out: fill at 7/3/1 days
-    w7 = (f["first_obs"] <= f["starts_at"] - pd.Timedelta(days=7)) & \
-         f[["spots_7d", "spots_3d", "spots_1d"]].le(f["capacity"], axis=0).all(axis=1)
+    # fill 7 / 3 / 1 days out, each where we were watching the session by then
+    # (a session listed 5 days ahead has a 3- and 1-day figure, not a 7-day one)
+    def stage(col, days):
+        ok = (f["first_obs"] <= f["starts_at"] - pd.Timedelta(days=days)) & f[col].notna() & f[col].le(f["capacity"])
+        return pd.Series(np.where(ok, (100 * (1 - f[col] / f["capacity"])).round(1), np.nan), index=f.index)
+    f7, f3, f1 = stage("spots_7d", 7), stage("spots_3d", 3), stage("spots_1d", 1)
+    opt = lambda v: None if v != v else float(v)
     sess = []
     for i, x in enumerate(f.itertuples()):
         sess.append({
@@ -373,9 +377,7 @@ def main():
             # price was worked out (venue_report.session_prices); longest waitlist
             "mprice": r1(x.mprice_n), "dur": r1(x.dur_h), "pb": x.price_basis,
             "wl": int(x.waitlist_max) if x.waitlist_max == x.waitlist_max and x.waitlist_max is not None else None,
-            "f7": round(100 * (1 - x.spots_7d / x.capacity), 1) if w7.loc[x.Index] else None,
-            "f3": round(100 * (1 - x.spots_3d / x.capacity), 1) if w7.loc[x.Index] else None,
-            "f1": round(100 * (1 - x.spots_1d / x.capacity), 1) if w7.loc[x.Index] else None,
+            "f7": opt(f7.loc[x.Index]), "f3": opt(f3.loc[x.Index]), "f1": opt(f1.loc[x.Index]),
         })
 
     # ── per-venue player facts ──
