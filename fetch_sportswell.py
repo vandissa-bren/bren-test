@@ -38,6 +38,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from extract_thejar import PlayByPointAPI
+import court_log
 
 SECRETS_PATH = os.environ.get("GEO_SECRETS", "/home/pmjobs/secrets.json")
 SESSION_PATH = os.environ.get("GEO_SESSION", "/home/pmjobs/pbp_session.json")
@@ -73,7 +74,8 @@ def get_shift(sec, target_date=None):
     return shift
 
 
-async def fetch_blocks_and_prices(api, fid, target, existing_prices, existing_fetched_at, errors=None):
+async def fetch_blocks_and_prices(api, fid, target, existing_prices, existing_fetched_at, errors=None,
+                                  universe=None, free=None):
     """
     SportsWell-style venues use session-style available_hours (one block per
     hour) -- we deliberately build one block per available hour slot rather
@@ -84,6 +86,11 @@ async def fetch_blocks_and_prices(api, fid, target, existing_prices, existing_fe
     # incomplete is appended to it, and the caller does not save that day.
     # Price errors are not among them -- a missing price is shown as
     # unpriced, which is honest; a missing court is not.
+    #
+    # Court-hire log (20261016): when `universe` is a dict and `free` a dict,
+    # every slot PlayByPoint lists -- free OR taken -- goes into universe as
+    # {sec: shift}, and each free court into free as {"id|name": [secs]}, the
+    # shapes court_log.court_slot_rows takes (as in fetch_court_blocks.py).
     blocks = []
     new_prices = dict(existing_prices)
     new_fetched_at = dict(existing_fetched_at)
@@ -98,6 +105,15 @@ async def fetch_blocks_and_prices(api, fid, target, existing_prices, existing_fe
         # weekend with genuinely different prices doesn't collide.
         sec_shift_map = {}
         valid = []
+        if universe is not None:
+            for s in slots:
+                if isinstance(s, dict) and isinstance(s.get("seconds_from_midnight"), (int, float)):
+                    sh = s.get("shift")
+                    if sh and target.weekday() >= 5:
+                        sh = f"{sh}_weekend"
+                    sec = int(s["seconds_from_midnight"])
+                    if sh or sec not in universe:
+                        universe[sec] = sh
         for s in slots:
             if not (s.get("available") and isinstance(s.get("seconds_from_midnight"), (int, float))):
                 continue
@@ -174,6 +190,10 @@ async def fetch_blocks_and_prices(api, fid, target, existing_prices, existing_fe
                 courts = []
                 if errors is not None:
                     errors.append(f"courts at {sec_to_hhmm(sec)}: {e}")
+            if free is not None:
+                for court in (courts or []):
+                    if court.get("id"):
+                        free.setdefault(f"{court['id']}|{court.get('name') or court['id']}", []).append(sec)
             if not courts:
                 courts = [{"id": None, "name": "Court"}]
             for court in courts:
@@ -317,6 +337,7 @@ async def main():
     results = {v.facility_id: {"name": v.name, "ok": False, "error": None, "dates_ok": 0,
                                "failed_dates": [], "by_date": {}} for v in venues}
     save_failed = []
+    court_log_rows = []   # court-hire log (court_log.py), sent after the saves
 
     session = await ensure_session(settings, venues[0]) if venues else None
     if session and not session.get("user_id"):
@@ -381,11 +402,31 @@ async def main():
                 try:
                     async with _api(session["cookies"], slug) as api:
                         api._user_id = session.get("user_id")
+                        # The venue's bookable courts, for the court-hire log:
+                        # the same inventory fetch_court_blocks.py uses. If it
+                        # can't be read, this venue isn't logged this run (its
+                        # courts are still saved for the app).
+                        valid_ids = None
+                        try:
+                            import court_inventory
+                            ct = await api.court_types(fid, kind=None)
+                            inv = court_inventory.build_inventory(fid, ct or [], await api.courts(fid))
+                            valid_ids = {str(c.id) for c in inv.courts} or None
+                        except Exception as e:
+                            print(f"  {slug}: court inventory not read ({type(e).__name__}: {e}) -- not logged this run")
                         for target in dates:
                             date_errors = []
+                            universe, free = {}, {}
+                            observed_at = datetime.now().astimezone()
                             blocks, res["prices"], res["fetched_at"] = await fetch_blocks_and_prices(
-                                api, fid, target, res["prices"], res["fetched_at"], errors=date_errors)
+                                api, fid, target, res["prices"], res["fetched_at"], errors=date_errors,
+                                universe=universe, free=free)
                             ds = target.isoformat()
+                            # Only a day read without errors is logged: a court
+                            # we failed to read must never look booked.
+                            if valid_ids and not date_errors:
+                                court_log_rows.extend(court_log.court_slot_rows(
+                                    fid, target, universe, free, valid_ids, observed_at))
                             if date_errors:
                                 res["failed_dates"].append(ds)
                                 res["error"] = res["error"] or date_errors[0][:300]
@@ -422,6 +463,21 @@ async def main():
             if out is not None and not DRY_RUN:
                 print(f"Saved {slug}: {total} total blocks, {len(res['prices'])} prices cached"
                       + (f"  [PARTIAL -- kept stored days {', '.join(res['failed_dates'])}]" if res["failed_dates"] else ""))
+
+        # Court-hire log and court-rate log, after the saves so a log problem
+        # can never cost the app its availability. A failed log write fails the
+        # run (history missed here is gone); the rate log never does.
+        if not DRY_RUN and not os.environ.get("SKIP_COURT_LOG"):
+            if court_log_rows:
+                out = await court_log.send_court_slots(client, base, headers, court_log_rows)
+                if out["error"]:
+                    save_failed.append(("court_slot_states", out["error"]))
+                    print(f"  COURT LOG FAILED: {out['error']}")
+                print(f"  Court log: {len(court_log_rows)} slots read, "
+                      f"{out['inserted']} new states, {out['extended']} unchanged")
+            print("  " + await court_log.record_court_rates(client, base, headers))
+        elif DRY_RUN:
+            print(f"  DRY RUN: would log {len(court_log_rows)} court slots and the court rates")
 
     failed = [f for f, r in results.items() if not r["ok"]]
     partial = [f for f, r in results.items() if r["ok"] and r["failed_dates"]]
