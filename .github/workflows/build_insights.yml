@@ -1,0 +1,32 @@
+name: Build Insights
+
+# The full analysis behind PickleMatch's /admin/insights (Overview … Sessions
+# tabs): last 7, 28 and 90 days, rebuilt each morning after the overnight
+# scrapes. Reads and writes Supabase only -- it never contacts PlayByPoint.
+on:
+  schedule:
+    - cron: '47 18 * * *'   # 4:47am / 5:47am Melbourne
+  workflow_dispatch:
+    inputs:
+      windows:
+        description: 'Windows in days, comma separated'
+        default: '7,28,90'
+
+jobs:
+  build:
+    name: Build the insights dataset
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install httpx pandas numpy scipy networkx tzdata
+      - name: Build and store
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          INSIGHTS_WINDOWS: ${{ github.event_name == 'workflow_dispatch' && inputs.windows || '7,28,90' }}
+        run: python insights/build_insights.py
