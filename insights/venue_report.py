@@ -117,6 +117,12 @@ def attach_titles(s, c):
         else:
             titles.append(None); skills.append(None); durs.append(np.nan); how.append(None)
     s["title"], s["skill_level"], s["dur_h"], s["title_how"] = titles, skills, durs, how
+    # The session's own logged end time (20261016100000) beats the catalogue's.
+    if "end_time" in s:
+        end = pd.to_datetime(s["end_time"], format="%H:%M", errors="coerce")
+        start = pd.to_datetime(s["hm"], format="%H:%M", errors="coerce")
+        own = (end - start).dt.total_seconds() / 3600
+        s["dur_h"] = own.where(own > 0, s["dur_h"])
     terms = [parse(t, ty if isinstance(ty, str) else None, sk if isinstance(sk, str) else None) if isinstance(t, str) and t else None
              for t, ty, sk in zip(s["title"], s["session_type"], s["skill_level"])]
     s["family"] = [t["family"] if t else None for t in terms]
