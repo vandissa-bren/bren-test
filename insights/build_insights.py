@@ -44,12 +44,15 @@ COLS = {
     "sessions": ["session_key", "session_date", "start_time", "capacity", "price", "status", "starts_at",
                  "venue_id", "session_type", "first_obs", "last_obs", "n_obs", "n_obs_before", "last_obs_before",
                  "spots_at_start", "first_full_at", "spots_7d", "spots_3d", "spots_1d", "n_prices",
-                 "n_start_times", "venue_name", "end_time"],
+                 "n_start_times", "venue_name", "end_time", "price_tiers", "program_slug", "waitlist_max"],
     "rosters": ["pbp_user_id", "session_key", "lesson_id", "session_date", "first_seen", "last_seen",
                 "rating_at_time"],
     "catalogue": ["venue_id", "venue_name", "lesson_id", "title", "type", "category", "skill_level",
                   "program_slug", "date", "start", "end_time", "capacity", "spots_left", "price"],
+    # optional: a database without 20261018100000 just has no programme prices
+    "programs": ["venue_id", "program_slug", "tiers", "lessons_ahead_max"],
 }
+OPTIONAL = {"programs"}
 
 
 def sb():
@@ -81,12 +84,26 @@ def export(client, url, h, frm, to, d: Path, chunk_days: int = 14):
     counts = {}
     for kind, cols in COLS.items():
         rows, a = [], frm
-        while a <= to:
-            b = min(to, a + timedelta(days=chunk_days - 1))
-            rows += rpc(client, url, h, f"insights_export_{kind}", {"p_from": str(a), "p_to": str(b)})
-            a = b + timedelta(days=1)
+        try:
+            if kind == "programs":
+                rows = rpc(client, url, h, "insights_export_programs", {"p_from": str(frm), "p_to": str(to)})
+            else:
+                while a <= to:
+                    b = min(to, a + timedelta(days=chunk_days - 1))
+                    rows += rpc(client, url, h, f"insights_export_{kind}", {"p_from": str(a), "p_to": str(b)})
+                    a = b + timedelta(days=1)
+        except RuntimeError as e:
+            if kind not in OPTIONAL:
+                raise
+            print(f"  {kind}: not available ({str(e)[:80]}); carrying on without")
+            rows = []
         df = pd.DataFrame(rows, columns=cols)
-        key = {"sessions": ["session_key"], "rosters": ["pbp_user_id", "session_key"], "catalogue": ["lesson_id"]}[kind]
+        # JSON values (price records) go to the CSV as JSON, not Python reprs
+        for col in df.columns:
+            if df[col].map(lambda v: isinstance(v, (list, dict))).any():
+                df[col] = df[col].map(lambda v: json.dumps(v) if isinstance(v, (list, dict)) else v)
+        key = {"sessions": ["session_key"], "rosters": ["pbp_user_id", "session_key"], "catalogue": ["lesson_id"],
+               "programs": ["venue_id", "program_slug"]}[kind]
         df = df.drop_duplicates(key)
         df.to_csv(d / f"{kind}.csv", index=False)
         counts[kind] = len(df)
