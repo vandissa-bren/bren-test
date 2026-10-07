@@ -34,6 +34,11 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://stwohmddmdwttasbyblt.supa
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 PROXY_URL = os.environ.get("PROXY_URL") or None
 DAYS_AHEAD = 14
+# Sessions further out than DAYS_AHEAD are on the program pages this job
+# already reads. They aren't stored for the app, but their places taken go to
+# the fill log, so insights can see how full sessions are weeks ahead
+# (publish-versus-book). LOG_FAR_SESSIONS=0 turns it off.
+LOG_FAR_SESSIONS = os.environ.get("LOG_FAR_SESSIONS", "1") != "0"
 
 # The venues to scrape: every active Play By Point venue in the one list the
 # site publishes (frontend public/venues.json), read through venue_registry.
@@ -223,6 +228,74 @@ async def record_listing_horizon(rows: list[dict]) -> None:
         console.print(f"  [yellow]Listing horizon NOT recorded: {type(e).__name__}: {e}[/yellow]")
 
 
+def _far_observation(lesson: dict, stub: dict, facility_id: int, program_slug: str, price: str, props: dict) -> dict | None:
+    """A fill-log reading for a session beyond the app's window (see
+    LOG_FAR_SESSIONS): the same fields the roster job sends, from the program
+    page already read. None when the lesson can't be placed."""
+    lid, ld = lesson.get("id"), lesson.get("lesson_date")
+    cap = lesson.get("capacity") or stub.get("capacity") or 0
+    if not lid or not isinstance(ld, str) or not cap:
+        return None
+    pc = lesson.get("player_count", 0) or 0
+    left = max(0, int(cap) - int(pc))
+    hs = lesson.get("hour_start", 0)
+    he = lesson.get("hour_end", hs + 3600)
+    lp = price
+    for ip in (lesson.get("individual_prices") or []):
+        if ip.get("price") and ip.get("player_category") != "member":
+            p = float(ip["price"])
+            lp = f"${p:.0f}" if p == int(p) else f"${p:.2f}"
+            break
+    wl_off = props.get("enableWaitlist") is False or props.get("waitlist") is False
+    wl = lesson.get("waitlist_count")
+    sl = stub.get("ntrp_str") or ""
+    return {
+        "session_key": f"pbp-{lid}",
+        "spots_left": left,
+        "capacity": int(cap),
+        "session_date": ld,
+        "start_time": _sec_to_hhmm(hs),
+        "end_time": _sec_to_hhmm(he),
+        "price": lp,
+        "status": "Full" if left == 0 else "Available",
+        "venue_id": f"pbp-{facility_id}",
+        "session_type": stub.get("category") or "Session",
+        "title": stub.get("name"),
+        "skill_level": sl or None,
+        "program_slug": program_slug,
+        "price_tiers": _pricing_tiers(lesson.get("individual_prices")) or None,
+        "coaches": [str(n).strip() for n in (lesson.get("teacher_names") or []) if n and str(n).strip()] or None,
+        "waitlist": None if wl_off or not isinstance(wl, int) or wl < 0 else wl,
+    }
+
+
+async def record_far_sessions(rows: list[dict]) -> None:
+    """Send the far-out sessions to the fill log (record_inventory_snapshot,
+    which writes only what changed, plus a reading every 6 hours). Never fails
+    the run: a missed night is a gap in a trend, not lost sessions."""
+    if not rows:
+        return
+    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}", "Content-Type": "application/json"}
+    written, failed = 0, 0
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            for i in range(0, len(rows), 500):
+                resp = await client.post(f"{SUPABASE_URL}/rest/v1/rpc/record_inventory_snapshot", headers=headers,
+                                         json={"p_observations": rows[i:i + 500], "p_source": "pbp"})
+                if resp.status_code == 200:
+                    try:
+                        written += int(resp.json() or 0)
+                    except Exception:
+                        pass
+                else:
+                    failed += 1
+                    console.print(f"  [yellow]Far sessions batch NOT logged: HTTP {resp.status_code} {resp.text[:200]}[/yellow]")
+        console.print(f"  Far sessions: {len(rows)} read beyond {DAYS_AHEAD} days, {written} fill-log rows written"
+                      + (f", {failed} batch(es) failed" if failed else ""))
+    except Exception as e:
+        console.print(f"  [yellow]Far sessions NOT logged: {type(e).__name__}: {e}[/yellow]")
+
+
 async def scrape_pbp_venue(
     cookies: dict,
     user_id: int,
@@ -250,9 +323,12 @@ async def scrape_pbp_venue(
         "_clinics_tried": 0,        # clinics in range that we tried to read
         "_failed_slugs": [],        # program slugs whose page could not be read
         "_listing": [],             # how far ahead each program is listed (see run_once)
+        "_far": [],                 # sessions past the window, for the fill log (LOG_FAR_SESSIONS)
     }
 
     date_strs = {d.isoformat() for d in dates}
+    last_day = max(date_strs) if date_strs else ""
+    far_seen: set = set()
 
     try:
         async with PlayByPointAPI(cookies=cookies, club_slug=slug, proxy=PROXY_URL) as api:
@@ -366,6 +442,12 @@ async def scrape_pbp_venue(
                     for lesson in lessons_raw:
                         ld = lesson.get("lesson_date")
                         if ld not in date_strs:
+                            # beyond the app's window: to the fill log only
+                            if LOG_FAR_SESSIONS and isinstance(ld, str) and ld > last_day and lesson.get("id") not in far_seen:
+                                obs = _far_observation(lesson, stub, facility_id, program_slug, price, props)
+                                if obs:
+                                    far_seen.add(lesson.get("id"))
+                                    result["_far"].append(obs)
                             continue
                         lid = lesson.get("id")
                         cap = lesson.get("capacity") or stub.get("capacity") or 0
@@ -482,6 +564,7 @@ async def run_once():
         # non-zero, so the workflow goes red instead of green.
         records, not_saved, partial = [], [], []
         listing_rows = []   # listing_horizon rows, written after the venues
+        far_rows = []       # sessions beyond the window, for the fill log
         for r in pbp_results:
             if not isinstance(r, dict):
                 continue
@@ -490,6 +573,7 @@ async def run_once():
             failed_slugs = sorted(set(r.pop("_failed_slugs", [])))
             for row in r.pop("_listing", []):
                 listing_rows.append({"facility_id": int(r["id"]), **row})
+            far_rows.extend(r.pop("_far", []))
             if list_failed or (tried and len(failed_slugs) >= tried):
                 not_saved.append(r["name"])
                 console.print(f"  [red]✗ NOT SAVED[/red] {r['name']} · "
@@ -520,6 +604,7 @@ async def run_once():
         if partial:
             console.print(f"[yellow]{len(partial)} venue(s) partly read: {', '.join(partial)}[/yellow]")
         await record_listing_horizon(listing_rows)
+        await record_far_sessions(far_rows)
         if pbp_results and not records:
             console.print("[red]EVERY VENUE FAILED -- nothing written; exiting non-zero so the run shows as failed[/red]")
             sys.exit(1)
