@@ -1,0 +1,32 @@
+name: Re-read Played Rosters
+# Daily. Re-reads the rosters of sessions played 1, 3, 7 and 14 days ago and
+# records each player's DUPR now (record_rating_checks), so ratings can be
+# compared before and after a session. Writes the rating checks and the
+# rating log only; never the roster sightings.
+on:
+  schedule:
+    - cron: '47 19 * * *'     # about 6:47am Melbourne
+  workflow_dispatch:
+    inputs:
+      days:
+        description: 'Days after the session to re-read (comma-separated)'
+        default: '1,3,7,14'
+
+jobs:
+  reread:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install httpx curl_cffi python-dotenv loguru rich typer tenacity
+      - name: Re-read played rosters
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          PBP_COOKIES_JSON: ${{ secrets.PBP_COOKIES_JSON }}
+          REREAD_DAYS: ${{ github.event.inputs.days || '1,3,7,14' }}
+        run: python reread_played_rosters.py
