@@ -52,8 +52,10 @@ COLS = {
                   "program_slug", "date", "start", "end_time", "capacity", "spots_left", "price"],
     # optional: a database without 20261018100000 just has no programme prices
     "programs": ["venue_id", "program_slug", "tiers", "lessons_ahead_max"],
+    # optional: each player's first session at each venue, up to the period's end (20261025100000)
+    "firsts": ["pbp_user_id", "fid", "first_date", "first_key"],
 }
-OPTIONAL = {"programs"}
+OPTIONAL = {"programs", "firsts"}
 
 
 def sb():
@@ -88,6 +90,8 @@ def export(client, url, h, frm, to, d: Path, chunk_days: int = 14):
         try:
             if kind == "programs":
                 rows = rpc(client, url, h, "insights_export_programs", {"p_from": str(frm), "p_to": str(to)})
+            elif kind == "firsts":
+                rows = rpc(client, url, h, "insights_export_firsts", {"p_to": str(to)})
             else:
                 while a <= to:
                     b = min(to, a + timedelta(days=chunk_days - 1))
@@ -104,7 +108,7 @@ def export(client, url, h, frm, to, d: Path, chunk_days: int = 14):
             if df[col].map(lambda v: isinstance(v, (list, dict))).any():
                 df[col] = df[col].map(lambda v: json.dumps(v) if isinstance(v, (list, dict)) else v)
         key = {"sessions": ["session_key"], "rosters": ["pbp_user_id", "session_key"], "catalogue": ["lesson_id"],
-               "programs": ["venue_id", "program_slug"]}[kind]
+               "programs": ["venue_id", "program_slug"], "firsts": ["pbp_user_id", "fid"]}[kind]
         df = df.drop_duplicates(key)
         df.to_csv(d / f"{kind}.csv", index=False)
         counts[kind] = len(df)
@@ -145,6 +149,8 @@ def shareable(d: dict, net: dict) -> dict:
     d["levelFit"] = [r for r in d.get("levelFit", []) if r["v"] in ids]
     d["levelClass"] = [r for r in d.get("levelClass", []) if r["v"] is None or r["v"] in ids]
     d["levelMix"] = [r for r in d.get("levelMix", []) if r["v"] in ids and r["players"] >= MIN_GROUP]
+    if d.get("newret"):
+        d["newret"] = dict(d["newret"], venues={k: v for k, v in d["newret"]["venues"].items() if int(k) in ids})
     if d.get("prev"):
         p = dict(d["prev"])
         p["sessions"] = [x for x in p["sessions"] if x[0] in ids]
