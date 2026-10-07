@@ -6,6 +6,7 @@ named; players appear only as counts, and no group under 5 players is shown.
 Returns (data, network); build_insights.py publishes them.
 """
 import json
+from datetime import timedelta
 from math import radians, sin, cos, atan2, degrees
 from pathlib import Path
 
@@ -203,6 +204,76 @@ def coaches(f, okv):
                     "players": hold(len(per)), "regulars": hold(int((per >= 2).sum())),
                     "rating": round(float(rated.median()), 2) if len(rated) >= MIN_GROUP else None})
     return sorted(out, key=lambda x: -x["sessions"])
+
+
+def new_returning(okv, f, vmap, start, end):
+    """New and returning players (Players › New and returning). A player is NEW
+    in the period when the first session we ever saw them in falls inside it;
+    "new here" when their first session at that venue does. Rosters reach back
+    to 19 Sep, so early on "new" includes players who were already playing
+    before we started watching; lookback says how many days of history sit
+    before the period, and the weekly series shows the new share settling.
+    Counts only; per-venue counts under 5 are held back (None).
+      city      players, new, returning, lookback (days), since (first roster date)
+      weeks     [monday, players, new]: every week in the period
+      venues    {fid: [players, new here, of whom new everywhere]}
+      firsts    {format|level: new players whose first session in the period was that kind}
+      back      new players with 14+ days left in the period: [n, came back within 14 days]
+      backBy    {format: [n, came back]}"""
+    F = R.FIRSTS
+    if F is None or F.empty or okv.empty:
+        return None
+    F = F.dropna(subset=["pbp_user_id", "first_date"]).copy()
+    F["first_date"] = pd.to_datetime(F["first_date"]).dt.date
+    first_all = F.groupby("pbp_user_id")["first_date"].min()
+    first_at = {(int(p), int(v)): d for p, v, d in F.dropna(subset=["fid"])[["pbp_user_id", "fid", "first_date"]].itertuples(index=False)}
+    since = min(first_all) if len(first_all) else None
+    s0, s1 = start.tz_convert(R.MEL).date(), end.tz_convert(R.MEL).date()
+    x = okv.copy()
+    x["day"] = x["starts_at"].dt.tz_convert(R.MEL).dt.date
+    x["first"] = x["pbp_user_id"].map(first_all)
+    x = x[x["first"].notna()]
+    kind = f.set_index("session_key")[["fgroup", "lvl"]]
+    x = x.join(kind, on="session_key")
+    hold = lambda n: int(n) if n >= MIN_GROUP else None
+    players = x["pbp_user_id"].unique()
+    is_new = {p for p in players if first_all[p] >= s0}
+    # weeks, Monday first
+    x["week"] = x["day"].map(lambda d: d - timedelta(days=d.weekday()))
+    weeks = []
+    for w, g in x.groupby("week"):
+        ps = g["pbp_user_id"].unique()
+        new = sum(1 for p in ps if w <= first_all[p] <= w + timedelta(days=6))
+        weeks.append([str(w), int(len(ps)), int(new)])
+    # venues
+    venues = {}
+    for fid, g in x.groupby("fid"):
+        ps = g["pbp_user_id"].unique()
+        here = [p for p in ps if first_at.get((int(p), int(fid)), s0) >= s0]
+        everywhere = [p for p in here if p in is_new]
+        venues[str(int(fid))] = [hold(len(ps)), hold(len(here)), hold(len(everywhere))]
+    # what new players first played, and whether they came back
+    nx = x[x["pbp_user_id"].isin(is_new)].sort_values("starts_at")
+    firsts_kind, back, back_by = {}, [0, 0], {}
+    for p, g in nx.groupby("pbp_user_id"):
+        g = g.drop_duplicates("session_key")
+        f0 = g.iloc[0]
+        k = f"{f0['fgroup'] if isinstance(f0['fgroup'], str) else 'Unknown'}|{f0['lvl'] if isinstance(f0['lvl'], str) else 'no level stated'}"
+        firsts_kind[k] = firsts_kind.get(k, 0) + 1
+        if f0["day"] <= s1 - timedelta(days=14):
+            came = bool(((g["day"] > f0["day"]) & (g["day"] <= f0["day"] + timedelta(days=14))).any())
+            back[0] += 1
+            back[1] += int(came)
+            fm = f0["fgroup"] if isinstance(f0["fgroup"], str) else "Unknown"
+            b = back_by.setdefault(fm, [0, 0])
+            b[0] += 1
+            b[1] += int(came)
+    return {"city": {"players": int(len(players)), "new": int(len(is_new)), "returning": int(len(players) - len(is_new)),
+                     "lookback": (s0 - since).days if since else 0, "since": str(since) if since else None},
+            "weeks": weeks, "venues": venues,
+            "firsts": {k: n for k, n in firsts_kind.items() if n >= MIN_GROUP},
+            "back": back if back[0] >= MIN_GROUP else None,
+            "backBy": {k: v for k, v in back_by.items() if v[0] >= MIN_GROUP}}
 
 
 def _spread(per: pd.Series) -> dict:
@@ -595,7 +666,8 @@ def main():
             "market": {str(fid): market(m, s, fin, okv, fid) for fid, v in vmap.items() if v.get("tracked")},
             "timing": timing(tl, f), "quality": quality(s, f, tl, start, end, vmap),
             "levelMix": level_mix(okv, dict(zip(s["session_key"], s["level_class"]))),
-            "levelSupply": level_supply(okv, f, vmap), "coaches": coaches(f, okv)}
+            "levelSupply": level_supply(okv, f, vmap), "coaches": coaches(f, okv),
+            "newret": new_returning(okv, f, vmap, start, end)}
     return data, net
 
 
