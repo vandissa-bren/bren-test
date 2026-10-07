@@ -163,6 +163,48 @@ def level_supply(okv, f, vmap):
     return out
 
 
+def _coach_list(raw):
+    """A session's coaches, as names (the export sends a JSON list)."""
+    if isinstance(raw, list):
+        xs = raw
+    elif isinstance(raw, str) and raw.strip().startswith("["):
+        try:
+            xs = json.loads(raw)
+        except ValueError:
+            xs = []
+    else:
+        xs = []
+    return [" ".join(str(x).split()) for x in xs if isinstance(x, str) and x.strip()]
+
+
+def coaches(f, okv):
+    """Each coach PlayByPoint lists on the window's finished sessions (from
+    6 Oct): their venues and sessions, and the players booked into them.
+    A coach is their name as listed, spaces tidied and case ignored.
+    players: distinct players; regulars: those in 2+ of the coach's sessions;
+    rating: median of the rated players (needs 5). Player counts under 5 are
+    held back (None). Session figures (fill, sold out, price) are summed on
+    the page from each session's `co`, so the filters apply."""
+    rows = []
+    for key, x in f.iterrows():
+        for name in x["co_list"]:
+            rows.append((name.lower(), name, x["session_key"], int(x["fid"])))
+    if not rows:
+        return []
+    c = pd.DataFrame(rows, columns=["k", "name", "session_key", "fid"])
+    hold = lambda n: int(n) if n >= MIN_GROUP else None
+    out = []
+    for k, g in c.groupby("k"):
+        pl = okv[okv["session_key"].isin(set(g["session_key"]))]
+        per = pl.groupby("pbp_user_id").size()
+        rated = pl.groupby("pbp_user_id")["rating"].median().dropna()
+        out.append({"name": g["name"].mode().iloc[0], "venues": sorted({int(v) for v in g["fid"]}),
+                    "sessions": int(g["session_key"].nunique()),
+                    "players": hold(len(per)), "regulars": hold(int((per >= 2).sum())),
+                    "rating": round(float(rated.median()), 2) if len(rated) >= MIN_GROUP else None})
+    return sorted(out, key=lambda x: -x["sessions"])
+
+
 def _spread(per: pd.Series) -> dict:
     return {"p10": round(float(per.quantile(.10)), 2), "p25": round(float(per.quantile(.25)), 2),
             "median": round(float(per.median()), 2),
@@ -416,6 +458,7 @@ def main():
         f["waitlist_max"] = np.nan
     loc = f["starts_at"].dt.tz_convert(R.MEL)
     f["date"] = loc.dt.strftime("%Y-%m-%d")
+    f["co_list"] = (f["coaches"] if "coaches" in f else pd.Series([None] * len(f), index=f.index)).map(_coach_list)
     f["slot"] = np.where(f["weekend"], "Weekend", "Weekday " + f["daypart"].map(
         {"early": "before 9am", "day": "9am–5pm", "evening": "after 5pm"}))
     # fill 7 / 3 / 1 days out, each where we were watching the session by then
@@ -438,6 +481,7 @@ def main():
             # price was worked out (venue_report.session_prices); longest waitlist
             "mprice": r1(x.mprice_n), "dur": r1(x.dur_h), "pb": x.price_basis,
             "wl": int(x.waitlist_max) if x.waitlist_max == x.waitlist_max and x.waitlist_max is not None else None,
+            "co": x.co_list or None,       # coaches as PlayByPoint lists them (from 6 Oct)
             "f7": opt(f7.loc[x.Index]), "f3": opt(f3.loc[x.Index]), "f1": opt(f1.loc[x.Index]),
         })
 
@@ -550,7 +594,7 @@ def main():
             "market": {str(fid): market(m, s, fin, okv, fid) for fid, v in vmap.items() if v.get("tracked")},
             "timing": timing(tl, f), "quality": quality(s, f, tl, start, end, vmap),
             "levelMix": level_mix(okv, dict(zip(s["session_key"], s["level_class"]))),
-            "levelSupply": level_supply(okv, f, vmap)}
+            "levelSupply": level_supply(okv, f, vmap), "coaches": coaches(f, okv)}
     return data, net
 
 
