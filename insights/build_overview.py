@@ -482,6 +482,7 @@ def main():
             "mprice": r1(x.mprice_n), "dur": r1(x.dur_h), "pb": x.price_basis,
             "wl": int(x.waitlist_max) if x.waitlist_max == x.waitlist_max and x.waitlist_max is not None else None,
             "co": x.co_list or None,       # coaches as PlayByPoint lists them (from 6 Oct)
+            "ps": x.program_slug if isinstance(x.program_slug, str) and x.program_slug else None,   # its program, for listing horizon
             "f7": opt(f7.loc[x.Index]), "f3": opt(f3.loc[x.Index]), "f1": opt(f1.loc[x.Index]),
         })
 
