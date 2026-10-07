@@ -19,7 +19,9 @@ Env: SUPABASE_URL, SUPABASE_KEY (service), PBP_COOKIES_JSON,
      REREAD_DAYS (default "1,3,7,14").
 """
 import asyncio
+import collections
 import json
+import re
 import os
 import sys
 from datetime import datetime, timedelta, timezone
@@ -94,7 +96,7 @@ async def main():
         targets = await played_sessions(client, dates)
         print(f"Re-read: {len(targets)} played sessions, {len(DAYS)} offsets ({', '.join(map(str, DAYS))} days)")
         run_at = datetime.now(timezone.utc).isoformat()
-        checks, ok, empty, failed, players, retry = [], 0, 0, 0, 0, []
+        checks, ok, empty, failed, players = [], 0, 0, 0, 0
         per_offset = {k: [0, 0] for k in DAYS}          # offset -> [sessions read, players]
         async with PlayByPointAPI(cookies=cookies, club_slug="thejar", **kw) as api:
             api._user_id = user_id
@@ -103,23 +105,18 @@ async def main():
                 return await api._get_json("/api/public/clinics/lesson_players",
                                            params={"lesson_id": lesson_id, "rating_provider": "dupr"})
 
-            # A read that fails gets one more try after the rest (the first
-            # run lost 11 of 154 to failed reads; the probe lost 1 of 39).
-            results = []
+            # The client already retries each read three times, so a read that
+            # still fails is refused for good (the first runs lost the same 11 of
+            # 154 twice). Count why, as HTTP status or error type only.
+            results, why = [], collections.Counter()
             for t in targets:
                 try:
                     results.append((t, await read(t["lesson_id"])))
-                except Exception:
-                    retry.append(t)
+                except Exception as e:
+                    failed += 1
+                    m = re.search(r"\b(\d{3}) ", str(e)[:40])
+                    why[f"HTTP {m.group(1)}" if m else type(e).__name__] += 1
                 await asyncio.sleep(0.3)
-            if retry:
-                await asyncio.sleep(5)
-                for t in retry:
-                    try:
-                        results.append((t, await read(t["lesson_id"])))
-                    except Exception:
-                        failed += 1
-                    await asyncio.sleep(1.0)
             for t, rd in results:
                 users = [{"id": u.get("id"), "rating": u.get("rating")}
                          for u in (rd or {}).get("users", []) if u.get("id") is not None]
@@ -147,7 +144,9 @@ async def main():
     print("=" * 56)
     for k in DAYS:
         print(f"  {k:>2} days after: {per_offset[k][0]} sessions read, {per_offset[k][1]} players")
-    print(f"REREAD SUMMARY  sessions={len(targets)}  read_ok={ok}  empty={empty}  retried={len(retry)}  failed={failed}  "
+    if failed:
+        print(f"  failed reads by reason: {', '.join(f'{k}: {n}' for k, n in why.most_common())}")
+    print(f"REREAD SUMMARY  sessions={len(targets)}  read_ok={ok}  empty={empty}  failed={failed}  "
           f"players={players}  dupr_checks={written['checks']}  new_duprs={written['changes']}")
     if targets and ok == 0:
         print("READ NOTHING FROM PLAYBYPOINT — session may be expired or blocked")
