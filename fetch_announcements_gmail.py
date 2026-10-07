@@ -45,6 +45,13 @@ WHAT CHANGED, AND WHY
    a regex that treats any quoted capitalised word as a discount code. Codes
    come from the admin panel.
 
+6. A SHARED MAILBOX: ONLY ONE LABEL IS READ.
+   When the mailbox also gets other mail, a Gmail filter puts the venues' mail
+   under one label (e.g. "PickleMatch") and only that label is read: nothing
+   else in the mailbox is opened, logged or marked read. The label comes from
+   GMAIL_LABEL, or from "label" in the token file (make_gmail_token.py writes
+   it). With neither, the whole mailbox is read, as before.
+
 Run:  python3 fetch_announcements_gmail.py --dry-run     # reads only
       python3 fetch_announcements_gmail.py
       WINDOW_DAYS=120 python3 fetch_announcements_gmail.py   # one-off catch-up
@@ -127,6 +134,29 @@ SKIP_SUBJECTS = (
     "you are now subscribed",
     "thanks for subscribing",
     "subscription confirmed",
+    # Account mail, not news. A shared mailbox that also holds a PlayByPoint
+    # account gets these from the venues' own sender addresses, and the
+    # announcements table is public: a login code must never be stored there.
+    "confirmation code",
+    "verification code",
+    "login code",
+    "sign in code",
+    "sign-in code",
+    "one-time code",
+    "reset your password",
+    "password reset",
+    "account approved",
+    "account has been approved",
+    "verify your email",
+    "confirm your email",
+    "your receipt",
+    "booking confirmation",
+    "booking confirmed",
+    "your booking",
+    "you're booked",
+    "you’re booked",
+    "payment received",
+    "order confirmation",
 )
 
 
@@ -186,6 +216,17 @@ def match_venue(addr: str, localparts: dict):
 
 
 # ── gmail ─────────────────────────────────────────────────────────────────────
+def gmail_label() -> str:
+    """The one label to read, if the mailbox is shared (see 6 above)."""
+    if os.environ.get("GMAIL_LABEL"):
+        return os.environ["GMAIL_LABEL"].strip()
+    try:
+        with open(GMAIL_TOKEN_PATH) as f:
+            return (json.load(f).get("label") or "").strip()
+    except Exception:
+        return ""
+
+
 def access_token() -> str:
     with open(GMAIL_TOKEN_PATH) as f:
         t = json.load(f)
@@ -377,12 +418,17 @@ def main() -> int:
 
     localparts = pbp_localparts()
     tok = access_token()
+    label = gmail_label()
     known_ids, known_titles = existing_rows()
     print(f"Ledger: {len(known_ids)} announcements already stored")
 
     # Everything in the window. NOT `is:unread` — see the note at the top.
-    msg_ids = list_messages(tok, f"newer_than:{WINDOW_DAYS}d")
-    print(f"Mailbox: {len(msg_ids)} messages in the window")
+    # A shared mailbox: only the venues' label (see 6 at the top).
+    query = f"newer_than:{WINDOW_DAYS}d"
+    if label:
+        query = f"label:{label.replace(' ', '-')} " + query   # Gmail's spelling of a label with spaces
+    msg_ids = list_messages(tok, query)
+    print(f"Mailbox: {len(msg_ids)} messages in the window" + (f" under the label '{label}'" if label else ""))
 
     stored = skipped = unmatched = failed = ignored = 0
 
