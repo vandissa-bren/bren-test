@@ -17,6 +17,11 @@ The window before is exported too and summarised in data["prev"] (compact
 sessions and player counts), so the page can show "compared with the period
 before" for any filter.
 
+Ratings (from 8 Oct): the rating log and played-roster re-reads are exported
+too (optional, 20261028100000) for data["ratings"] (ratings.py). The PM level
+(pm_level.py) is fitted once a run, on the longest window, stored privately
+through record_pm_run and summarised in data["pm"] for every window.
+
 Environment: SUPABASE_URL, SUPABASE_SERVICE_KEY (or SUPABASE_KEY).
 Optional: INSIGHTS_WINDOWS="7,28,90".
 
@@ -54,8 +59,11 @@ COLS = {
     "programs": ["venue_id", "program_slug", "tiers", "lessons_ahead_max"],
     # optional: each player's first session at each venue, up to the period's end (20261025100000)
     "firsts": ["pbp_user_id", "fid", "first_date", "first_key"],
+    # optional: every DUPR change (20261026100000) and the played-roster re-reads (20261027100000)
+    "ratelog": ["pbp_user_id", "rating", "prev_rating", "seen_at", "prev_seen_at", "session_key", "source"],
+    "ratechecks": ["pbp_user_id", "session_key", "session_date", "days_after", "rating", "observed_at"],
 }
-OPTIONAL = {"programs", "firsts"}
+OPTIONAL = {"programs", "firsts", "ratelog", "ratechecks"}
 
 
 def sb():
@@ -92,6 +100,8 @@ def export(client, url, h, frm, to, d: Path, chunk_days: int = 14):
                 rows = rpc(client, url, h, "insights_export_programs", {"p_from": str(frm), "p_to": str(to)})
             elif kind == "firsts":
                 rows = rpc(client, url, h, "insights_export_firsts", {"p_to": str(to)})
+            elif kind == "ratelog":
+                rows = rpc(client, url, h, "insights_export_ratelog", {})
             else:
                 while a <= to:
                     b = min(to, a + timedelta(days=chunk_days - 1))
@@ -108,7 +118,9 @@ def export(client, url, h, frm, to, d: Path, chunk_days: int = 14):
             if df[col].map(lambda v: isinstance(v, (list, dict))).any():
                 df[col] = df[col].map(lambda v: json.dumps(v) if isinstance(v, (list, dict)) else v)
         key = {"sessions": ["session_key"], "rosters": ["pbp_user_id", "session_key"], "catalogue": ["lesson_id"],
-               "programs": ["venue_id", "program_slug"], "firsts": ["pbp_user_id", "fid"]}[kind]
+               "programs": ["venue_id", "program_slug"], "firsts": ["pbp_user_id", "fid"],
+               "ratelog": ["pbp_user_id", "seen_at", "rating"],
+               "ratechecks": ["pbp_user_id", "session_key", "days_after"]}[kind]
         df = df.drop_duplicates(key)
         df.to_csv(d / f"{kind}.csv", index=False)
         counts[kind] = len(df)
@@ -151,12 +163,31 @@ def shareable(d: dict, net: dict) -> dict:
     d["levelMix"] = [r for r in d.get("levelMix", []) if r["v"] in ids and r["players"] >= MIN_GROUP]
     if d.get("newret"):
         d["newret"] = dict(d["newret"], venues={k: v for k, v in d["newret"]["venues"].items() if int(k) in ids})
+    if d.get("ratings"):
+        d["ratings"] = dict(d["ratings"], venues={k: v for k, v in d["ratings"]["venues"].items() if int(k) in ids},
+                            programmes=[x for x in d["ratings"]["programmes"] if x["v"] in ids])
+    if d.get("pm"):
+        d["pm"] = dict(d["pm"], venues={k: v for k, v in d["pm"].get("venues", {}).items() if int(k) in ids})
     if d.get("prev"):
         p = dict(d["prev"])
         p["sessions"] = [x for x in p["sessions"] if x[0] in ids]
         p["venuePlayers"] = {k: n for k, n in p.get("venuePlayers", {}).items() if int(k) in ids}
         d["prev"] = p
     return d
+
+
+def pm_run(frm, to):
+    """The PM level: fitted once a day on the longest window (pm_level.py).
+    Returns (summary for the build, per-player levels for record_pm_run)."""
+    import build_overview as B
+    import pm_level as PM
+    if not B.LAST:
+        return None, []
+    t0 = time.time()
+    summary, levels = PM.fit_and_test(B.LAST["m"], B.LAST["s"], frm, to)
+    if summary:
+        summary["seconds"] = round(time.time() - t0)
+    return summary, levels
 
 
 def clean(o):
@@ -180,6 +211,9 @@ def main() -> int:
     if a.csv:
         with tempfile.TemporaryDirectory() as w:
             d, net = build(Path(a.csv), Path(w))
+            pm, _ = pm_run(d["city"]["from"], d["city"]["to"])
+            if pm:
+                d["pm"] = pm
             if a.csv_prev:
                 import build_overview as B
                 d["prev"] = B.prev_summary(Path(a.csv_prev))
@@ -190,7 +224,8 @@ def main() -> int:
 
     import httpx
     url, h = sb()
-    windows = [int(x) for x in os.environ.get("INSIGHTS_WINDOWS", "7,28,90").split(",") if x.strip()]
+    windows = sorted({int(x) for x in os.environ.get("INSIGHTS_WINDOWS", "7,28,90").split(",") if x.strip()}, reverse=True)
+    pm = None                      # the PM level, fitted on the longest window, shown with every window
     to = datetime.now(MEL).date() - timedelta(days=1)
     ok = 0
     with httpx.Client(timeout=300) as client:
@@ -207,6 +242,23 @@ def main() -> int:
                         print(f"{days}d: no sessions between {frm} and {to}; skipped")
                         continue
                     d, net = build(data_dir, work_dir)
+                    if pm is None:
+                        try:
+                            pm, levels = pm_run(frm, to)
+                            if pm:
+                                res = rpc(client, url, h, "record_pm_run", {
+                                    "p_run": clean({"version": pm["version"], "from": str(frm), "to": str(to),
+                                                    "settings": __import__("pm_level").SETTINGS, "tests": pm["tests"],
+                                                    "summary": {k: v for k, v in pm.items() if k not in ("tests", "venues")}}),
+                                    "p_levels": levels})
+                                pm["runId"] = res.get("run_id") if isinstance(res, dict) else None
+                                print(f"PM level {pm['version']}: {pm['players']} players, tests {pm['tests']}, "
+                                      f"{pm.get('seconds')}s, stored {res}")
+                        except Exception as e:
+                            print(f"PM level: skipped ({type(e).__name__}: {e})")
+                            pm = False
+                    if pm:
+                        d["pm"] = pm
                     # the period before, the same length
                     prev_dir = Path(tmp) / "prev"
                     prev_dir.mkdir()
