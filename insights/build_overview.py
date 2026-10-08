@@ -489,6 +489,9 @@ def market(m, s, fin, ok, fid) -> dict:
             "away": {"bookings": int(len(away)), "of": int(len(allp)), "cells": cells}}
 
 
+LAST: dict = {}
+
+
 def main():
     s, r, c = R.load()
     R.NOW = max(s["last_obs"].max(), r["last_seen"].max())
@@ -668,6 +671,22 @@ def main():
             "levelMix": level_mix(okv, dict(zip(s["session_key"], s["level_class"]))),
             "levelSupply": level_supply(okv, f, vmap), "coaches": coaches(f, okv),
             "newret": new_returning(okv, f, vmap, start, end)}
+
+    # ── ratings: how DUPRs move (Insights › Ratings; ratings.py) ──
+    import ratings as RT
+    from catalogue_terms import dupr_rated
+    txt = (f["title"].fillna("") + " " + f["session_type"].fillna("")).str.lower()
+    rated_keys = set(f.loc[[dupr_rated(x) or "dupr" in x for x in txt], "session_key"])
+    data["ratings"] = RT.build(okv, f, r, R.RATELOG, R.RATECHECKS, start, end, home, rated_keys)
+    if data["ratings"]:
+        by_coach = data["ratings"].pop("coaches", {})
+        for c in data["coaches"]:
+            x = by_coach.get(c["name"].lower())
+            if x:
+                c.update(x)
+    # kept for the PM level, which the daily build fits once on its longest window
+    global LAST
+    LAST = {"m": m, "s": s, "start": start, "end": end}
     return data, net
 
 
