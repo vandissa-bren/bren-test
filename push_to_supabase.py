@@ -39,6 +39,15 @@ DAYS_AHEAD = 14
 # the fill log, so insights can see how full sessions are weeks ahead
 # (publish-versus-book). LOG_FAR_SESSIONS=0 turns it off.
 LOG_FAR_SESSIONS = os.environ.get("LOG_FAR_SESSIONS", "1") != "0"
+# Rosters for far-out competitive sessions (tournament divisions, league
+# nights), for Discover's opened division. Within DAYS_AHEAD every session's
+# roster is already read (sessions[].roster). Beyond it, only programmes that
+# read as competitive, only lessons with someone entered, and only up to
+# FAR_ROSTER_DAYS ahead. Stored in the venue's cache row as data.far_rosters.
+# LOG_FAR_ROSTERS=0 turns it off.
+LOG_FAR_ROSTERS = os.environ.get("LOG_FAR_ROSTERS", "1") != "0"
+FAR_ROSTER_DAYS = int(os.environ.get("FAR_ROSTER_DAYS", "120"))
+COMPETITIVE = re.compile(r"tournament|league|ladder|championship|competition|slam|classic|showdown|throwdown|invitational", re.I)
 
 # The venues to scrape: every active Play By Point venue in the one list the
 # site publishes (frontend public/venues.json), read through venue_registry.
@@ -162,7 +171,16 @@ async def supabase_upsert(records: list[dict]) -> None:
             # Not a column: the programs this run could not read, whose
             # stored sessions are carried over rather than dropped.
             keep_slugs = set(record.pop("_keep_slugs", ()) or ())
+            keep_rosters = set(record.pop("_keep_rosters", ()) or ())
             existing_data = existing_by_id.get(row_id, {})
+            # Far rosters this run couldn't read (programme page unreadable, or
+            # the roster read itself failed): keep the stored one until its date.
+            if existing_data and "data" in record:
+                new_fr = record["data"].setdefault("far_rosters", {})
+                for lid, fr in (existing_data.get("far_rosters") or {}).items():
+                    if (lid not in new_fr and isinstance(fr, dict) and str(fr.get("date") or "") >= today_iso
+                            and (lid in keep_rosters or fr.get("program_slug") in keep_slugs)):
+                        new_fr[lid] = fr
             if existing_data and keep_slugs and "data" in record:
                 kept = [s for s in (existing_data.get("sessions") or [])
                         if s.get("program_slug") in keep_slugs
@@ -226,6 +244,87 @@ async def record_listing_horizon(rows: list[dict]) -> None:
             console.print(f"  [yellow]Listing horizon NOT recorded: HTTP {resp.status_code} {resp.text[:200]}[/yellow]")
     except Exception as e:
         console.print(f"  [yellow]Listing horizon NOT recorded: {type(e).__name__}: {e}[/yellow]")
+
+
+def is_competitive(stub: dict) -> bool:
+    """A tournament or league programme, by PlayByPoint's category or its name."""
+    return bool(COMPETITIVE.search(f"{stub.get('category') or ''} {stub.get('name') or ''}"))
+
+
+def short_name(n) -> str | None:
+    """'Sam Kerr' -> 'Sam K.'; one word stays as it is. Matches prog_short_name
+    in SQL. Far rosters are stored this way: Discover only shows short names,
+    so there's no reason to keep full ones for sessions weeks away."""
+    parts = str(n or "").split()
+    if not parts:
+        return None
+    return parts[0] if len(parts) == 1 else f"{parts[0]} {parts[-1][0].upper()}."
+
+
+async def read_roster(api, lesson_id) -> list[dict] | None:
+    """One far-out session's entrants, the same shape as sessions[].roster but
+    with names shortened (short_name). None when the read failed, so the caller
+    can keep the last good roster instead."""
+    try:
+        rd = await api._get_json(
+            "/api/public/clinics/lesson_players",
+            params={"lesson_id": lesson_id, "rating_provider": "dupr"},
+        )
+    except Exception:
+        return None
+    return [
+        {"id": u.get("id"), "name": short_name(u.get("name")), "initials": u.get("name_initials"),
+         "avatar": u.get("avatar") or "", "rating": u.get("rating")}
+        for u in (rd or {}).get("users", []) if isinstance(u, dict)
+    ]
+
+
+CLINIC_PAGE_SIZE = 50   # what PlayByPoint was always asked for
+CLINIC_PAGES_MAX = 10   # 500 programmes; no venue is near that
+
+
+async def fetch_clinic_stubs(api, facility_id: int) -> tuple[list[dict], int, bool]:
+    """Every programme a venue lists, page by page.
+
+    Until 9 Oct this asked for ONE page of 50 and never the next, so a venue
+    with more than 50 programmes silently lost the rest: their sessions never
+    reached the app or the fill log. Eastern Indoor was reading 43.
+
+    Stops when a page comes back short, or when a page adds nothing new (in
+    case PlayByPoint ignores `page` and repeats page 1: de-duplicated by id, so
+    the result is never worse than the single page it replaces). A failure on
+    ANY page raises, so the caller treats the list as unreadable and keeps the
+    venue's stored sessions rather than saving a partial list as if it were all.
+
+    Returns (stubs, pages read, maybe_more): maybe_more is True when a full page
+    added nothing new, i.e. there may be more that paging couldn't reach.
+    """
+    stubs: list[dict] = []
+    seen: set = set()
+    pages, maybe_more = 0, False
+    for page in range(1, CLINIC_PAGES_MAX + 1):
+        resp = await api._get_json(
+            "/api/public/clinics",
+            params={"search": "", "facility_id": facility_id,
+                    "per_page": CLINIC_PAGE_SIZE, "page": page},
+        )
+        batch = ((resp or {}).get("clinics") or []) if isinstance(resp, dict) else (resp or [])
+        pages += 1
+        fresh = []
+        for s in batch:
+            key = s.get("id") if isinstance(s, dict) else None
+            if key is None:
+                key = (s.get("url") if isinstance(s, dict) else None) or id(s)
+            if key not in seen:
+                seen.add(key)
+                fresh.append(s)
+        stubs.extend(fresh)
+        if len(batch) < CLINIC_PAGE_SIZE:
+            break
+        if not fresh:
+            maybe_more = page > 1
+            break
+    return stubs, pages, maybe_more
 
 
 def _far_observation(lesson: dict, stub: dict, facility_id: int, program_slug: str, price: str, props: dict) -> dict | None:
@@ -316,6 +415,9 @@ async def scrape_pbp_venue(
         # the cost of the package, not of one occurrence, so copying it onto
         # each session would misrepresent it as a per-session price.
         "program_pricing": {},
+        # Rosters of far-out competitive sessions, keyed by lesson id:
+        # {"program_slug", "date", "read_at", "roster": [...]} (LOG_FAR_ROSTERS).
+        "far_rosters": {},
         # ── private bookkeeping, removed before anything is written ──
         # A scrape that could not read PlayByPoint must not be mistaken for
         # a venue with nothing on. See run_once.
@@ -324,27 +426,29 @@ async def scrape_pbp_venue(
         "_failed_slugs": [],        # program slugs whose page could not be read
         "_listing": [],             # how far ahead each program is listed (see run_once)
         "_far": [],                 # sessions past the window, for the fill log (LOG_FAR_SESSIONS)
+        "_roster_failed": [],       # far lesson ids whose roster read failed: keep the stored one
     }
 
     date_strs = {d.isoformat() for d in dates}
     last_day = max(date_strs) if date_strs else ""
     far_seen: set = set()
+    roster_until = (date.today() + timedelta(days=FAR_ROSTER_DAYS)).isoformat()
 
     try:
         async with PlayByPointAPI(cookies=cookies, club_slug=slug, proxy=PROXY_URL) as api:
             api._user_id = user_id
 
-            # Get clinic list
+            # Get clinic list: every page of it (see fetch_clinic_stubs)
             try:
-                resp = await api._get_json(
-                    "/api/public/clinics",
-                    params={"search": "", "facility_id": facility_id, "per_page": 50},
-                )
-                stubs = (resp or {}).get("clinics") or [] if isinstance(resp, dict) else (resp or [])
+                stubs, pages, maybe_more = await fetch_clinic_stubs(api, facility_id)
             except Exception as e:
                 console.print(f"    [yellow]clinic list error for {name}: {e}[/yellow]")
                 result["_list_failed"] = True
                 return result
+            if pages > 1 or maybe_more:
+                console.print(f"    {name}: {len(stubs)} programmes over {pages} page(s)"
+                              + (" -- [yellow]the last page was full and the next added nothing new; "
+                                 "PlayByPoint may be ignoring 'page'[/yellow]" if maybe_more else ""))
 
             for stub in stubs:
                 clinic_id = stub.get("id")
@@ -448,6 +552,17 @@ async def scrape_pbp_venue(
                                 if obs:
                                     far_seen.add(lesson.get("id"))
                                     result["_far"].append(obs)
+                            # ...and, for competitive programmes, its roster
+                            if (LOG_FAR_ROSTERS and isinstance(ld, str) and last_day < ld <= roster_until
+                                    and lesson.get("id") and str(lesson.get("id")) not in result["far_rosters"]
+                                    and (lesson.get("player_count") or 0) > 0 and is_competitive(stub)):
+                                roster = await read_roster(api, lesson.get("id"))
+                                if roster is None:
+                                    result["_roster_failed"].append(str(lesson.get("id")))
+                                else:
+                                    result["far_rosters"][str(lesson.get("id"))] = {
+                                        "program_slug": program_slug, "date": ld,
+                                        "read_at": datetime.utcnow().isoformat(), "roster": roster}
                             continue
                         lid = lesson.get("id")
                         cap = lesson.get("capacity") or stub.get("capacity") or 0
@@ -574,6 +689,7 @@ async def run_once():
             for row in r.pop("_listing", []):
                 listing_rows.append({"facility_id": int(r["id"]), **row})
             far_rows.extend(r.pop("_far", []))
+            roster_failed = r.pop("_roster_failed", [])
             if list_failed or (tried and len(failed_slugs) >= tried):
                 not_saved.append(r["name"])
                 console.print(f"  [red]✗ NOT SAVED[/red] {r['name']} · "
@@ -590,8 +706,11 @@ async def run_once():
                 "data": r,
                 "updated_at": datetime.utcnow().isoformat(),
                 "_keep_slugs": failed_slugs,
+                "_keep_rosters": roster_failed,
             })
             note = f" · {len(failed_slugs)} of {tried} programs unreadable, their stored sessions kept" if failed_slugs else ""
+            if r.get("far_rosters"):
+                note += f" · {len(r['far_rosters'])} far-out rosters"
             console.print(f"  [green]✓[/green] {r['name']} · {sum(len(v) for v in r['by_date'].values())} blocks · {len(r['sessions'])} sessions{note}")
 
         # Any failure propagates: a scrape that cannot persist is a failed
