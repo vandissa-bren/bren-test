@@ -43,8 +43,9 @@ LOG_FAR_SESSIONS = os.environ.get("LOG_FAR_SESSIONS", "1") != "0"
 # nights), for Discover's opened division. Within DAYS_AHEAD every session's
 # roster is already read (sessions[].roster). Beyond it, only programmes that
 # read as competitive, only lessons with someone entered, and only up to
-# FAR_ROSTER_DAYS ahead. Stored in the venue's cache row as data.far_rosters.
-# LOG_FAR_ROSTERS=0 turns it off.
+# FAR_ROSTER_DAYS ahead. Stored in the venue's cache row as data.far_rosters,
+# with full names like sessions[].roster (the reader shortens them for
+# signed-out players). LOG_FAR_ROSTERS=0 turns it off.
 LOG_FAR_ROSTERS = os.environ.get("LOG_FAR_ROSTERS", "1") != "0"
 FAR_ROSTER_DAYS = int(os.environ.get("FAR_ROSTER_DAYS", "120"))
 COMPETITIVE = re.compile(r"tournament|league|ladder|championship|competition|slam|classic|showdown|throwdown|invitational", re.I)
@@ -251,20 +252,11 @@ def is_competitive(stub: dict) -> bool:
     return bool(COMPETITIVE.search(f"{stub.get('category') or ''} {stub.get('name') or ''}"))
 
 
-def short_name(n) -> str | None:
-    """'Sam Kerr' -> 'Sam K.'; one word stays as it is. Matches prog_short_name
-    in SQL. Far rosters are stored this way: Discover only shows short names,
-    so there's no reason to keep full ones for sessions weeks away."""
-    parts = str(n or "").split()
-    if not parts:
-        return None
-    return parts[0] if len(parts) == 1 else f"{parts[0]} {parts[-1][0].upper()}."
-
-
 async def read_roster(api, lesson_id) -> list[dict] | None:
-    """One far-out session's entrants, the same shape as sessions[].roster but
-    with names shortened (short_name). None when the read failed, so the caller
-    can keep the last good roster instead."""
+    """One far-out session's entrants, the same shape as sessions[].roster
+    (full names; get_division_roster shortens them for signed-out players).
+    None when the read failed, so the caller can keep the last good roster
+    instead."""
     try:
         rd = await api._get_json(
             "/api/public/clinics/lesson_players",
@@ -273,7 +265,7 @@ async def read_roster(api, lesson_id) -> list[dict] | None:
     except Exception:
         return None
     return [
-        {"id": u.get("id"), "name": short_name(u.get("name")), "initials": u.get("name_initials"),
+        {"id": u.get("id"), "name": u.get("name"), "initials": u.get("name_initials"),
          "avatar": u.get("avatar") or "", "rating": u.get("rating")}
         for u in (rd or {}).get("users", []) if isinstance(u, dict)
     ]
