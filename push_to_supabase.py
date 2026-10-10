@@ -39,6 +39,11 @@ DAYS_AHEAD = 14
 # the fill log, so insights can see how full sessions are weeks ahead
 # (publish-versus-book). LOG_FAR_SESSIONS=0 turns it off.
 LOG_FAR_SESSIONS = os.environ.get("LOG_FAR_SESSIONS", "1") != "0"
+# ...up to FAR_LOG_DAYS ahead (10 Oct 2026). Some weekly programmes are listed
+# three and a half years out; past about six months a nightly reading tells
+# nothing (no one books that far ahead) and no programme exists only out
+# there, so Discover and Follow lose nothing. 0 = no limit.
+FAR_LOG_DAYS = int(os.environ.get("FAR_LOG_DAYS", "183"))
 # Rosters for far-out competitive sessions (tournament divisions, league
 # nights), for Discover's opened division. Within DAYS_AHEAD every session's
 # roster is already read (sessions[].roster). Beyond it, only programmes that
@@ -425,6 +430,7 @@ async def scrape_pbp_venue(
     last_day = max(date_strs) if date_strs else ""
     far_seen: set = set()
     roster_until = (date.today() + timedelta(days=FAR_ROSTER_DAYS)).isoformat()
+    far_until = (date.today() + timedelta(days=FAR_LOG_DAYS)).isoformat() if FAR_LOG_DAYS > 0 else "9999-12-31"
 
     try:
         async with PlayByPointAPI(cookies=cookies, club_slug=slug, proxy=PROXY_URL) as api:
@@ -539,7 +545,8 @@ async def scrape_pbp_venue(
                         ld = lesson.get("lesson_date")
                         if ld not in date_strs:
                             # beyond the app's window: to the fill log only
-                            if LOG_FAR_SESSIONS and isinstance(ld, str) and ld > last_day and lesson.get("id") not in far_seen:
+                            if (LOG_FAR_SESSIONS and isinstance(ld, str) and last_day < ld <= far_until
+                                    and lesson.get("id") not in far_seen):
                                 obs = _far_observation(lesson, stub, facility_id, program_slug, price, props)
                                 if obs:
                                     far_seen.add(lesson.get("id"))
