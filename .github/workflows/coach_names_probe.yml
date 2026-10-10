@@ -1,7 +1,9 @@
 name: Coach Names Probe
-# Run by hand. Looks for coaches' full names in what PlayByPoint shows signed
-# out (clinic list, program pages, pros pages). Prints field names and value
-# SHAPES only ("Aaaa Aaaaaa"), never a name, so the log is safe to share.
+# Run by hand. Looks for coaches' full names in PlayByPoint's data: program
+# pages, the venue's pros page, and the coach-list addresses PlayByPoint's own
+# JavaScript calls, tried signed out and with the scrape's login. Prints field
+# names, addresses and value SHAPES only ("Aaaa Aaaaaa"), never a name or a
+# cookie, so the log is safe to share.
 on:
   workflow_dispatch:
     inputs:
@@ -13,7 +15,7 @@ on:
 jobs:
   probe:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 8
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -24,4 +26,5 @@ jobs:
       - name: Look for coach names
         env:
           PROBE_FACILITIES: ${{ github.event.inputs.facilities }}
+          PBP_COOKIES_JSON: ${{ secrets.PBP_COOKIES_JSON }}
         run: python coach_names_probe.py
