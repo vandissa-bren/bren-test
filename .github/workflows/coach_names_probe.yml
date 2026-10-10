@@ -1,0 +1,27 @@
+name: Coach Names Probe
+# Run by hand. Looks for coaches' full names in what PlayByPoint shows signed
+# out (clinic list, program pages, pros pages). Prints field names and value
+# SHAPES only ("Aaaa Aaaaaa"), never a name, so the log is safe to share.
+on:
+  workflow_dispatch:
+    inputs:
+      facilities:
+        description: 'PlayByPoint facility ids, comma separated'
+        required: false
+        default: '1379,885'
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install curl_cffi
+      - name: Look for coach names
+        env:
+          PROBE_FACILITIES: ${{ github.event.inputs.facilities }}
+        run: python coach_names_probe.py
