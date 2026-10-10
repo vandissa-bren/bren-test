@@ -1,0 +1,33 @@
+name: Coach Directory
+# Daily: PlayByPoint's "Book a Pro" list for every active venue, saved to
+# coach_directory so the Coaches tab can show signed-in players coaches' full
+# names (coach_directory.py). Public data, read signed out. The log prints
+# counts only. Minutes kept off the top of the hour (GitHub drops scheduled
+# runs worst at :00).
+on:
+  schedule:
+    - cron: '37 14 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run: read everything, save nothing (1 = yes)'
+        default: '0'
+
+jobs:
+  directory:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency: { group: coach-directory, cancel-in-progress: false }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install httpx curl_cffi
+      - name: Read the pros lists
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || '0' }}
+        run: python coach_directory.py
