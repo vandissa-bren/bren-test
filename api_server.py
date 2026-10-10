@@ -157,6 +157,77 @@ def _supabase_headers(extra: dict | None = None) -> dict:
     return h
 
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", SUPABASE_KEY)
+
+
+def _service_headers(extra: dict | None = None) -> dict:
+    """The service key, sent the way its format needs (C15): apikey always,
+    Bearer only for a legacy eyJ… key. 10 Oct 2026: availability_cache is
+    closed to the public key (it holds players' full names), so this server
+    reads it with the service key."""
+    key = SUPABASE_SERVICE_KEY or SUPABASE_KEY
+    h = {"apikey": key}
+    if key.startswith("eyJ"):
+        h["Authorization"] = f"Bearer {key}"
+    if extra:
+        h.update(extra)
+    return h
+
+
+# ── players' names: full when signed in, "Tom E." otherwise ─────────────────
+# 10 Oct 2026. Rosters in availability_cache carry full names. The app showed
+# signed-out visitors "Tom E.", but this server sent everyone the full name,
+# so anyone could read it from the response. Now the response itself is
+# shortened unless the request carries a valid PickleMatch sign-in token
+# (Authorization: Bearer, checked with Supabase by _caller_id). A failed check
+# counts as signed out. Same rule as prog_short_name in the database and
+# shortName in the app.
+import hashlib
+import time as _time
+
+_signed_in_seen: dict[str, tuple[float, bool]] = {}
+
+
+async def _signed_in(authorization: Optional[str]) -> bool:
+    if not authorization or not authorization.lower().startswith("bearer "):
+        return False
+    k = hashlib.sha256(authorization.encode("utf-8")).hexdigest()
+    now = _time.time()
+    hit = _signed_in_seen.get(k)
+    if hit and hit[0] > now:
+        return hit[1]
+    ok = bool(await _caller_id(authorization))
+    if len(_signed_in_seen) > 5000:
+        _signed_in_seen.clear()
+    _signed_in_seen[k] = (now + (300 if ok else 30), ok)
+    return ok
+
+
+def _short_name(n) -> str:
+    parts = str(n or "").split()
+    if not parts:
+        return "Player"
+    return parts[0] if len(parts) == 1 else f"{parts[0]} {parts[-1][0].upper()}."
+
+
+def _public_sessions(sessions):
+    """Sessions with roster names shortened. A copy; the input is untouched."""
+    out = []
+    for s in sessions or []:
+        roster = s.get("roster") if isinstance(s, dict) else None
+        if isinstance(roster, list) and roster:
+            s = {**s, "roster": [{**p, "name": _short_name(p.get("name"))} if isinstance(p, dict) else p
+                                 for p in roster]}
+        out.append(s)
+    return out
+
+
+def _public_venues(response):
+    if not isinstance(response, dict):
+        return response
+    out = dict(response)
+    out["venues"] = [{**v, "sessions": _public_sessions(v.get("sessions"))} if isinstance(v, dict) else v
+                     for v in (response.get("venues") or [])]
+    return out
 PROXY_URL = os.environ.get("PROXY_URL")  # e.g. http://user:pass@p.webshare.io:80
 
 
@@ -201,7 +272,7 @@ def _recall(platform: str) -> list[dict]:
 
 async def _read_from_supabase(platform: str, attempts: int = 3) -> list[dict]:
     """Cached availability from Supabase. Retries, then the last good answer."""
-    headers = {"apikey": SUPABASE_KEY}
+    headers = _service_headers()
     url = f"{SUPABASE_URL}/rest/v1/availability_cache?select=data&platform=eq.{platform}"
     why = ""
     for attempt in range(1, attempts + 1):
@@ -749,9 +820,7 @@ async def refresh_cookies(req: RefreshCookiesRequest):
 async def debug_supabase():
     """Debug endpoint to check Supabase connectivity and data."""
     try:
-        headers = {
-            "apikey": SUPABASE_KEY,
-        }
+        headers = _service_headers()
         url = f"{SUPABASE_URL}/rest/v1/availability_cache?select=id,platform,venue_name&limit=5"
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(url, headers=headers)
@@ -774,8 +843,8 @@ async def debug_session():
     return {
         "has_cookies": bool(cookies),
         "cookie_count": len(cookies),
-        "user_id": user_id,
-        "email": email,
+        # The scraper's PlayByPoint account id and email are no longer shown
+        # (10 Oct 2026): this endpoint is public.
         "env_var_length": len(raw),
         "proxy_url": os.environ.get("PROXY_URL", "not set")[:30] if os.environ.get("PROXY_URL") else "not set",
     }
@@ -885,9 +954,13 @@ async def pbp_availability(
     # failed on a miss, which is why it appeared intermittent.
     pm_user_id: Optional[str] = Query(None, alias="user_id",
                                       description="PickleMatch user, for personalised pricing"),
+    authorization: Optional[str] = Header(None),
 ):
     """
     Get court blocks + sessions for PBP venues from the Supabase cache.
+
+    Roster names are full only for a signed-in caller (10 Oct 2026; see
+    _signed_in).
 
     NOTE (18 Sep 2026): despite the old wording here, this endpoint does NO
     live PlayByPoint calls. Court data is fetched once by GitHub Actions
@@ -923,7 +996,8 @@ async def pbp_availability(
         # AFTER the cache read, never before: the cache key has no user in
         # it, so personalising anything that gets stored would serve one
         # member's price to everyone.
-        return await _personalise_prices(cached_result, pm_user_id)
+        result = await _personalise_prices(cached_result, pm_user_id)
+        return result if await _signed_in(authorization) else _public_venues(result)
 
     slug_map = {k: v for k, v in active_slug_map().items() if not ids_filter or k in ids_filter}
 
@@ -971,7 +1045,8 @@ async def pbp_availability(
     _cache_set(cache_key, response)
     # Personalise only the copy being returned. The object handed to
     # _cache_set above stays public.
-    return await _personalise_prices(response, pm_user_id)
+    result = await _personalise_prices(response, pm_user_id)
+    return result if await _signed_in(authorization) else _public_venues(result)
 
 
 @app.get("/api/pbp/venue/{facility_id}")
@@ -980,8 +1055,10 @@ async def pbp_single_venue(
     date: Optional[str] = Query(None),
     from_time: str = Query("00:00", alias="from"),
     to_time: str = Query("23:30", alias="to"),
+    authorization: Optional[str] = Header(None),
 ):
-    """Get availability for a single PBP venue from Supabase cache."""
+    """Get availability for a single PBP venue from Supabase cache. Roster
+    names are full only for a signed-in caller (10 Oct 2026)."""
     target_date = (datetime.strptime(date, "%Y-%m-%d").date()
                    if date else datetime.today().date())
     date_str = target_date.isoformat()
@@ -1002,6 +1079,8 @@ async def pbp_single_venue(
                 if s.get("date") == date_str
                 and from_sec <= _hhmm_to_sec(s["start"]) < to_sec
             ]
+            if not await _signed_in(authorization):
+                filtered_sessions = _public_sessions(filtered_sessions)
             return {
                 "id": facility_id,
                 "name": r.get("name"),
@@ -1132,10 +1211,17 @@ def _hhmm_to_sec(hhmm: str) -> int:
 
 
 @app.post("/api/pbp/book_court")
-async def pbp_book_court(req: CourtBookingRequest):
+async def pbp_book_court(req: CourtBookingRequest, authorization: Optional[str] = Header(None)):
     """
     Book a court hire slot on PBP using stored user session cookies.
     """
+    # 10 Oct 2026: the caller must BE this player. This used to trust the
+    # user_id in the body, so anyone who knew a player's id could book with
+    # their saved PlayByPoint login. The app books through the booking server
+    # (authFetch), not here; this keeps the old path from being misused.
+    caller = await _caller_id(authorization)
+    if not caller or caller != req.user_id:
+        raise HTTPException(status_code=401, detail="Please sign in again to book.")
     # Fetch user's stored PBP cookies from Supabase.
     try:
         headers = {
@@ -1228,11 +1314,18 @@ async def pbp_book_court(req: CourtBookingRequest):
 
 
 @app.post("/api/pbp/book")
-async def pbp_book(req: BookingRequest):
+async def pbp_book(req: BookingRequest, authorization: Optional[str] = Header(None)):
     """
     Book a PBP session on behalf of a user using their stored session cookies.
     Requires the user to have connected their PBP account via the profile page.
     """
+    # 10 Oct 2026: the caller must BE this player. This used to trust the
+    # user_id in the body, so anyone who knew a player's id could book with
+    # their saved PlayByPoint login. The app books through the booking server
+    # (authFetch), not here; this keeps the old path from being misused.
+    caller = await _caller_id(authorization)
+    if not caller or caller != req.user_id:
+        raise HTTPException(status_code=401, detail="Please sign in again to book.")
     # Fetch user's stored PBP cookies from Supabase.
     try:
         headers = {
@@ -1455,9 +1548,11 @@ async def live_sessions(
     # parameter and sent PBP's numeric id to the pricing service.
     pm_user_id: Optional[str] = Query(None, alias="user_id",
                                       description="PickleMatch user, for personalised pricing"),
+    authorization: Optional[str] = Header(None),
 ):
     """
     "Search my member venues": every session at these venues on one date.
+    Roster names are full only for a signed-in caller (10 Oct 2026).
 
     F130, 20 Sep 2026: this server (.117) is Cloudflare-blocked from PlayByPoint
     (403 on every request), so the fetch that used to live here returned no
@@ -1485,6 +1580,8 @@ async def live_sessions(
         print(f"live_sessions: booking server unavailable: {e}", flush=True)
 
     all_sessions = await _personalise_live_sessions(all_sessions, pm_user_id)
+    if not await _signed_in(authorization):
+        all_sessions = _public_sessions(all_sessions)
     return {"sessions": all_sessions, "date": date_str, "fetched_at": datetime.utcnow().isoformat()}
 
 # ── Announcements ─────────────────────────────────────────────────────────────
@@ -1828,10 +1925,16 @@ async def stripe_config():
     return {"publishable_key": STRIPE_PUBLISHABLE_KEY}
 
 @app.post("/api/stripe/connect")
-async def stripe_connect(req: StripeConnectRequest):
+async def stripe_connect(req: StripeConnectRequest, authorization: Optional[str] = Header(None)):
     """Create or retrieve a Stripe Connect account for a host and return onboarding link."""
     if not STRIPE_SECRET_KEY:
         raise HTTPException(status_code=500, detail="Stripe not configured")
+    # 10 Oct 2026: only for the signed-in host themselves. This used to trust
+    # the user_id in the body, so anyone could open (and complete) Stripe
+    # onboarding for another host's account, bank details included.
+    caller = await _caller_id(authorization)
+    if not caller or caller != req.user_id:
+        raise HTTPException(status_code=401, detail="Please sign in again to connect Stripe.")
     svc_headers = {
         "apikey": SUPABASE_SERVICE_KEY,
         "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
@@ -1891,7 +1994,7 @@ async def stripe_status(user_id: str):
         profile = r.json()[0] if r.json() else {}
         account_id = profile.get("stripe_account_id")
         if not account_id:
-            return {"onboarded": False, "account_id": None}
+            return {"onboarded": False}
 
     # Verify with Stripe
     try:
@@ -1904,9 +2007,12 @@ async def stripe_status(user_id: str):
                     headers={"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}", "Content-Type": "application/json"},
                     json={"stripe_onboarded": True},
                 )
-        return {"onboarded": onboarded, "account_id": account_id}
-    except Exception as e:
-        return {"onboarded": False, "account_id": account_id, "error": str(e)}
+        # No account id in the answer (10 Oct 2026): this endpoint is public
+        # (a join page asks whether a host takes payments) and only
+        # `onboarded` is read.
+        return {"onboarded": onboarded}
+    except Exception:
+        return {"onboarded": False}
 
 @app.post("/api/stripe/payment_intent")
 async def create_payment_intent(req: PaymentIntentRequest, authorization: Optional[str] = Header(None)):
