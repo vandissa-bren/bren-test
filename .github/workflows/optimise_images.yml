@@ -1,0 +1,29 @@
+name: Optimise Images
+# Small WebP copies of venue banners and logos, promo banners and the featured
+# banner (optimise_images.py, 11 Oct 2026). Run with dry_run first: it reports
+# each image's size before and after and saves nothing.
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run: report sizes only, save nothing'
+        required: true
+        default: true
+        type: boolean
+jobs:
+  optimise:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install httpx pillow
+      - name: Optimise images
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
+        run: python optimise_images.py
