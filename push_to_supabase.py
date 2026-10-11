@@ -252,9 +252,37 @@ async def record_listing_horizon(rows: list[dict]) -> None:
         console.print(f"  [yellow]Listing horizon NOT recorded: {type(e).__name__}: {e}[/yellow]")
 
 
-def is_competitive(stub: dict) -> bool:
-    """A tournament or league programme, by PlayByPoint's category or its name."""
-    return bool(COMPETITIVE.search(f"{stub.get('category') or ''} {stub.get('name') or ''}"))
+def is_competitive(stub: dict, program_slug: str = "") -> bool:
+    """A tournament or league programme: one Discover lists as either (the
+    catalogue's own call, COMPETITIVE_SLUGS), or by PlayByPoint's category or
+    its name."""
+    return (program_slug in COMPETITIVE_SLUGS
+            or bool(COMPETITIVE.search(f"{stub.get('category') or ''} {stub.get('name') or ''}")))
+
+
+# The programmes Discover shows as leagues and tournaments (programmes.category,
+# 11 Oct). Some are named nothing like one ("Monday Night Mixers"), so the name
+# test alone left them with no far-out roster: Discover showed "N players
+# signed up. The list isn't available yet." Read once per run; if the read
+# fails the name test still applies, as before.
+COMPETITIVE_SLUGS: set[str] = set()
+
+
+async def load_competitive_slugs() -> None:
+    global COMPETITIVE_SLUGS
+    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(f"{SUPABASE_URL}/rest/v1/programmes",
+                                    params={"select": "program_slug", "category": "in.(league,tournament)"},
+                                    headers=headers)
+        if resp.status_code == 200:
+            COMPETITIVE_SLUGS = {r["program_slug"] for r in resp.json() if r.get("program_slug")}
+            console.print(f"  Leagues and tournaments in the catalogue: {len(COMPETITIVE_SLUGS)}")
+        else:
+            console.print(f"  [yellow]Catalogue not read (HTTP {resp.status_code}): far rosters by name only[/yellow]")
+    except Exception as e:
+        console.print(f"  [yellow]Catalogue not read ({type(e).__name__}): far rosters by name only[/yellow]")
 
 
 async def read_roster(api, lesson_id) -> list[dict] | None:
@@ -554,7 +582,7 @@ async def scrape_pbp_venue(
                             # ...and, for competitive programmes, its roster
                             if (LOG_FAR_ROSTERS and isinstance(ld, str) and last_day < ld <= roster_until
                                     and lesson.get("id") and str(lesson.get("id")) not in result["far_rosters"]
-                                    and (lesson.get("player_count") or 0) > 0 and is_competitive(stub)):
+                                    and (lesson.get("player_count") or 0) > 0 and is_competitive(stub, program_slug)):
                                 roster = await read_roster(api, lesson.get("id"))
                                 if roster is None:
                                     result["_roster_failed"].append(str(lesson.get("id")))
@@ -659,6 +687,8 @@ async def run_once():
         console.print("[red]No PBP cookies. Run refresh_cookies.py first.[/red]")
     else:
         console.print(f"Scraping {len(PBP_SLUG_MAP)} PBP venues × {DAYS_AHEAD} days…")
+        if LOG_FAR_ROSTERS:
+            await load_competitive_slugs()
         pbp_results = []
         for fid, slug in PBP_SLUG_MAP.items():
             r = await scrape_pbp_venue(cookies, user_id, fid, VENUE_NAMES.get(fid, f"Venue {fid}"), slug, dates)
