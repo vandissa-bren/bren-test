@@ -59,6 +59,15 @@ COMPETITIVE = re.compile(r"tournament|league|ladder|championship|competition|sla
 # site publishes (frontend public/venues.json), read through venue_registry.
 # To add a venue, add it there -- nothing here needs editing.
 import venue_registry as _registry
+
+
+def mel_today() -> date:
+    """Today in Melbourne (11 Oct 2026). The run starts at 2am Melbourne, which
+    is still the day before in UTC, the runner's clock: date.today() put the
+    whole 14-day window a day behind, so the 14th Melbourne day was never
+    stored (its sessions had no roster) and yesterday was stored instead."""
+    from zoneinfo import ZoneInfo
+    return datetime.now(ZoneInfo("Australia/Melbourne")).date()
 PBP_SLUG_MAP: dict[int, str] = {v.facility_id: v.slug for v in _registry.active_venues()}
 VENUE_NAMES: dict[int, str] = {v.facility_id: v.name for v in _registry.active_venues()}
 
@@ -171,7 +180,7 @@ async def supabase_upsert(records: list[dict]) -> None:
                 existing_by_id[row["id"]] = row["data"]
 
         # Merge court_prices, shift_map, by_date into record["data"]
-        today_iso = date.today().isoformat()
+        today_iso = mel_today().isoformat()
         for record in records:
             row_id = record.get("id")
             # Not a column: the programs this run could not read, whose
@@ -420,6 +429,24 @@ async def record_far_sessions(rows: list[dict]) -> None:
         console.print(f"  [yellow]Far sessions NOT logged: {type(e).__name__}: {e}[/yellow]")
 
 
+async def refresh_catalogue() -> None:
+    """Rebuild the programme catalogue (refresh_programmes) from what this run
+    just wrote (11 Oct 2026). Its own 3:40am job ran before this run had
+    finished whenever GitHub started the run late (6:06am on 11 Oct), so
+    Discover showed the night before's data. The 3:40am job stays as a
+    fallback. Never fails the run."""
+    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}", "Content-Type": "application/json"}
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            resp = await client.post(f"{SUPABASE_URL}/rest/v1/rpc/refresh_programmes", headers=headers, json={})
+        if resp.status_code == 200:
+            console.print("  Programme catalogue rebuilt")
+        else:
+            console.print(f"  [yellow]Programme catalogue NOT rebuilt: HTTP {resp.status_code} {resp.text[:200]}[/yellow]")
+    except Exception as e:
+        console.print(f"  [yellow]Programme catalogue NOT rebuilt: {type(e).__name__}: {e}[/yellow]")
+
+
 async def scrape_pbp_venue(
     cookies: dict,
     user_id: int,
@@ -457,8 +484,8 @@ async def scrape_pbp_venue(
     date_strs = {d.isoformat() for d in dates}
     last_day = max(date_strs) if date_strs else ""
     far_seen: set = set()
-    roster_until = (date.today() + timedelta(days=FAR_ROSTER_DAYS)).isoformat()
-    far_until = (date.today() + timedelta(days=FAR_LOG_DAYS)).isoformat() if FAR_LOG_DAYS > 0 else "9999-12-31"
+    roster_until = (mel_today() + timedelta(days=FAR_ROSTER_DAYS)).isoformat()
+    far_until = (mel_today() + timedelta(days=FAR_LOG_DAYS)).isoformat() if FAR_LOG_DAYS > 0 else "9999-12-31"
 
     try:
         async with PlayByPointAPI(cookies=cookies, club_slug=slug, proxy=PROXY_URL) as api:
@@ -679,7 +706,7 @@ async def scrape_pbp_venue(
 async def run_once():
     console.print(f"\n[bold]🏓 PickleMatch → Supabase sync[/bold] · {datetime.now().strftime('%H:%M:%S')}\n")
 
-    dates = [date.today() + timedelta(days=i) for i in range(DAYS_AHEAD)]
+    dates = [mel_today() + timedelta(days=i) for i in range(DAYS_AHEAD)]
     cookies, user_id = _load_cookies()
 
     # ── PlayByPoint ───────────────────────────────────────────────────────────
@@ -731,7 +758,7 @@ async def run_once():
                 "id": f"pbp-{r['id']}",
                 "venue_name": VENUE_NAMES.get(r["id"], r["name"]),
                 "platform": "playbypoint",
-                "date": date.today().isoformat(),
+                "date": mel_today().isoformat(),
                 "data": r,
                 "updated_at": datetime.utcnow().isoformat(),
                 "_keep_slugs": failed_slugs,
@@ -753,6 +780,7 @@ async def run_once():
             console.print(f"[yellow]{len(partial)} venue(s) partly read: {', '.join(partial)}[/yellow]")
         await record_listing_horizon(listing_rows)
         await record_far_sessions(far_rows)
+        await refresh_catalogue()
         if pbp_results and not records:
             console.print("[red]EVERY VENUE FAILED -- nothing written; exiting non-zero so the run shows as failed[/red]")
             sys.exit(1)
