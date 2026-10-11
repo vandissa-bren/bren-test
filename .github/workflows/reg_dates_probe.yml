@@ -1,0 +1,29 @@
+name: Registration Dates Probe
+# Run by hand. Looks for where PlayByPoint says a tournament's entries close:
+# date-like fields on the programme list, programme pages and sessions, and
+# sentences about registration on the page. No rosters are read.
+on:
+  workflow_dispatch:
+    inputs:
+      facilities:
+        description: 'PlayByPoint facility ids, comma separated'
+        required: false
+        default: '1009,1355,1379,1383,885'
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install httpx curl_cffi loguru python-dotenv rich supabase typer tenacity
+      - name: Look for registration dates
+        env:
+          PBP_COOKIES_JSON: ${{ secrets.PBP_COOKIES_JSON }}
+          PROBE_FACILITIES: ${{ github.event.inputs.facilities }}
+          PROXY_URL: ""
+        run: python reg_dates_probe.py
