@@ -31,6 +31,7 @@ import sys
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Query, HTTPException, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
 
 # Load .env file if present
@@ -139,6 +140,13 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Compress responses (11 Oct 2026, SEO audit). /api/pbp/availability, which
+# the homepage and Book load, was going out as 2.2 MB of plain JSON even when
+# the browser asked for gzip; compressed it is roughly a tenth of that. Only
+# for clients that send Accept-Encoding: gzip, and only above 1 KB, so small
+# answers aren't touched. Level 6 is gzip's usual balance of size and CPU.
+app.add_middleware(GZipMiddleware, minimum_size=1000, compresslevel=6)
 
 # ── Supabase REST helper ─────────────────────────────────────────────────────
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://stwohmddmdwttasbyblt.supabase.co")
