@@ -316,6 +316,29 @@ async def record_entry_rules(rows: list[dict]) -> None:
         console.print(f"  [yellow]Entry windows NOT saved: {type(e).__name__}: {e}[/yellow]")
 
 
+async def record_programme_about(rows: list[dict]) -> None:
+    """Save each program's description as its page gives it (programme_about,
+    20261109110000), for the About section of Discover's league, tournament
+    and weekly pop-ups. Sessions in the 14-day window already carry it; this
+    keeps it for programmes whose nights are all further out. Never fails
+    the run."""
+    if not rows:
+        return
+    body = list({r["program_slug"]: r for r in rows}.values())
+    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}", "Content-Type": "application/json",
+               "Prefer": "resolution=merge-duplicates,return=minimal"}
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(f"{SUPABASE_URL}/rest/v1/programme_about?on_conflict=program_slug",
+                                     json=body, headers=headers)
+        if resp.status_code in (200, 201, 204):
+            console.print(f"  Programme descriptions: {len(body)} saved")
+        else:
+            console.print(f"  [yellow]Programme descriptions NOT saved: HTTP {resp.status_code} {resp.text[:200]}[/yellow]")
+    except Exception as e:
+        console.print(f"  [yellow]Programme descriptions NOT saved: {type(e).__name__}: {e}[/yellow]")
+
+
 def is_competitive(stub: dict, program_slug: str = "") -> bool:
     """A tournament or league programme: one Discover lists as either (the
     catalogue's own call, COMPETITIVE_SLUGS), or by PlayByPoint's category or
@@ -592,6 +615,7 @@ async def scrape_pbp_venue(
         "_far": [],                 # sessions past the window, for the fill log (LOG_FAR_SESSIONS)
         "_roster_failed": [],       # far lesson ids whose roster read failed: keep the stored one
         "_entry": [],               # each program's entry window (programme_entry_rules)
+        "_about": [],               # each program's description (programme_about)
     }
 
     date_strs = {d.isoformat() for d in dates}
@@ -680,6 +704,10 @@ async def scrape_pbp_venue(
                     desc = re.sub(r"<[^>]+>", " ", raw_desc).strip()
                     desc = desc.replace("&nbsp;", " ").replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&#8203;", "").replace("\u200b", "")
                     desc = re.sub(r"\s+", " ", desc).strip()[:1000]
+                    if desc or desc_html:
+                        result["_about"].append({"program_slug": program_slug, "description": desc or None,
+                                                 "description_html": desc_html or None,
+                                                 "read_at": datetime.utcnow().isoformat() + "Z"})
                     sl = stub.get("ntrp_str") or ""
                     if not sl:
                         mn = props.get("min_rating")
@@ -852,6 +880,7 @@ async def run_once():
         records, not_saved, partial = [], [], []
         listing_rows = []   # listing_horizon rows, written after the venues
         entry_rows = []     # programme_entry_rules rows, likewise
+        about_rows = []     # programme_about rows, likewise
         far_rows = []       # sessions beyond the window, for the fill log
         for r in pbp_results:
             if not isinstance(r, dict):
@@ -860,6 +889,7 @@ async def run_once():
             tried = r.pop("_clinics_tried", 0)
             failed_slugs = sorted(set(r.pop("_failed_slugs", [])))
             entry_rows.extend(r.pop("_entry", []))
+            about_rows.extend(r.pop("_about", []))
             for row in r.pop("_listing", []):
                 listing_rows.append({"facility_id": int(r["id"]), **row})
             far_rows.extend(r.pop("_far", []))
@@ -898,6 +928,7 @@ async def run_once():
             console.print(f"[yellow]{len(partial)} venue(s) partly read: {', '.join(partial)}[/yellow]")
         await record_listing_horizon(listing_rows)
         await record_entry_rules(entry_rows)
+        await record_programme_about(about_rows)
         await record_far_sessions(far_rows)
         await refresh_catalogue()
         await read_season_rosters(cookies, user_id)
