@@ -261,6 +261,61 @@ async def record_listing_horizon(rows: list[dict]) -> None:
         console.print(f"  [yellow]Listing horizon NOT recorded: {type(e).__name__}: {e}[/yellow]")
 
 
+def _entry_rule(program_slug: str, facility_id: int, props: dict, lessons: list, today: str) -> dict:
+    """A program's entry window, from its page (11 Oct 2026; the Registration
+    Dates Probe found no close date, but these): booking stops
+    hours_before_stop_booking hours before a session starts and opens
+    daysPriorBooking days before (0 / null: no limit). Each session also
+    carries PlayByPoint's own verdict at the moment of reading, kept as the
+    upcoming dates it said were past booking or not yet open."""
+    def num(v):
+        try:
+            n = float(v)
+        except (TypeError, ValueError):
+            return None
+        return n if n > 0 else None
+    hours = num(props.get("hours_before_stop_booking"))
+    days_prior = num(props.get("daysPriorBooking"))
+    closed, unopened = set(), set()
+    for l in lessons:
+        ld = str(l.get("lesson_date") or "") if isinstance(l, dict) else ""
+        if not re.match(r"^\d{4}-\d{2}-\d{2}$", ld) or ld < today:
+            continue
+        if l.get("in_time_to_book?") is False:
+            closed.add(ld)
+        if l.get("open_time_allows_booking?") is False:
+            unopened.add(ld)
+    return {"program_slug": program_slug, "facility_id": int(facility_id),
+            "close_hours": round(hours, 2) if hours else None,
+            "open_days": int(days_prior) if days_prior else None,
+            "closed_dates": sorted(closed)[:60], "unopened_dates": sorted(unopened)[:60],
+            "read_at": datetime.utcnow().isoformat() + "Z"}
+
+
+async def record_entry_rules(rows: list[dict]) -> None:
+    """Save each program's entry window (programme_entry_rules,
+    20261109100000), which Discover turns into "Entries close Mon 3 Nov, 5pm".
+    Only programs read this run are written; the rest keep what they had.
+    Never fails the run."""
+    if not rows:
+        return
+    body = list({r["program_slug"]: r for r in rows}.values())
+    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}", "Content-Type": "application/json",
+               "Prefer": "resolution=merge-duplicates,return=minimal"}
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(f"{SUPABASE_URL}/rest/v1/programme_entry_rules?on_conflict=program_slug",
+                                     json=body, headers=headers)
+        if resp.status_code in (200, 201, 204):
+            console.print(f"  Entry windows: {len(body)} programs · {sum(1 for r in body if r['close_hours'])} close before play"
+                          f" · {sum(1 for r in body if r['open_days'])} open a set time ahead"
+                          f" · {sum(len(r['closed_dates']) for r in body)} sessions past booking")
+        else:
+            console.print(f"  [yellow]Entry windows NOT saved: HTTP {resp.status_code} {resp.text[:200]}[/yellow]")
+    except Exception as e:
+        console.print(f"  [yellow]Entry windows NOT saved: {type(e).__name__}: {e}[/yellow]")
+
+
 def is_competitive(stub: dict, program_slug: str = "") -> bool:
     """A tournament or league programme: one Discover lists as either (the
     catalogue's own call, COMPETITIVE_SLUGS), or by PlayByPoint's category or
@@ -536,6 +591,7 @@ async def scrape_pbp_venue(
         "_listing": [],             # how far ahead each program is listed (see run_once)
         "_far": [],                 # sessions past the window, for the fill log (LOG_FAR_SESSIONS)
         "_roster_failed": [],       # far lesson ids whose roster read failed: keep the stored one
+        "_entry": [],               # each program's entry window (programme_entry_rules)
     }
 
     date_strs = {d.isoformat() for d in dates}
@@ -605,6 +661,9 @@ async def scrape_pbp_venue(
                     if _future:
                         result["_listing"].append({"program_slug": program_slug, "furthest_date": _future[-1],
                                                    "lessons_ahead": len(_future)})
+
+                    # When entries close and open (programme_entry_rules)
+                    result["_entry"].append(_entry_rule(program_slug, facility_id, props, lessons_raw, _today))
 
                     # Metadata
                     raw_desc = props.get("description") or ""
@@ -792,6 +851,7 @@ async def run_once():
         # non-zero, so the workflow goes red instead of green.
         records, not_saved, partial = [], [], []
         listing_rows = []   # listing_horizon rows, written after the venues
+        entry_rows = []     # programme_entry_rules rows, likewise
         far_rows = []       # sessions beyond the window, for the fill log
         for r in pbp_results:
             if not isinstance(r, dict):
@@ -799,6 +859,7 @@ async def run_once():
             list_failed = r.pop("_list_failed", False)
             tried = r.pop("_clinics_tried", 0)
             failed_slugs = sorted(set(r.pop("_failed_slugs", [])))
+            entry_rows.extend(r.pop("_entry", []))
             for row in r.pop("_listing", []):
                 listing_rows.append({"facility_id": int(r["id"]), **row})
             far_rows.extend(r.pop("_far", []))
@@ -836,6 +897,7 @@ async def run_once():
         if partial:
             console.print(f"[yellow]{len(partial)} venue(s) partly read: {', '.join(partial)}[/yellow]")
         await record_listing_horizon(listing_rows)
+        await record_entry_rules(entry_rows)
         await record_far_sessions(far_rows)
         await refresh_catalogue()
         await read_season_rosters(cookies, user_id)
