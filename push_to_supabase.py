@@ -429,6 +429,63 @@ async def record_far_sessions(rows: list[dict]) -> None:
         console.print(f"  [yellow]Far sessions NOT logged: {type(e).__name__}: {e}[/yellow]")
 
 
+async def read_season_rosters(cookies: dict, user_id: int) -> None:
+    """Each league's first-night list, the season's roster (11 Oct 2026).
+
+    Players sign up for a league's season on week 1 and then pay on the
+    night, so PlayByPoint's list for a later night holds only who booked that
+    night. The app shows the first night's list as the season and anyone
+    else booked on a night as a fill-in (get_division_roster). This reads the
+    first nights still needed (season_rosters_to_read: every night until
+    week 1 is played, then once more after, which is kept) into
+    league_season_rosters. PlayByPoint still answers for a played night, so
+    leagues already under way are read too. Never fails the run."""
+    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}", "Content-Type": "application/json"}
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(f"{SUPABASE_URL}/rest/v1/rpc/season_rosters_to_read", headers=headers, json={})
+        if resp.status_code != 200:
+            console.print(f"  [yellow]Season rosters not read: HTTP {resp.status_code} {resp.text[:200]}[/yellow]")
+            return
+        todo = [r for r in resp.json() if r.get("lesson_id")]
+    except Exception as e:
+        console.print(f"  [yellow]Season rosters not read: {type(e).__name__}: {e}[/yellow]")
+        return
+    if not todo:
+        return
+    today = mel_today().isoformat()
+    rows, failed = [], 0
+    try:
+        slug = next(iter(PBP_SLUG_MAP.values()))
+        async with PlayByPointAPI(cookies=cookies, club_slug=slug, proxy=PROXY_URL) as api:
+            api._user_id = user_id
+            for t in todo:
+                roster = await read_roster(api, t["lesson_id"])
+                if roster is None:
+                    failed += 1
+                    continue
+                rows.append({"program_slug": t["program_slug"], "first_date": t["first_date"], "lesson_id": t["lesson_id"],
+                             "roster": roster, "read_at": datetime.utcnow().isoformat() + "Z",
+                             "final": today > str(t["first_date"])})
+                await asyncio.sleep(0.3)
+    except Exception as e:
+        console.print(f"  [yellow]Season rosters: PlayByPoint read stopped: {type(e).__name__}: {e}[/yellow]")
+    if not rows:
+        console.print(f"  [yellow]Season rosters: none read ({failed} failed)[/yellow]")
+        return
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(f"{SUPABASE_URL}/rest/v1/league_season_rosters?on_conflict=program_slug",
+                                     headers={**headers, "Prefer": "resolution=merge-duplicates,return=minimal"}, json=rows)
+        if resp.status_code in (200, 201, 204):
+            console.print(f"  Season rosters: {len(rows)} saved ({sum(r['final'] for r in rows)} kept for the season)"
+                          + (f", {failed} failed" if failed else ""))
+        else:
+            console.print(f"  [yellow]Season rosters NOT saved: HTTP {resp.status_code} {resp.text[:200]}[/yellow]")
+    except Exception as e:
+        console.print(f"  [yellow]Season rosters NOT saved: {type(e).__name__}: {e}[/yellow]")
+
+
 async def refresh_catalogue() -> None:
     """Rebuild the programme catalogue (refresh_programmes) from what this run
     just wrote (11 Oct 2026). Its own 3:40am job ran before this run had
@@ -781,6 +838,7 @@ async def run_once():
         await record_listing_horizon(listing_rows)
         await record_far_sessions(far_rows)
         await refresh_catalogue()
+        await read_season_rosters(cookies, user_id)
         if pbp_results and not records:
             console.print("[red]EVERY VENUE FAILED -- nothing written; exiting non-zero so the run shows as failed[/red]")
             sys.exit(1)
