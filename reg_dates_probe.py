@@ -50,7 +50,8 @@ def walk(o, path, out, depth=0):
         for k, v in o.items():
             p = f"{path}.{k}"
             if KEY.search(str(k)) and not isinstance(v, (dict, list)):
-                out.append(f"      {re.sub(r'\[\d+\]', '[]', p):<58} {shape(v)}")
+                gp = re.sub(r"\[\d+\]", "[]", p)
+                out.append(f"      {gp:<58} {shape(v)}")
             if isinstance(v, (dict, list)):
                 walk(v, p, out, depth + 1)
     elif isinstance(o, list):
