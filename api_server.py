@@ -131,12 +131,27 @@ app = FastAPI(
     title="PickleMatch API",
     description="Real-time pickleball court availability aggregator",
     version="1.0.0",
+    # No public route list (12 Oct 2026, security review): /docs and
+    # /openapi.json published every route, which only helps someone probing.
+    docs_url=None, redoc_url=None, openapi_url=None,
 )
 
+# ── which websites may call this server from a browser (12 Oct 2026) ──────
+# It allowed any website, with credentials, so another site could have its
+# visitors' browsers call this server. Now: the site itself, Netlify's
+# previews of it, Bolt's editor preview (where the app is built), and local
+# testing. Servers and scripts calling it directly send no Origin and are
+# not affected. Sign-in travels in the Authorization header, never cookies,
+# so credentials are not needed.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origin_regex=(
+        r"https://(www\.)?picklematch\.com\.au"
+        r"|https://[a-z0-9-]+(--[a-z0-9-]+)?\.netlify\.app"
+        r"|https://([a-z0-9-]+\.)*(webcontainer-api\.io|webcontainer\.io|bolt\.new|stackblitz\.io)"
+        r"|http://(localhost|127\.0\.0\.1)(:\d+)?"
+    ),
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -236,6 +251,38 @@ def _public_venues(response):
     out["venues"] = [{**v, "sessions": _public_sessions(v.get("sessions"))} if isinstance(v, dict) else v
                      for v in (response.get("venues") or [])]
     return out
+# ── ids are checked before they go into a database address (12 Oct 2026) ──
+# A user or session id is put into the Supabase address (?id=eq.<id>). Unchecked,
+# a value carrying "&" could add filters of its own. Users are standard ids;
+# hosted sessions are standard ids or short codes ("k3-x9ab").
+_UUID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+_SESSION_ID = re.compile(r"^[A-Za-z0-9-]{1,64}$")
+
+
+def _user_id_ok(v) -> str:
+    v = str(v or "")
+    if not _UUID.match(v):
+        raise HTTPException(status_code=400, detail="That isn't a valid account.")
+    return v
+
+
+def _session_id_ok(v) -> str:
+    v = str(v or "")
+    if not _SESSION_ID.match(v):
+        raise HTTPException(status_code=400, detail="That isn't a valid session.")
+    return v
+
+
+_INTENT_ID = re.compile(r"^pi_[A-Za-z0-9]{8,64}$")
+
+
+def _intent_id_ok(v) -> str:
+    v = str(v or "")
+    if not _INTENT_ID.match(v):
+        raise HTTPException(status_code=400, detail="That isn't a valid payment.")
+    return v
+
+
 PROXY_URL = os.environ.get("PROXY_URL")  # e.g. http://user:pass@p.webshare.io:80
 
 
@@ -824,40 +871,7 @@ async def refresh_cookies(req: RefreshCookiesRequest):
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
 
-@app.get("/api/debug/supabase")
-async def debug_supabase():
-    """Debug endpoint to check Supabase connectivity and data."""
-    try:
-        headers = _service_headers()
-        url = f"{SUPABASE_URL}/rest/v1/availability_cache?select=id,platform,venue_name&limit=5"
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(url, headers=headers)
-            return {
-                "status_code": resp.status_code,
-                "supabase_url": SUPABASE_URL,
-                "rows": resp.json() if resp.status_code == 200 else [],
-                "error": resp.text if resp.status_code != 200 else None,
-            }
-    except Exception as e:
-        return {"error": str(e)}
-
-
 # ── PlayByPoint ─────────────────────────────────────────────────────────────
-
-@app.get("/api/debug/session")
-async def debug_session():
-    cookies, user_id, email = _load_session_with_env_fallback()
-    raw = os.environ.get("PBP_COOKIES_JSON", "")
-    return {
-        "has_cookies": bool(cookies),
-        "cookie_count": len(cookies),
-        # The scraper's PlayByPoint account id and email are no longer shown
-        # (10 Oct 2026): this endpoint is public.
-        "env_var_length": len(raw),
-        "proxy_url": os.environ.get("PROXY_URL", "not set")[:30] if os.environ.get("PROXY_URL") else "not set",
-    }
-
-
 
 async def pbp_venues():
     """List all saved PBP venues from Supabase cache."""
@@ -1110,97 +1124,15 @@ async def pbp_single_venue(
     }
 
 
-# ── Combined ─────────────────────────────────────────────────────────────────
-
-@app.get("/api/all")
-async def all_availability(
-    date: Optional[str] = Query(None),
-    from_time: str = Query("16:00", alias="from"),
-    to_time: str = Query("23:00", alias="to"),
-):
-    """Get all PBP availability in one call."""
-    target_date = (datetime.strptime(date, "%Y-%m-%d").date()
-                   if date else datetime.today().date())
-    from_sec = _hhmm_to_sec(from_time)
-    to_sec = _hhmm_to_sec(to_time)
-    pbp_results = await _fetch_all_pbp(target_date, from_sec, to_sec)
-    return {
-        "date": target_date.isoformat(),
-        "from": from_time,
-        "to": to_time,
-        "playbypoint": pbp_results,
-    }
-
+# /api/all was removed (12 Oct 2026): it called a function that no longer exists
+# and failed on every request; nothing in the app uses it.
 
 # ── PBP Booking ───────────────────────────────────────────────────────────────
 
-class ValidateCredentialsRequest(BaseModel):
-    email: str
-    password: str
-
-
-@app.post("/api/pbp/validate")
-async def pbp_validate(req: ValidateCredentialsRequest):
-    """
-    Validate PBP credentials by attempting to fetch the user profile.
-    Returns user_id and email on success, raises 401 on failure.
-    This endpoint is called when a user connects their PBP account.
-    """
-    try:
-        import base64
-        # Try logging in via the API using email/password.
-        # PBP uses a Rails session login — we POST to /users/sign_in.
-        login_url = "https://app.playbypoint.com/users/sign_in"
-        headers = {
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "X-Requested-With": "XMLHttpRequest",
-        }
-        payload = {
-            "user": {
-                "email": req.email,
-                "password": req.password,
-            }
-        }
-        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-            resp = await client.post(login_url, json=payload, headers=headers)
-
-            if resp.status_code in (200, 201):
-                data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
-                user_id = data.get("id") or data.get("user_id")
-                cookies = dict(resp.cookies)
-                if cookies or user_id:
-                    return {
-                        "valid": True,
-                        "user_id": user_id,
-                        "email": req.email,
-                        "cookies": cookies,
-                    }
-
-            # Try alternate endpoint.
-            resp2 = await client.post(
-                "https://app.playbypoint.com/api/users/sign_in",
-                json=payload,
-                headers=headers,
-            )
-            if resp2.status_code in (200, 201):
-                data2 = resp2.json() if resp2.headers.get("content-type", "").startswith("application/json") else {}
-                user_id = data2.get("id") or data2.get("user_id")
-                cookies = dict(resp2.cookies)
-                return {
-                    "valid": True,
-                    "user_id": user_id,
-                    "email": req.email,
-                    "cookies": cookies,
-                }
-
-            raise HTTPException(status_code=401, detail="Invalid email or password. Please check your PlayByPoint credentials.")
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Could not verify credentials: {e}")
-
+# /api/pbp/validate was removed (12 Oct 2026): it took any email and password,
+# tried them on PlayByPoint and returned the session cookies, with no sign-in
+# and no limit. Nothing has ever called it; connecting an account goes through
+# /api/pbp/connect to the booking server, which checks and saves the login.
 
 class CourtBookingRequest(BaseModel):
     user_id: str
@@ -1626,7 +1558,17 @@ async def live_courts(
     """Fetch court blocks live from PBP for a specific venue and date."""
     from datetime import date as date_type
     import asyncio
-    target_date = datetime.strptime(date, "%Y-%m-%d").date()
+    try:
+        target_date = datetime.strptime(date, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Use a date like 2026-11-02.")
+    # Only the dates this is for (12 Oct 2026). The app asks here for days 14+
+    # ahead, beyond the nightly cache; each request goes to PlayByPoint as the
+    # scraper's account, so dates it never needs (past, near, years out) are
+    # refused instead of fetched. 12 days, not 14, leaves room for time zones.
+    ahead = (target_date - datetime.utcnow().date()).days
+    if ahead < 12 or ahead > 180:
+        raise HTTPException(status_code=400, detail="Live court lookups are for 14 to 180 days ahead.")
     slug = registry_slug(facility_id)
     if not slug:
         return {"court_blocks": [], "date": date, "error": "Unknown facility"}
@@ -1847,6 +1789,7 @@ async def _caller_id(authorization: Optional[str]) -> Optional[str]:
 
 
 async def _session_row(session_id: str) -> dict:
+    session_id = _session_id_ok(session_id)
     async with httpx.AsyncClient(timeout=10.0) as client:
         r = await client.get(
             f"{SUPABASE_URL}/rest/v1/created_sessions?id=eq.{session_id}"
@@ -1990,6 +1933,7 @@ async def stripe_status(user_id: str):
     """Check if host has completed Stripe onboarding."""
     if not STRIPE_SECRET_KEY:
         return {"onboarded": False}
+    user_id = _user_id_ok(user_id)
     svc_headers = {
         "apikey": SUPABASE_SERVICE_KEY,
         "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
@@ -2142,6 +2086,7 @@ async def _require_host(authorization: Optional[str], sess: dict) -> str:
 
 
 async def _participant(session_id: str, user_id: str) -> Optional[dict]:
+    session_id, user_id = _session_id_ok(session_id), _user_id_ok(user_id)
     async with httpx.AsyncClient(timeout=10.0) as client:
         r = await client.get(
             f"{SUPABASE_URL}/rest/v1/session_participants?session_id=eq.{session_id}"
@@ -2245,6 +2190,7 @@ async def capture_payment(req: CaptureRequest, authorization: Optional[str] = He
     be approved. New clients use /api/host/approve, which also admits."""
     if not STRIPE_SECRET_KEY:
         raise HTTPException(status_code=500, detail="Stripe not configured")
+    _intent_id_ok(req.payment_intent_id)
     sess = await _session_row(req.session_id)
     await _require_host(authorization, sess)
     refusal = _admission_refusal(sess)
@@ -2277,6 +2223,7 @@ async def cancel_payment(req: CaptureRequest, authorization: Optional[str] = Hea
     release someone else's hold before."""
     if not STRIPE_SECRET_KEY:
         raise HTTPException(status_code=500, detail="Stripe not configured")
+    _intent_id_ok(req.payment_intent_id)
     sess = await _session_row(req.session_id)
     await _require_host(authorization, sess)
     async with httpx.AsyncClient(timeout=10.0) as client:
