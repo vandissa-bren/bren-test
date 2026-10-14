@@ -26,6 +26,7 @@ except ImportError:
 
 sys.path.insert(0, str(Path(__file__).parent))
 from extract_thejar import PlayByPointAPI, _extract_react_props_from_html
+from league_rosters import read_league_rosters
 
 
 console = Console()
@@ -1123,6 +1124,10 @@ async def run_once():
         await record_far_sessions(far_rows)
         await refresh_catalogue()
         await read_season_rosters(cookies, user_id)
+        # Host leagues phase 2: claimed seasons' rosters and their players' ratings
+        await read_league_rosters(cookies, user_id,
+                                  lambda c, s: PlayByPointAPI(cookies=c, club_slug=s, proxy=PROXY_URL),
+                                  next(iter(PBP_SLUG_MAP.values()), ""))
         if pbp_results and not records:
             console.print("[red]EVERY VENUE FAILED -- nothing written; exiting non-zero so the run shows as failed[/red]")
             sys.exit(1)
