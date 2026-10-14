@@ -339,6 +339,174 @@ async def record_programme_about(rows: list[dict]) -> None:
         console.print(f"  [yellow]Programme descriptions NOT saved: {type(e).__name__}: {e}[/yellow]")
 
 
+LEAGUE_NIGHT_WINDOW_DAYS = 400   # nights further back or ahead than this are junk
+
+
+def _sec_to_hms(sec) -> str | None:
+    """Seconds after midnight (PlayByPoint's hour_start / hour_end) as
+    'HH:MM:SS' for a Postgres time column; None when absent or unreadable."""
+    try:
+        sec = int(sec)
+    except (TypeError, ValueError):
+        return None
+    if sec < 0 or sec >= 86400:
+        return None
+    return f"{sec // 3600:02d}:{(sec % 3600) // 60:02d}:{sec % 60:02d}"
+
+
+def _league_night_rows(program_slug: str, facility_id: int, lessons: list, today: str) -> list[dict]:
+    """One pbp_league_nights row per lesson a competitive programme's page
+    lists, past and future (20261110100000, section 5). Deleted lessons and
+    ones with no id or date are skipped, as are nights more than
+    LEAGUE_NIGHT_WINDOW_DAYS from today (a Melbourne YYYY-MM-DD)."""
+    def num(v):
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return None
+    t = date.fromisoformat(today)
+    lo = (t - timedelta(days=LEAGUE_NIGHT_WINDOW_DAYS)).isoformat()
+    hi = (t + timedelta(days=LEAGUE_NIGHT_WINDOW_DAYS)).isoformat()
+    rows = []
+    for l in lessons or []:
+        if not isinstance(l, dict) or l.get("deleted_at"):
+            continue
+        lid = num(l.get("id"))
+        ld = str(l.get("lesson_date") or "")
+        if lid is None or not re.match(r"^\d{4}-\d{2}-\d{2}$", ld) or not (lo <= ld <= hi):
+            continue
+        created = l.get("created_at")
+        if isinstance(created, str) and created:
+            try:
+                datetime.fromisoformat(created.replace("Z", "+00:00"))
+            except ValueError:
+                created = None
+        else:
+            created = None
+        batch = l.get("batch_id")
+        batch = str(batch).strip() if batch not in (None, "") else ""
+        status = l.get("status")
+        rows.append({
+            "lesson_id": lid,
+            "program_slug": program_slug,
+            "venue_id": f"pbp-{int(facility_id)}",
+            "night_date": ld,
+            "start_time": _sec_to_hms(l.get("hour_start")),
+            "end_time": _sec_to_hms(l.get("hour_end")),
+            "batch_id": batch or None,
+            "capacity": num(l.get("capacity")),
+            "player_count": num(l.get("player_count")),
+            "status": str(status) if status not in (None, "") else None,
+            "pbp_created_at": created,
+        })
+    return rows
+
+
+async def record_league_nights(rows: list[dict]) -> bool:
+    """Save every league night the scrape saw (pbp_league_nights,
+    20261110100000), keyed by lesson id. Only nights read this run are
+    written; first_seen is left to the table's default. Never fails the run.
+    Returns True when nothing failed (run_once prunes stale nights only then,
+    so a night PlayByPoint moved is never removed before its new date is in)."""
+    if not rows:
+        return True
+    read_at = datetime.utcnow().isoformat() + "Z"
+    body = [{**r, "read_at": read_at} for r in {r["lesson_id"]: r for r in rows}.values()]
+    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}", "Content-Type": "application/json",
+               "Prefer": "resolution=merge-duplicates,return=minimal"}
+    saved, failed = 0, 0
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            for i in range(0, len(body), 500):
+                chunk = body[i:i + 500]
+                try:
+                    resp = await client.post(f"{SUPABASE_URL}/rest/v1/pbp_league_nights?on_conflict=lesson_id",
+                                             json=chunk, headers=headers)
+                except Exception as e:
+                    failed += 1
+                    console.print(f"  [yellow]League nights batch NOT saved: {type(e).__name__}: {e}[/yellow]")
+                    continue
+                if resp.status_code in (200, 201, 204):
+                    saved += len(chunk)
+                else:
+                    failed += 1
+                    console.print(f"  [yellow]League nights batch NOT saved: HTTP {resp.status_code} {resp.text[:200]}[/yellow]")
+        console.print(f"  League nights: {saved} saved across {len({r['program_slug'] for r in body})} programmes"
+                      + (f", {failed} batch(es) failed" if failed else ""))
+        return failed == 0
+    except Exception as e:
+        console.print(f"  [yellow]League nights NOT saved: {type(e).__name__}: {e}[/yellow]")
+        return False
+
+
+LEAGUE_PRUNE_IDS = 300   # most lesson ids in one DELETE url
+
+
+async def prune_league_nights(seen: list[tuple[str, list[int]]], today: str | None = None) -> None:
+    """Remove the FUTURE nights PlayByPoint no longer lists (deleted or moved),
+    so a cancelled or rescheduled first night stops distorting claim
+    deadlines. `seen` holds (program_slug, lesson ids on its page) for each
+    programme page read SUCCESSFULLY this run -- never a failed or challenged
+    read. One DELETE per slug removes rows with night_date >= today (Melbourne)
+    whose lesson_id is not in the page; no ids means every future row goes.
+    Past nights are kept. Over LEAGUE_PRUNE_IDS ids the stale ids are found by
+    a read and deleted in chunks (a 'not in' list cannot be split). Never
+    fails the run."""
+    if not seen:
+        return
+    today = today or mel_today().isoformat()
+    merged: dict[str, set] = {}
+    for slug, ids in seen:
+        merged.setdefault(slug, set()).update(int(i) for i in ids)
+    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}", "Content-Type": "application/json",
+               "Prefer": "return=minimal"}
+    url = f"{SUPABASE_URL}/rest/v1/pbp_league_nights"
+    base = lambda slug: {"program_slug": f"eq.{slug}", "night_date": f"gte.{today}"}
+    pruned, failed = 0, 0
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            for slug, ids in sorted(merged.items()):
+                try:
+                    if len(ids) <= LEAGUE_PRUNE_IDS:
+                        params = base(slug)
+                        if ids:
+                            params["lesson_id"] = f"not.in.({','.join(str(i) for i in sorted(ids))})"
+                        resp = await client.delete(url, params=params, headers=headers)
+                        ok = resp.status_code in (200, 204)
+                        if not ok:
+                            console.print(f"  [yellow]League nights prune NOT done for {slug}: HTTP {resp.status_code} {resp.text[:200]}[/yellow]")
+                        pruned += ok
+                        failed += not ok
+                        continue
+                    stored, offset = set(), 0
+                    while True:
+                        resp = await client.get(url, params={**base(slug), "select": "lesson_id", "order": "lesson_id",
+                                                             "limit": 1000, "offset": offset},
+                                                headers={k: v for k, v in headers.items() if k != "Prefer"})
+                        if resp.status_code != 200:
+                            raise RuntimeError(f"read HTTP {resp.status_code} {resp.text[:200]}")
+                        page = [int(r["lesson_id"]) for r in resp.json()]
+                        stored.update(page)
+                        if len(page) < 1000:
+                            break
+                        offset += 1000
+                    stale = sorted(stored - ids)
+                    for i in range(0, len(stale), LEAGUE_PRUNE_IDS):
+                        chunk = stale[i:i + LEAGUE_PRUNE_IDS]
+                        resp = await client.delete(url, params={**base(slug), "lesson_id": f"in.({','.join(str(x) for x in chunk)})"},
+                                                   headers=headers)
+                        if resp.status_code not in (200, 204):
+                            raise RuntimeError(f"delete HTTP {resp.status_code} {resp.text[:200]}")
+                    pruned += 1
+                except Exception as e:
+                    failed += 1
+                    console.print(f"  [yellow]League nights prune NOT done for {slug}: {type(e).__name__}: {e}[/yellow]")
+        console.print(f"  League nights pruned: {pruned} programmes checked for moved or deleted nights"
+                      + (f", {failed} failed" if failed else ""))
+    except Exception as e:
+        console.print(f"  [yellow]League nights prune NOT done: {type(e).__name__}: {e}[/yellow]")
+
+
 def is_competitive(stub: dict, program_slug: str = "") -> bool:
     """A tournament or league programme: one Discover lists as either (the
     catalogue's own call, COMPETITIVE_SLUGS), or by PlayByPoint's category or
@@ -616,6 +784,8 @@ async def scrape_pbp_venue(
         "_roster_failed": [],       # far lesson ids whose roster read failed: keep the stored one
         "_entry": [],               # each program's entry window (programme_entry_rules)
         "_about": [],               # each program's description (programme_about)
+        "_nights": [],              # every night of each competitive program (pbp_league_nights)
+        "_nights_seen": [],         # (slug, lesson ids) per competitive page read in full, to prune moved/deleted nights
     }
 
     date_strs = {d.isoformat() for d in dates}
@@ -688,6 +858,12 @@ async def scrape_pbp_venue(
 
                     # When entries close and open (programme_entry_rules)
                     result["_entry"].append(_entry_rule(program_slug, facility_id, props, lessons_raw, _today))
+
+                    # Every night of a league or tournament, past and future
+                    # (pbp_league_nights), with its batch
+                    if is_competitive(stub, program_slug):
+                        _night_rows = _league_night_rows(program_slug, facility_id, lessons_raw, _today)
+                        result["_nights"].extend(_night_rows)
 
                     # Metadata
                     raw_desc = props.get("description") or ""
@@ -830,6 +1006,13 @@ async def scrape_pbp_venue(
                             "price_tiers": lesson_tiers,
                             "coaches": coaches,
                         })
+
+                    # Only now, with the whole page handled: this programme's
+                    # page was read in full, so a future night missing from it
+                    # was deleted or moved (prune_league_nights). A failed or
+                    # challenged read raised above and never gets here.
+                    if is_competitive(stub, program_slug):
+                        result["_nights_seen"].append((program_slug, [r["lesson_id"] for r in _night_rows]))
                 except Exception as e:
                     console.print(f"    [yellow]clinic {clinic_id} error for {name}: {e}[/yellow]")
                     result["_failed_slugs"].append(program_slug)
@@ -881,6 +1064,8 @@ async def run_once():
         listing_rows = []   # listing_horizon rows, written after the venues
         entry_rows = []     # programme_entry_rules rows, likewise
         about_rows = []     # programme_about rows, likewise
+        night_rows = []     # pbp_league_nights rows, likewise
+        night_seen = []     # (slug, lesson ids) of programmes read in full, to prune stale nights
         far_rows = []       # sessions beyond the window, for the fill log
         for r in pbp_results:
             if not isinstance(r, dict):
@@ -890,6 +1075,8 @@ async def run_once():
             failed_slugs = sorted(set(r.pop("_failed_slugs", [])))
             entry_rows.extend(r.pop("_entry", []))
             about_rows.extend(r.pop("_about", []))
+            night_rows.extend(r.pop("_nights", []))
+            night_seen.extend(r.pop("_nights_seen", []))
             for row in r.pop("_listing", []):
                 listing_rows.append({"facility_id": int(r["id"]), **row})
             far_rows.extend(r.pop("_far", []))
@@ -929,6 +1116,10 @@ async def run_once():
         await record_listing_horizon(listing_rows)
         await record_entry_rules(entry_rows)
         await record_programme_about(about_rows)
+        if await record_league_nights(night_rows):
+            await prune_league_nights(night_seen)
+        else:
+            console.print("  [yellow]League nights not pruned: the save above had failures[/yellow]")
         await record_far_sessions(far_rows)
         await refresh_catalogue()
         await read_season_rosters(cookies, user_id)
