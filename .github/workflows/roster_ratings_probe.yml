@@ -1,0 +1,29 @@
+name: Roster Ratings Probe
+# Run by hand. Phase 2 of host leagues: across whole league rosters, how many
+# players can we get a DUPR (doubles, singles, id) for through PlayByPoint?
+# Prints counts, field names and value shapes only -- never names, ids,
+# ratings or cookies.
+on:
+  workflow_dispatch:
+    inputs:
+      slugs:
+        description: 'PlayByPoint programme slugs, comma-separated'
+        required: false
+        default: 'intermediateleague2026,intermediate-competition'
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install curl_cffi
+      - name: Probe roster ratings
+        env:
+          PBP_COOKIES_JSON: ${{ secrets.PBP_COOKIES_JSON }}
+          PROBE_SLUGS: ${{ inputs.slugs }}
+        run: python roster_ratings_probe.py
