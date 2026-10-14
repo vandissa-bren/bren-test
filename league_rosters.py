@@ -3,9 +3,11 @@ league_rosters.py -- host leagues phase 2: season rosters and ratings (14 Oct 20
 
 Run at the end of push_to_supabase.py's nightly run (read_league_rosters).
 
-1. Asks Supabase which claimed season divisions still need their roster read
-   (league_rosters_to_read: nights 1 to 3 of each live division, until two
-   days after its third night).
+1. Asks Supabase which claimed season divisions need their roster read
+   (league_rosters_to_read: EVERY night of each live division, up to 30,
+   until two days after its last night). A season buyer is booked on every
+   night as soon as they buy, so how many nights someone is booked on tells
+   a season player from a fill-in (14 Oct).
 2. Reads PlayByPoint's player list for each of those nights and hands the lot
    to league_roster_ingest, one division at a time. A night that can't be read
    is sent as "not read" (users null), so what we had for it is kept; the
