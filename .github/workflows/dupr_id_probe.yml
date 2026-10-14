@@ -1,0 +1,28 @@
+name: DUPR ID Probe
+# Run by hand. Phase 0 of host leagues: does PlayByPoint show a player's DUPR
+# ID anywhere we can read? Prints status codes, field names and masked values
+# only -- never names, emails or cookies.
+on:
+  workflow_dispatch:
+    inputs:
+      slug:
+        description: 'PlayByPoint programme slug to probe'
+        required: false
+        default: 'intermediateleague2026'
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install curl_cffi
+      - name: Probe PlayByPoint for DUPR IDs
+        env:
+          PBP_COOKIES_JSON: ${{ secrets.PBP_COOKIES_JSON }}
+          PROBE_SLUG: ${{ inputs.slug }}
+        run: python dupr_id_probe.py
