@@ -126,8 +126,12 @@ def main() -> int:
     lessons.sort(key=lambda l: str(l.get("lesson_date") or ""))
     print(f"  nights listed: {len(lessons)}"
           + (f", first {lessons[0].get('lesson_date')}, last {lessons[-1].get('lesson_date')}" if lessons else ""))
-    if lessons:
-        print(f"  night fields: {sorted(lessons[0].keys())}")
+    # Round 2 (14 Oct): which fields separate one season's nights from another's
+    for l in lessons:
+        print(f"    {l.get('lesson_date')}  batch {l.get('batch_id')}  status {l.get('status')}"
+              f"  players {l.get('player_count')}/{l.get('capacity')}  created {str(l.get('created_at'))[:10]}"
+              f"  bookable {l.get('in_time_to_book?')}/{l.get('open_time_allows_booking?')}"
+              f"  opens {l.get('booking_opens_label')!r}  deleted {bool(l.get('deleted_at'))}")
     if not lessons:
         print("No nights found on the page; nothing more to probe.")
         return 0
@@ -137,7 +141,7 @@ def main() -> int:
     user_ids: list = []
     for l in picks:
         print(f"\nNight {l.get('lesson_date')}:")
-        for provider in ("dupr", "DUPR", "nrp", None):
+        for provider in ("dupr",):
             params = {"lesson_id": l["id"]}
             if provider:
                 params["rating_provider"] = provider
@@ -157,20 +161,33 @@ def main() -> int:
             user_ids += [u["id"] for u in users if isinstance(u, dict) and u.get("id")]
 
     # 3. player-level endpoints, for up to three players
-    seen = list(dict.fromkeys(user_ids))[:3]
-    print(f"\nPlayer endpoints, {len(seen)} players:")
+    # Round 2 (14 Oct): inside each player's ratings list. Round 1 only looked
+    # for "dupr" in field NAMES; the provider is a VALUE ("dupr"), so this
+    # prints each entry's fields and any value shaped like a DUPR ID, masked.
+    seen = list(dict.fromkeys(user_ids))[:8]
+    print(f"\nRatings entries, {len(seen)} players:")
+    with_dupr = 0
     for n, uid in enumerate(seen, 1):
-        for path in (f"/api/users/{uid}", f"/api/public/users/{uid}", f"/api/users/{uid}/ratings",
-                     f"/api/public/users/{uid}/ratings", f"/api/users/{uid}/profile"):
-            body = get_json(s, f"player {n}: {path.replace(str(uid), '<id>')}", path)
-            if body is None:
+        body = get_json(s, f"player {n}: /api/users/<id>/ratings", f"/api/users/{uid}/ratings")
+        if not isinstance(body, dict):
+            continue
+        print(f"      rpr_linked {body.get('rpr_linked')!r}  finished_onboarding {body.get('finished_onboarding')!r}")
+        found = False
+        for e in body.get("ratings") or []:
+            if not isinstance(e, dict):
                 continue
-            top = sorted(body.keys()) if isinstance(body, dict) else f"list of {len(body)}"
-            print(f"      fields: {top}")
-            for d in dupr_fields(body):
-                print(f"      field: {d}")
+            prov = e.get("provider")
+            found |= str(prov).lower() == "dupr"
+            ids = [f"{k} = {mask(v)}" for k, v in e.items()
+                   if isinstance(v, str) and DUPR_ID.match(v) and k != "provider"]
+            print(f"      provider {prov!r}: fields {sorted(e.keys())}"
+                  f"  single {'set' if e.get('single') not in (None, '') else 'empty'}"
+                  f"  double {'set' if e.get('double') not in (None, '') else 'empty'}"
+                  + (f"  ID-shaped values: {ids}" if ids else ""))
+        with_dupr += found
+    print(f"\n  players with a DUPR entry: {with_dupr} of {len(seen)}")
 
-    print("\nDone. A line ending '(looks like a DUPR ID)' means PlayByPoint shows it.")
+    print("\nDone. 'ID-shaped values' or '(looks like a DUPR ID)' means PlayByPoint shows a DUPR ID.")
     return 0
 
 
