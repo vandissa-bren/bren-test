@@ -61,16 +61,22 @@ def load_cookies():
 
 
 async def read_catalogue(client) -> list[dict]:
-    """The stored PBP catalogue: one row per venue, each with its sessions."""
+    """The stored PBP catalogue: one row per venue, each with its sessions.
+
+    Pack 5, 20 Oct 2026: asks for `sessions` only. It used to download every
+    venue's whole `data` (court days, prices, far rosters) each run and use
+    none of it. The rows keep the {"sessions": [...]} shape the rest of this
+    file reads."""
     r = await client.get(
         f"{SUPABASE_URL}/rest/v1/availability_cache",
-        params={"select": "id,data", "platform": "eq.playbypoint"},
+        params={"select": "id,sessions:data->sessions", "platform": "eq.playbypoint"},
         headers=supabase_headers(),
     )
     if r.status_code != 200:
         print(f"  CATALOGUE READ FAILED: HTTP {r.status_code} {r.text[:200]}")
         return []
-    return [(row["id"], row["data"]) for row in r.json() if row.get("data")]
+    return [(row["id"], {"sessions": row.get("sessions") or []})
+            for row in r.json() if row.get("sessions") is not None]
 
 
 def collect_target_sessions(catalogue: list[dict]) -> list[dict]:
