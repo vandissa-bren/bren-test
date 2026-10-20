@@ -56,8 +56,10 @@ DAYS_AHEAD = int(os.environ.get("DAYS_AHEAD", "14"))
 DRY_RUN = os.environ.get("DRY_RUN", "") == "1"
 
 # How old a cached price can get before we refetch it. Matches
-# fetch_court_blocks.py's PRICE_REFRESH_HOURS behaviour.
-PRICE_REFRESH_HOURS = int(os.environ.get("PRICE_REFRESH_HOURS", "168"))
+# fetch_court_blocks.py: 24 hours (Pack 5, 20 Oct 2026 -- this said it matched
+# but defaulted to 168. Until then the hourly scrape wiped the timestamps, so
+# these venues were in fact re-priced every hour; 24 is the agreed rate).
+PRICE_REFRESH_HOURS = int(os.environ.get("PRICE_REFRESH_HOURS", "24"))
 
 # Superseded by venue_registry (fetcher='sportswell'). No consumers remain;
 # deleted once the frontend migrates. Do not add to it.
@@ -405,8 +407,14 @@ async def main():
             row_id = f"pbp-{fid}"
             status = "no response"
             try:
+                # Pack 5: only the court fields this job uses, not the whole
+                # row with its sessions and rosters.
                 resp = await client.get(f"{base}/rest/v1/availability_cache",
-                                        params={"id": f"eq.{row_id}", "select": "id,data"}, headers=headers)
+                                        params={"id": f"eq.{row_id}",
+                                                "select": "id,court_prices:data->court_prices,"
+                                                          "court_prices_fetched_at:data->court_prices_fetched_at,"
+                                                          "by_date:data->by_date"},
+                                        headers=headers)
                 status = f"HTTP {resp.status_code}"
                 rows = resp.json() if resp.status_code == 200 else []
             except Exception as e:
@@ -415,7 +423,7 @@ async def main():
                 res["error"] = res["error"] or f"no stored row {row_id} ({status})"
                 print(f"  SKIPPED {v.name}: {res['error']}")
                 continue
-            data = rows[0].get("data") or {}
+            data = {k: rows[0].get(k) for k in ("court_prices", "court_prices_fetched_at", "by_date")}
             existing_prices = data.get("court_prices", {}) or {}
             existing_fetched_at = data.get("court_prices_fetched_at", {}) or {}
             res["prices"], res["fetched_at"] = dict(existing_prices), dict(existing_fetched_at)
