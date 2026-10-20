@@ -149,39 +149,59 @@ def _pricing_tiers(records):
     return out
 
 
+# The keys of a venue's `data` that this scrape owns (Pack 5, 20 Oct 2026).
+# Only these are ever written. Everything else in the row belongs to another
+# job and is left exactly as it is: court days, court prices and their
+# timestamps and fetch_status (fetch_court_blocks.py), shift_map, member
+# court prices, and anything added later.
+#
+# The save used to replace the whole `data` object, copying back only
+# court_prices, shift_map and the court days it had read. Every hourly run
+# therefore deleted court_prices_fetched_at (so the court job re-priced every
+# court with PlayByPoint on its next run), fetch_status and member court
+# prices -- and a court run that saved between this read and this write had
+# its new days put back to the old ones.
+SCRAPE_OWNS = ("id", "name", "slug", "platform", "sessions", "program_pricing",
+               "far_rosters")
+
+
 async def supabase_upsert(records: list[dict]) -> None:
+    """Save each venue through merge_availability: one statement per venue
+    that replaces only the SCRAPE_OWNS keys. Court days are never sent. A
+    venue seen for the first time gets its row created."""
     if not records:
         return
     headers = {
         "apikey": SUPABASE_KEY,
         "Authorization": f"Bearer {SUPABASE_KEY}",
         "Content-Type": "application/json",
-        "Prefer": "resolution=merge-duplicates",
     }
     async with httpx.AsyncClient(timeout=30.0) as client:
-        # Fetch existing records to preserve court_prices, shift_map, court blocks
+        # Stored sessions and far rosters, for the programs this run could not
+        # read (carried over below). Only those two keys: the rest of the row
+        # is not this job's to read or write.
         row_ids = [r["id"] for r in records if "id" in r]
         existing_by_id = {}
         if row_ids:
             fetch_resp = await client.get(
                 f"{SUPABASE_URL}/rest/v1/availability_cache",
-                params={"id": f"in.({','.join(row_ids)})", "select": "id,data"},
+                params={"id": f"in.({','.join(row_ids)})",
+                        "select": "id,sessions:data->sessions,far_rosters:data->far_rosters"},
                 headers=headers,
             )
             if fetch_resp.status_code != 200:
-                # Not cosmetic: existing_by_id feeds the merge below, which
-                # preserves court_prices, shift_map and previously-fetched
-                # by_date blocks. Continuing with an empty dict would skip
-                # that merge and overwrite live court data with nothing.
+                # Not cosmetic: without the stored sessions, a program that
+                # could not be read this run would lose its sessions.
                 raise RuntimeError(
                     f"Supabase read failed ({fetch_resp.status_code}): "
                     f"{fetch_resp.text[:200]}"
                 )
             for row in fetch_resp.json():
-                existing_by_id[row["id"]] = row["data"]
+                existing_by_id[row["id"]] = {"sessions": row.get("sessions") or [],
+                                             "far_rosters": row.get("far_rosters") or {}}
 
-        # Merge court_prices, shift_map, by_date into record["data"]
         today_iso = mel_today().isoformat()
+        failed = []
         for record in records:
             row_id = record.get("id")
             # Not a column: the programs this run could not read, whose
@@ -189,46 +209,50 @@ async def supabase_upsert(records: list[dict]) -> None:
             keep_slugs = set(record.pop("_keep_slugs", ()) or ())
             keep_rosters = set(record.pop("_keep_rosters", ()) or ())
             existing_data = existing_by_id.get(row_id, {})
+            inner = record.get("data") or {}
             # Far rosters this run couldn't read (programme page unreadable, or
             # the roster read itself failed): keep the stored one until its date.
-            if existing_data and "data" in record:
-                new_fr = record["data"].setdefault("far_rosters", {})
+            if existing_data:
+                new_fr = inner.setdefault("far_rosters", {})
                 for lid, fr in (existing_data.get("far_rosters") or {}).items():
                     if (lid not in new_fr and isinstance(fr, dict) and str(fr.get("date") or "") >= today_iso
                             and (lid in keep_rosters or fr.get("program_slug") in keep_slugs)):
                         new_fr[lid] = fr
-            if existing_data and keep_slugs and "data" in record:
+            if existing_data and keep_slugs:
                 kept = [s for s in (existing_data.get("sessions") or [])
                         if s.get("program_slug") in keep_slugs
                         and str(s.get("date") or "") >= today_iso]
-                record["data"]["sessions"] = (record["data"].get("sessions") or []) + kept
-            if existing_data and "data" in record:
-                inner = record["data"]
-                if "court_prices" not in inner and "court_prices" in existing_data:
-                    inner["court_prices"] = existing_data["court_prices"]
-                if "shift_map" not in inner and "shift_map" in existing_data:
-                    inner["shift_map"] = existing_data["shift_map"]
-                existing_by_date = existing_data.get("by_date", {})
-                new_by_date = inner.get("by_date", {})
-                for date_str, existing_blocks in existing_by_date.items():
-                    if date_str not in new_by_date or not new_by_date[date_str]:
-                        if existing_blocks:
-                            new_by_date[date_str] = existing_blocks
-                inner["by_date"] = new_by_date
+                inner["sessions"] = (inner.get("sessions") or []) + kept
 
-        resp = await client.post(
-            f"{SUPABASE_URL}/rest/v1/availability_cache",
-            json=records,
-            headers=headers,
-        )
-        if resp.status_code not in (200, 201):
-            # Must raise, not just print. This previously returned normally,
-            # so the caller's "Pushed N venues" message printed regardless
-            # and the workflow exited 0. An RLS rejection therefore went
-            # unnoticed for four days while every scheduled scrape discarded
-            # its results and reported success.
+            body = {
+                "p_id": row_id,
+                "p_set": {k: inner[k] for k in SCRAPE_OWNS if k in inner},
+                "p_row": {"venue_name": record.get("venue_name"),
+                          "platform": record.get("platform"),
+                          "date": record.get("date")},
+                "p_create": True,
+                "p_touch": True,
+            }
+            try:
+                resp = await client.post(
+                    f"{SUPABASE_URL}/rest/v1/rpc/merge_availability",
+                    json=body, headers=headers,
+                )
+            except Exception as e:
+                failed.append(f"{row_id}: {type(e).__name__}: {e}")
+                continue
+            if resp.status_code != 200:
+                failed.append(f"{row_id}: HTTP {resp.status_code} {resp.text[:200]}")
+
+        if failed:
+            # Must raise, not just print. The old save once returned normally
+            # on a rejected write, so the caller's "Pushed N venues" message
+            # printed regardless and the workflow exited 0 -- an RLS rejection
+            # went unnoticed for four days. Every venue is attempted first, so
+            # one bad row does not cost the others their sessions.
             raise RuntimeError(
-                f"Supabase write failed ({resp.status_code}): {resp.text[:300]}"
+                f"Supabase write failed for {len(failed)} of {len(records)} venue(s): "
+                + " | ".join(failed)[:600]
             )
 
 async def record_listing_horizon(rows: list[dict]) -> None:
