@@ -73,10 +73,16 @@ def _cache_get(key: str):
         return entry["data"]
     return None
 
-def _cache_set(key: str, data):
+def _cache_set(key: str, data, born: Optional[float] = None):
+    """`born` is when the stored rows behind `data` were read (Pack 5). The
+    entry expires CACHE_TTL after THAT, not after now, so a response built
+    from rows that are already a minute old is not kept a full five minutes
+    more: nothing is ever served more than CACHE_TTL behind the database,
+    the same limit as before the shared rows existed."""
+    start = born if born is not None else datetime.utcnow().timestamp()
     _availability_cache[key] = {
         "data": data,
-        "expires": datetime.utcnow().timestamp() + CACHE_TTL,
+        "expires": start + CACHE_TTL,
     }
 
 
@@ -351,7 +357,56 @@ async def _read_from_supabase(platform: str, attempts: int = 3) -> list[dict]:
     logger.error(f"Supabase read error after {attempts} attempts ({why}) — "
                  + (f"serving the last good copy ({len(fallback)} venues)" if fallback
                     else "and there is no earlier copy to serve"))
+    _read_failed[platform] = True
     return fallback
+
+
+# ── One shared copy of the stored rows (Pack 5, 20 Oct 2026) ─────────────────
+# availability_cache was the busiest read on the database: 233k reads, 4.7
+# hours. Every caller above fetched the WHOLE table (every venue's JSON,
+# ~1.4 MB) for itself -- once per uncached date, once per time window (the
+# window was in the cache key but filters nothing), on every single-venue
+# page, and once per live court lookup just to read one venue's prices. Ten
+# players arriving as a key expired meant ten full downloads at once.
+#
+# Now every caller asks _stored_rows. It keeps the last read for ROWS_TTL
+# seconds, and callers that arrive while a read is under way wait for that
+# read instead of starting their own. The rows are shared and read-only:
+# every caller builds new dicts from them and never edits them in place.
+#
+# A failed read (the last-good fallback was served) is kept only briefly, so
+# the next attempt comes soon but an outage is not hammered by every request.
+ROWS_TTL = 90
+ROWS_FAILED_TTL = 15
+_rows_memo: dict[str, tuple[float, float, list]] = {}   # platform -> (expires, read_at, rows)
+_rows_inflight: dict[str, "asyncio.Future"] = {}
+_read_failed: dict[str, bool] = {}
+
+
+async def _load_rows(platform: str) -> tuple[list, float]:
+    _read_failed[platform] = False
+    read_at = _time.time()
+    rows = await _read_from_supabase(platform)
+    ttl = ROWS_FAILED_TTL if _read_failed.get(platform) else ROWS_TTL
+    _rows_memo[platform] = (_time.time() + ttl, read_at, rows)
+    return rows, read_at
+
+
+async def _stored_rows(platform: str = "playbypoint", *, fresh: bool = False) -> tuple[list, float]:
+    """(rows, read_at): the stored availability rows and when they were read.
+    `fresh` skips the kept copy (the warm loop uses it), but still joins a
+    read already under way."""
+    hit = _rows_memo.get(platform)
+    if hit and not fresh and hit[0] > _time.time():
+        return hit[2], hit[1]
+    fut = _rows_inflight.get(platform)
+    if fut is None:
+        fut = asyncio.ensure_future(_load_rows(platform))
+        _rows_inflight[platform] = fut
+        fut.add_done_callback(lambda _f: _rows_inflight.pop(platform, None))
+    # shield: a caller that disconnects must not cancel the read others wait on
+    return await asyncio.shield(fut)
+
 
 # ── Slug map for saved venues ───────────────────────────────────────────────
 # In-memory cache for live court fetches (facility_id+date -> {blocks, expires})
@@ -650,7 +705,7 @@ async def _get_pbp_availability(
                 # unpriced -- an absent price is recoverable, a confidently
                 # wrong one is not.
                 try:
-                    _cache_rows = await _read_from_supabase("playbypoint")
+                    _cache_rows, _ = await _stored_rows()
                     _row = next((r for r in _cache_rows
                                  if r.get("id") == facility_id), {})
                     _court_prices = _row.get("court_prices", {}) or {}
@@ -742,7 +797,7 @@ async def _get_pbp_availability(
 
 # ── Routes ──────────────────────────────────────────────────────────────────
 
-async def _warm_single_date(target, supabase_data=None):
+async def _warm_single_date(target, supabase_data=None, read_at=None):
     """Pre-fill the in-memory cache for one date FROM STORED DATA.
 
     R0(a), 17 Sep 2026. This used to call PlayByPoint live for every venue
@@ -762,12 +817,12 @@ async def _warm_single_date(target, supabase_data=None):
     in place, unused, so this can be reverted by restoring this function alone.
     """
     date_str = target.isoformat()
-    cache_key = f"availability:{date_str}:00:00:23:30:all"
+    cache_key = f"availability:{date_str}:all"
     if _cache_get(cache_key):
         return
     try:
         if supabase_data is None:
-            supabase_data = await _read_from_supabase("playbypoint")
+            supabase_data, read_at = await _stored_rows()
         if not supabase_data:
             # A failed or empty read is not an empty catalogue. Caching it
             # would show a blank week for five minutes; leave the cache alone
@@ -782,7 +837,7 @@ async def _warm_single_date(target, supabase_data=None):
             filtered_sessions = r.get("sessions", [])
             output.append({"id": vid, "name": r.get("name"), "slug": r.get("slug"), "platform": "playbypoint", "court_blocks": court_blocks_by_id.get(vid, []), "sessions": filtered_sessions, "error": None})
         response = {"date": date_str, "from": "00:00", "to": "23:30", "venues": output, "total_court_blocks": sum(len(v["court_blocks"]) for v in output), "total_sessions": sum(len(v["sessions"]) for v in output), "source": "live", "cached_count": len(output)}
-        _cache_set(cache_key, response)
+        _cache_set(cache_key, response, born=read_at)
         logger.info(f"Cache warmed for {date_str}: {response['total_court_blocks']} blocks, {response['total_sessions']} sessions")
     except Exception as e:
         logger.error(f"Warm error for {target}: {e}")
@@ -794,9 +849,9 @@ async def _warm_cache():
     targets = [date_type.fromordinal(date_type.today().toordinal() + i) for i in range(7)]
     # One stored read per cycle, not one per date: every date is built from the
     # same rows. Read here rather than per date so a cycle is consistent.
-    supabase_data = await _read_from_supabase("playbypoint")
+    supabase_data, read_at = await _stored_rows(fresh=True)
     for t in targets:
-        await _warm_single_date(t, supabase_data)
+        await _warm_single_date(t, supabase_data, read_at)
         await asyncio.sleep(3)
 
 async def _cache_refresh_loop():
@@ -875,7 +930,7 @@ async def refresh_cookies(req: RefreshCookiesRequest):
 
 async def pbp_venues():
     """List all saved PBP venues from Supabase cache."""
-    cached = await _read_from_supabase("playbypoint")
+    cached, _ = await _stored_rows()
     venues = [
         {"id": r["id"], "name": r["name"], "slug": r["slug"], "platform": "playbypoint"}
         for r in cached if r.get("id")
@@ -1010,11 +1065,17 @@ async def pbp_availability(
     to_sec = _hhmm_to_sec(to_time)
 
     ids_filter = {int(i.strip()) for i in venue_ids.split(",")} if venue_ids else None
-    cache_key = f"availability:{date_str}:{from_time}:{to_time}:{venue_ids or 'all'}"
+    # Pack 5: the key is the date and the venues, nothing else. from/to filter
+    # nothing in this response, so keying on them stored identical copies and
+    # made a full read for each window. Venue ids sorted so "1,2" and "2,1"
+    # share an entry. The reply still echoes the window it was asked for.
+    venues_key = ",".join(str(i) for i in sorted(ids_filter)) if ids_filter else "all"
+    cache_key = f"availability:{date_str}:{venues_key}"
 
     # Check in-memory cache first
     cached_result = _cache_get(cache_key)
     if cached_result:
+        cached_result = {**cached_result, "from": from_time, "to": to_time}
         # AFTER the cache read, never before: the cache key has no user in
         # it, so personalising anything that gets stored would serve one
         # member's price to everyone.
@@ -1028,8 +1089,8 @@ async def pbp_availability(
     # Read court blocks from Supabase by_date (populated by GitHub Actions)
     court_blocks_by_id = {}
 
-    # Fetch sessions from Supabase cache
-    supabase_data = await _read_from_supabase("playbypoint")
+    # Fetch sessions from Supabase cache (the shared copy, Pack 5)
+    supabase_data, read_at = await _stored_rows()
     for r in supabase_data:
         vid = r.get("id")
         by_date_data = r.get("by_date", {})
@@ -1064,7 +1125,7 @@ async def pbp_availability(
         "cached_count": len(output),
     }
 
-    _cache_set(cache_key, response)
+    _cache_set(cache_key, response, born=read_at)
     # Personalise only the copy being returned. The object handed to
     # _cache_set above stays public.
     result = await _personalise_prices(response, pm_user_id)
@@ -1087,7 +1148,8 @@ async def pbp_single_venue(
     from_sec = _hhmm_to_sec(from_time)
     to_sec = _hhmm_to_sec(to_time)
 
-    cached = await _read_from_supabase("playbypoint")
+    # Pack 5: the shared copy, not a full table download per venue page.
+    cached, _ = await _stored_rows()
     for r in cached:
         if r.get("id") == facility_id:
             by_date = r.get("by_date", {})
@@ -1684,7 +1746,7 @@ async def live_courts(
             # Get prices from cache -- keyed by court_id + REAL PBP shift, same
             # scheme fetch_court_blocks.py now uses.
             try:
-                supabase_data = await _read_from_supabase("playbypoint")
+                supabase_data, _ = await _stored_rows()
                 cached = next((r for r in supabase_data if r.get("id") == facility_id), {})
                 court_prices = cached.get("court_prices", {})
                 for block in blocks:
