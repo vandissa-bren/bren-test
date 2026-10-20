@@ -438,13 +438,31 @@ async def main():
         "Content-Type": "application/json",
     }
 
-    async with httpx.AsyncClient() as client:
+    # Pack 5, 20 Oct 2026: only the court fields this job uses. It used to
+    # download every venue's whole `data` -- sessions and rosters included,
+    # about 1.4 MB -- on every run, several times an hour, to read these.
+    # Rebuilt into the {"id", "data": {...}} shape the rest of this file uses.
+    async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.get(
             f"{SUPABASE_URL}/rest/v1/availability_cache",
-            params={"platform": "eq.playbypoint", "select": "id,data"},
+            params={"platform": "eq.playbypoint",
+                    "select": "id,fid:data->id,name:data->name,"
+                              "court_prices:data->court_prices,"
+                              "court_prices_fetched_at:data->court_prices_fetched_at,"
+                              "by_date:data->by_date"},
             headers=headers,
         )
-        records = resp.json()
+        if resp.status_code != 200:
+            # Without the stored prices every court would be re-priced, and
+            # the status counts would start from nothing. Stop instead.
+            raise SystemExit(f"Supabase read failed ({resp.status_code}): {resp.text[:200]}")
+        records = [{"id": row["id"],
+                    "data": {"id": row.get("fid"),
+                             "name": row.get("name") or row["id"],
+                             "court_prices": row.get("court_prices") or {},
+                             "court_prices_fetched_at": row.get("court_prices_fetched_at") or {},
+                             "by_date": row.get("by_date") or {}}}
+                   for row in resp.json()]
 
     records_by_fid = {}
     for record in records:
