@@ -12,6 +12,10 @@ Run at the end of push_to_supabase.py's nightly run (read_league_rosters).
    to league_roster_ingest, one division at a time. A night that can't be read
    is sent as "not read" (users null), so what we had for it is kept; the
    database also holds back a list that comes back empty or sharply shorter.
+2b. Does the same for claimed tournament divisions (28 Oct 2026):
+   tournament_rosters_to_read gives each division's PlayByPoint session(s),
+   whose player lists go to tournament_roster_ingest. A tournament problem is
+   printed and skipped; league rosters and ratings carry on.
 3. Asks which roster players are due a ratings read (pbp_people_due_ratings:
    never read, or not in the last 20 hours) and reads each one's ratings from
    PlayByPoint (signed in), then saves them with pbp_ratings_ingest. Only
@@ -105,6 +109,37 @@ async def _save_ratings(client, rows) -> int:
         return 0
 
 
+async def read_tournament_rosters(client, api) -> None:
+    """Tournament divisions' entrant lists (tournaments phase 2a). Never raises."""
+    try:
+        todo = await _rpc(client, "tournament_rosters_to_read", {})
+    except Exception as e:
+        console.print(f"  [yellow]Tournament rosters skipped: {e}[/yellow]")
+        return
+    done = added = missing = held = failed = 0
+    for div in todo or []:
+        reads = []
+        for l in div.get("lessons") or []:
+            users = await read_night(api, l.get("lesson_id"))
+            reads.append({"lesson_id": l.get("lesson_id"), "users": users})
+            await asyncio.sleep(PAUSE)
+        if not reads:
+            continue
+        try:
+            res = await _rpc(client, "tournament_roster_ingest",
+                             {"p_division": div["division_id"], "p_reads": reads})
+            done += 1
+            added += res.get("added", 0)
+            missing += res.get("missing", 0)
+            held += res.get("held", 0)
+            failed += res.get("failed", 0)
+        except Exception as e:
+            console.print(f"  [yellow]Tournament roster {div.get('program_slug')} not saved: {e}[/yellow]")
+    console.print(f"  Tournament rosters: {done} of {len(todo or [])} divisions read · {added} added"
+                  f" · {missing} now missing" + (f" · {held} held back" if held else "")
+                  + (f" · {failed} unreadable" if failed else ""))
+
+
 async def read_league_rosters(cookies: dict, user_id: int, api_factory, slug: str) -> None:
     """The whole job. `api_factory(cookies, slug)` returns an async context
     manager giving a signed-in PlayByPoint client (PlayByPointAPI)."""
@@ -140,6 +175,10 @@ async def read_league_rosters(cookies: dict, user_id: int, api_factory, slug: st
                 console.print(f"  League rosters: {done} of {len(todo or [])} divisions read · {added} added"
                               f" · {missing} now missing" + (f" · {held} nights held back" if held else "")
                               + (f" · {failed} nights unreadable" if failed else ""))
+
+                # 2b. tournament divisions, before ratings so their entrants
+                # are read for ratings tonight
+                await read_tournament_rosters(client, api)
 
                 # 3. ratings
                 due = await _rpc(client, "pbp_people_due_ratings", {"p_limit": RATINGS_PER_RUN})
