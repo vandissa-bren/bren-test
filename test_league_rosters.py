@@ -38,7 +38,7 @@ class FakeAPI:
         return {"ratings": v, "rpr_linked": True}
 
 
-def run(api, todo, due, fail_rpc=()):
+def run(api, todo, due, fail_rpc=(), ttodo=()):
     """Run the job against a fake Supabase; returns the RPC bodies sent."""
     sent = []
 
@@ -52,6 +52,10 @@ def run(api, todo, due, fail_rpc=()):
             return httpx.Response(200, json=todo)
         if name == "league_roster_ingest":
             return httpx.Response(200, json={"applied": 3, "held": 0, "failed": 0, "added": 2, "missing": 0})
+        if name == "tournament_rosters_to_read":
+            return httpx.Response(200, json=list(ttodo))
+        if name == "tournament_roster_ingest":
+            return httpx.Response(200, json={"applied": True, "held": 0, "failed": 0, "added": 4, "missing": 0})
         if name == "pbp_people_due_ratings":
             return httpx.Response(200, json=[{"pbp_user_id": u} for u in due])
         if name == "pbp_ratings_ingest":
@@ -128,6 +132,34 @@ def test_a_failed_ingest_does_not_stop_ratings():
     api = FakeAPI({11: [U(1)], 12: [U(1)], 13: [U(1)]}, {1: []})
     sent = run(api, TODO, [1], fail_rpc=("league_roster_ingest",))
     assert any(n == "pbp_ratings_ingest" for n, _ in sent)
+
+
+TTODO = [{"division_id": "t1", "program_slug": "tour-mens",
+          "lessons": [{"lesson_id": 21, "date": "2026-12-12"}]},
+         {"division_id": "t2", "program_slug": "tour-empty", "lessons": []}]
+
+
+def test_tournament_divisions_read_and_sent():
+    api = FakeAPI({21: [U(5), U(6)]}, {})
+    sent = run(api, [], [], ttodo=TTODO)
+    ing = [b for n, b in sent if n == "tournament_roster_ingest"]
+    assert len(ing) == 1 and ing[0]["p_division"] == "t1"      # a division with no session is skipped
+    assert ing[0]["p_reads"] == [{"lesson_id": 21, "users": [
+        {"id": 5, "name": "Player 5", "name_initials": "P", "avatar": "", "is_child": False},
+        {"id": 6, "name": "Player 6", "name_initials": "P", "avatar": "", "is_child": False}]}]
+
+
+def test_tournament_failed_read_sent_as_not_read():
+    api = FakeAPI({21: Exception}, {})
+    ing = [b for n, b in run(api, [], [], ttodo=TTODO) if n == "tournament_roster_ingest"]
+    assert ing[0]["p_reads"][0]["users"] is None
+
+
+def test_tournament_trouble_does_not_stop_ratings():
+    api = FakeAPI({21: [U(5)]}, {9: []})
+    for fail in ("tournament_rosters_to_read", "tournament_roster_ingest"):
+        sent = run(api, [], [9], fail_rpc=(fail,), ttodo=TTODO)
+        assert any(n == "pbp_ratings_ingest" for n, _ in sent), fail
 
 
 def test_supabase_down_never_raises():
