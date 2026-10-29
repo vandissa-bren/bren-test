@@ -148,7 +148,13 @@ async def read_league_rosters(cookies: dict, user_id: int, api_factory, slug: st
         return
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
-            todo = await _rpc(client, "league_rosters_to_read", {})
+            # 28 Oct 2026: a failed league list no longer stops the
+            # tournament read and the ratings behind it
+            try:
+                todo = await _rpc(client, "league_rosters_to_read", {})
+            except Exception as e:
+                console.print(f"  [yellow]League rosters skipped: {type(e).__name__}: {e}[/yellow]")
+                todo = []
             due_first = None
             async with api_factory(cookies, slug) as api:
                 api._user_id = user_id
