@@ -165,7 +165,10 @@ def test_tournament_trouble_does_not_stop_ratings():
 def test_supabase_down_never_raises():
     api = FakeAPI({}, {})
     sent = run(api, TODO, [], fail_rpc=("league_rosters_to_read",))
-    assert [n for n, _ in sent] == ["league_rosters_to_read"]   # stopped quietly
+    names = [n for n, _ in sent]
+    # 28 Oct 2026: no league list, but the tournament read and ratings still run
+    assert names[0] == "league_rosters_to_read" and "league_roster_ingest" not in names
+    assert "tournament_rosters_to_read" in names and "pbp_people_due_ratings" in names
     assert api.calls == []
 
 
