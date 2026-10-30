@@ -73,16 +73,10 @@ def _cache_get(key: str):
         return entry["data"]
     return None
 
-def _cache_set(key: str, data, born: Optional[float] = None):
-    """`born` is when the stored rows behind `data` were read (Pack 5). The
-    entry expires CACHE_TTL after THAT, not after now, so a response built
-    from rows that are already a minute old is not kept a full five minutes
-    more: nothing is ever served more than CACHE_TTL behind the database,
-    the same limit as before the shared rows existed."""
-    start = born if born is not None else datetime.utcnow().timestamp()
+def _cache_set(key: str, data):
     _availability_cache[key] = {
         "data": data,
-        "expires": start + CACHE_TTL,
+        "expires": datetime.utcnow().timestamp() + CACHE_TTL,
     }
 
 
@@ -357,56 +351,7 @@ async def _read_from_supabase(platform: str, attempts: int = 3) -> list[dict]:
     logger.error(f"Supabase read error after {attempts} attempts ({why}) — "
                  + (f"serving the last good copy ({len(fallback)} venues)" if fallback
                     else "and there is no earlier copy to serve"))
-    _read_failed[platform] = True
     return fallback
-
-
-# ── One shared copy of the stored rows (Pack 5, 20 Oct 2026) ─────────────────
-# availability_cache was the busiest read on the database: 233k reads, 4.7
-# hours. Every caller above fetched the WHOLE table (every venue's JSON,
-# ~1.4 MB) for itself -- once per uncached date, once per time window (the
-# window was in the cache key but filters nothing), on every single-venue
-# page, and once per live court lookup just to read one venue's prices. Ten
-# players arriving as a key expired meant ten full downloads at once.
-#
-# Now every caller asks _stored_rows. It keeps the last read for ROWS_TTL
-# seconds, and callers that arrive while a read is under way wait for that
-# read instead of starting their own. The rows are shared and read-only:
-# every caller builds new dicts from them and never edits them in place.
-#
-# A failed read (the last-good fallback was served) is kept only briefly, so
-# the next attempt comes soon but an outage is not hammered by every request.
-ROWS_TTL = 90
-ROWS_FAILED_TTL = 15
-_rows_memo: dict[str, tuple[float, float, list]] = {}   # platform -> (expires, read_at, rows)
-_rows_inflight: dict[str, "asyncio.Future"] = {}
-_read_failed: dict[str, bool] = {}
-
-
-async def _load_rows(platform: str) -> tuple[list, float]:
-    _read_failed[platform] = False
-    read_at = _time.time()
-    rows = await _read_from_supabase(platform)
-    ttl = ROWS_FAILED_TTL if _read_failed.get(platform) else ROWS_TTL
-    _rows_memo[platform] = (_time.time() + ttl, read_at, rows)
-    return rows, read_at
-
-
-async def _stored_rows(platform: str = "playbypoint", *, fresh: bool = False) -> tuple[list, float]:
-    """(rows, read_at): the stored availability rows and when they were read.
-    `fresh` skips the kept copy (the warm loop uses it), but still joins a
-    read already under way."""
-    hit = _rows_memo.get(platform)
-    if hit and not fresh and hit[0] > _time.time():
-        return hit[2], hit[1]
-    fut = _rows_inflight.get(platform)
-    if fut is None:
-        fut = asyncio.ensure_future(_load_rows(platform))
-        _rows_inflight[platform] = fut
-        fut.add_done_callback(lambda _f: _rows_inflight.pop(platform, None))
-    # shield: a caller that disconnects must not cancel the read others wait on
-    return await asyncio.shield(fut)
-
 
 # ── Slug map for saved venues ───────────────────────────────────────────────
 # In-memory cache for live court fetches (facility_id+date -> {blocks, expires})
@@ -705,7 +650,7 @@ async def _get_pbp_availability(
                 # unpriced -- an absent price is recoverable, a confidently
                 # wrong one is not.
                 try:
-                    _cache_rows, _ = await _stored_rows()
+                    _cache_rows = await _read_from_supabase("playbypoint")
                     _row = next((r for r in _cache_rows
                                  if r.get("id") == facility_id), {})
                     _court_prices = _row.get("court_prices", {}) or {}
@@ -797,7 +742,7 @@ async def _get_pbp_availability(
 
 # ── Routes ──────────────────────────────────────────────────────────────────
 
-async def _warm_single_date(target, supabase_data=None, read_at=None):
+async def _warm_single_date(target, supabase_data=None):
     """Pre-fill the in-memory cache for one date FROM STORED DATA.
 
     R0(a), 17 Sep 2026. This used to call PlayByPoint live for every venue
@@ -817,12 +762,12 @@ async def _warm_single_date(target, supabase_data=None, read_at=None):
     in place, unused, so this can be reverted by restoring this function alone.
     """
     date_str = target.isoformat()
-    cache_key = f"availability:{date_str}:all"
+    cache_key = f"availability:{date_str}:00:00:23:30:all"
     if _cache_get(cache_key):
         return
     try:
         if supabase_data is None:
-            supabase_data, read_at = await _stored_rows()
+            supabase_data = await _read_from_supabase("playbypoint")
         if not supabase_data:
             # A failed or empty read is not an empty catalogue. Caching it
             # would show a blank week for five minutes; leave the cache alone
@@ -837,7 +782,7 @@ async def _warm_single_date(target, supabase_data=None, read_at=None):
             filtered_sessions = r.get("sessions", [])
             output.append({"id": vid, "name": r.get("name"), "slug": r.get("slug"), "platform": "playbypoint", "court_blocks": court_blocks_by_id.get(vid, []), "sessions": filtered_sessions, "error": None})
         response = {"date": date_str, "from": "00:00", "to": "23:30", "venues": output, "total_court_blocks": sum(len(v["court_blocks"]) for v in output), "total_sessions": sum(len(v["sessions"]) for v in output), "source": "live", "cached_count": len(output)}
-        _cache_set(cache_key, response, born=read_at)
+        _cache_set(cache_key, response)
         logger.info(f"Cache warmed for {date_str}: {response['total_court_blocks']} blocks, {response['total_sessions']} sessions")
     except Exception as e:
         logger.error(f"Warm error for {target}: {e}")
@@ -849,9 +794,9 @@ async def _warm_cache():
     targets = [date_type.fromordinal(date_type.today().toordinal() + i) for i in range(7)]
     # One stored read per cycle, not one per date: every date is built from the
     # same rows. Read here rather than per date so a cycle is consistent.
-    supabase_data, read_at = await _stored_rows(fresh=True)
+    supabase_data = await _read_from_supabase("playbypoint")
     for t in targets:
-        await _warm_single_date(t, supabase_data, read_at)
+        await _warm_single_date(t, supabase_data)
         await asyncio.sleep(3)
 
 async def _cache_refresh_loop():
@@ -930,7 +875,7 @@ async def refresh_cookies(req: RefreshCookiesRequest):
 
 async def pbp_venues():
     """List all saved PBP venues from Supabase cache."""
-    cached, _ = await _stored_rows()
+    cached = await _read_from_supabase("playbypoint")
     venues = [
         {"id": r["id"], "name": r["name"], "slug": r["slug"], "platform": "playbypoint"}
         for r in cached if r.get("id")
@@ -1065,17 +1010,11 @@ async def pbp_availability(
     to_sec = _hhmm_to_sec(to_time)
 
     ids_filter = {int(i.strip()) for i in venue_ids.split(",")} if venue_ids else None
-    # Pack 5: the key is the date and the venues, nothing else. from/to filter
-    # nothing in this response, so keying on them stored identical copies and
-    # made a full read for each window. Venue ids sorted so "1,2" and "2,1"
-    # share an entry. The reply still echoes the window it was asked for.
-    venues_key = ",".join(str(i) for i in sorted(ids_filter)) if ids_filter else "all"
-    cache_key = f"availability:{date_str}:{venues_key}"
+    cache_key = f"availability:{date_str}:{from_time}:{to_time}:{venue_ids or 'all'}"
 
     # Check in-memory cache first
     cached_result = _cache_get(cache_key)
     if cached_result:
-        cached_result = {**cached_result, "from": from_time, "to": to_time}
         # AFTER the cache read, never before: the cache key has no user in
         # it, so personalising anything that gets stored would serve one
         # member's price to everyone.
@@ -1089,8 +1028,8 @@ async def pbp_availability(
     # Read court blocks from Supabase by_date (populated by GitHub Actions)
     court_blocks_by_id = {}
 
-    # Fetch sessions from Supabase cache (the shared copy, Pack 5)
-    supabase_data, read_at = await _stored_rows()
+    # Fetch sessions from Supabase cache
+    supabase_data = await _read_from_supabase("playbypoint")
     for r in supabase_data:
         vid = r.get("id")
         by_date_data = r.get("by_date", {})
@@ -1125,7 +1064,7 @@ async def pbp_availability(
         "cached_count": len(output),
     }
 
-    _cache_set(cache_key, response, born=read_at)
+    _cache_set(cache_key, response)
     # Personalise only the copy being returned. The object handed to
     # _cache_set above stays public.
     result = await _personalise_prices(response, pm_user_id)
@@ -1148,8 +1087,7 @@ async def pbp_single_venue(
     from_sec = _hhmm_to_sec(from_time)
     to_sec = _hhmm_to_sec(to_time)
 
-    # Pack 5: the shared copy, not a full table download per venue page.
-    cached, _ = await _stored_rows()
+    cached = await _read_from_supabase("playbypoint")
     for r in cached:
         if r.get("id") == facility_id:
             by_date = r.get("by_date", {})
@@ -1746,7 +1684,7 @@ async def live_courts(
             # Get prices from cache -- keyed by court_id + REAL PBP shift, same
             # scheme fetch_court_blocks.py now uses.
             try:
-                supabase_data, _ = await _stored_rows()
+                supabase_data = await _read_from_supabase("playbypoint")
                 cached = next((r for r in supabase_data if r.get("id") == facility_id), {})
                 court_prices = cached.get("court_prices", {})
                 for block in blocks:
@@ -2109,6 +2047,170 @@ async def create_payment_intent(req: PaymentIntentRequest, authorization: Option
         # `paid` from this result. Told, rather than left to guess.
         "capture_method": capture_method,
     }
+
+class TournamentIntentRequest(BaseModel):
+    division_id: str
+    # enter | accept (a partner invite, by token) | spot (a waitlist offer)
+    purpose: str = "enter"
+    token: Optional[str] = None
+    # what the entry will be, so every refusal comes before the charge
+    gender: Optional[str] = None
+    with_partner: bool = False
+
+
+class TournamentConfirmRequest(BaseModel):
+    payment_intent_id: str
+
+
+_REFUSAL_WORDS = {
+    "sign_in": "Please sign in again to pay.",
+    "not_open": "Entries aren't open for this division.",
+    "closed": "Entries have closed.",
+    "own_tournament": "You're running this tournament.",
+    "already_in": "You're already in this division.",
+    "invited": "You've been invited to this division. Answer the invite instead.",
+    "early_access": "Entries are open to the host's group first.",
+    "outside_level": "Your DUPR is outside this division's level.",
+    "full": "This division is full.",
+    "invite_gone": "That invite isn't open any more.",
+    "no_offer": "That spot isn't being offered to you any more.",
+    "not_found": "That division doesn't exist.",
+    "not_for_you": "That invite is for someone else.",
+    "gender_needed": "Say whether you play as a woman or a man.",
+    "bad_gender": "Say whether you play as a woman or a man.",
+    "partner_needed": "This tournament needs you to enter with a partner.",
+    "mixed_needs_both": "A mixed pair is a woman and a man.",
+}
+
+
+@app.post("/api/tournament/payment_intent")
+async def create_tournament_intent(req: TournamentIntentRequest, authorization: Optional[str] = Header(None)):
+    """The entry fee for a host's tournament (20261221100000_host_tournaments.sql).
+
+    THE DATABASE DECIDES, as for sessions: tournament_entry_quote says whether
+    this person may enter now, the fee, and whose account it goes to. The
+    PaymentIntent is a direct charge on the host's connected account, taken at
+    once (a place is the player's as soon as they enter), and recorded in
+    payment_intents_issued with session_id 'tournament:<division>'. Entering
+    (tournament_enter / tournament_invite_answer / tournament_take_spot)
+    checks that record. Refunds go through the refunds ledger, which
+    settle_refunds.py pays: nothing here refunds."""
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(status_code=500, detail="Stripe not configured")
+    caller = await _caller_id(authorization)
+    if not caller:
+        raise HTTPException(status_code=401, detail="Please sign in again to pay.")
+    division = _user_id_ok(req.division_id)   # a uuid
+    purpose = (req.purpose or "enter").strip().lower()
+    if purpose not in ("enter", "accept", "spot"):
+        purpose = "enter"
+    token = (req.token or "")[:40] or None
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.post(
+            f"{SUPABASE_URL}/rest/v1/rpc/tournament_entry_quote",
+            headers={**_svc_headers(), "Content-Type": "application/json"},
+            json={"p_division": division, "p_user": caller, "p_purpose": purpose, "p_token": token,
+                  "p_gender": (req.gender or None) if (req.gender or "") in ("w", "m") else None,
+                  "p_with_partner": bool(req.with_partner)},
+        )
+    if r.status_code >= 300:
+        raise HTTPException(status_code=502, detail="Couldn't check the entry. Try again in a moment.")
+    quote = r.json() or {}
+    refusal = quote.get("refusal")
+    if refusal:
+        raise HTTPException(status_code=409, detail=_REFUSAL_WORDS.get(refusal, "You can't enter right now."))
+    amount = int(quote.get("fee_cents") or 0)
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="This tournament is free.")
+
+    account_id = await _stripe_account_for({"user_id": quote.get("host_id")})
+    metadata = {"tournament_division_id": division, "player_user_id": caller,
+                "host_user_id": quote.get("host_id"), "purpose": purpose}
+    kwargs = dict(amount=amount, currency="aud", description=(quote.get("description") or "PickleMatch tournament")[:200],
+                  metadata=metadata, capture_method="automatic")
+    if account_id:
+        kwargs["stripe_account"] = account_id
+    intent = stripe.PaymentIntent.create(**kwargs)
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        w = await client.post(
+            f"{SUPABASE_URL}/rest/v1/payment_intents_issued",
+            headers={**_svc_headers(), "Content-Type": "application/json", "Prefer": "return=minimal"},
+            json={"intent_id": intent.id, "session_id": f"tournament:{division}", "user_id": caller,
+                  "amount_cents": amount, "capture_method": "automatic", "purpose": f"tournament_{purpose}",
+                  "host_id": quote.get("host_id")},
+        )
+    if w.status_code >= 300:
+        try:
+            if account_id:
+                stripe.PaymentIntent.cancel(intent.id, stripe_account=account_id)
+            else:
+                stripe.PaymentIntent.cancel(intent.id)
+        except stripe.error.StripeError:
+            pass
+        logging.error("payment_intents_issued write failed (tournament): %s", w.text[:200])
+        raise HTTPException(status_code=500, detail="Couldn't start the payment. Please try again.")
+
+    return {"client_secret": intent.client_secret, "payment_intent_id": intent.id,
+            "account_id": account_id, "capture_method": "automatic", "amount": amount}
+
+
+@app.post("/api/tournament/payment_confirm")
+async def confirm_tournament_payment(req: TournamentConfirmRequest, authorization: Optional[str] = Header(None)):
+    """After the card goes through, before entering: is the money really taken?
+
+    The app calls this once Stripe has confirmed the payment, then enters
+    (tournament_enter / tournament_invite_answer / tournament_take_spot with
+    the intent). Entering only accepts an intent stamped here, so an intent
+    that was made but never paid can't buy a place. Asked of Stripe on the
+    host's account, never taken from the app's word.
+
+    Stamped and then refused, or stamped and never used: the database puts
+    the full amount in the refunds ledger (20261221100000_host_tournaments.sql).
+    """
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(status_code=500, detail="Stripe not configured")
+    caller = await _caller_id(authorization)
+    if not caller:
+        raise HTTPException(status_code=401, detail="Please sign in again.")
+    intent_id = (req.payment_intent_id or "").strip()
+    if not re.fullmatch(r"pi_[A-Za-z0-9]{8,64}", intent_id):
+        raise HTTPException(status_code=400, detail="That isn't a payment reference.")
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.get(
+            f"{SUPABASE_URL}/rest/v1/payment_intents_issued?intent_id=eq.{intent_id}"
+            f"&select=intent_id,session_id,user_id,amount_cents,host_id,succeeded_at",
+            headers=_svc_headers(),
+        )
+    rows = r.json() if r.status_code == 200 else []
+    row = rows[0] if rows else None
+    if not row or row.get("user_id") != caller or not str(row.get("session_id", "")).startswith("tournament:"):
+        raise HTTPException(status_code=404, detail="That payment isn't yours.")
+    if row.get("succeeded_at"):
+        return {"ok": True}
+
+    account_id = await _stripe_account_for({"user_id": row.get("host_id")}) if row.get("host_id") else None
+    try:
+        intent = (stripe.PaymentIntent.retrieve(intent_id, stripe_account=account_id) if account_id
+                  else stripe.PaymentIntent.retrieve(intent_id))
+    except stripe.error.StripeError:
+        raise HTTPException(status_code=502, detail="Couldn't check the payment with Stripe. Try again in a moment.")
+    if intent.status != "succeeded" or int(intent.amount_received or 0) < int(row.get("amount_cents") or 0):
+        raise HTTPException(status_code=402, detail="The payment hasn't gone through, so you're not entered.")
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        w = await client.patch(
+            f"{SUPABASE_URL}/rest/v1/payment_intents_issued?intent_id=eq.{intent_id}&succeeded_at=is.null",
+            headers={**_svc_headers(), "Content-Type": "application/json", "Prefer": "return=minimal"},
+            json={"succeeded_at": datetime.utcnow().isoformat() + "Z"},
+        )
+    if w.status_code >= 300:
+        logging.error("payment_intents_issued confirm failed (tournament): %s", w.text[:200])
+        raise HTTPException(status_code=500, detail="Couldn't record the payment. Try again in a moment.")
+    return {"ok": True}
+
 
 async def _connected_account_for_session(session_id: str, svc_headers: dict) -> str:
     """The host's Stripe account for a session.
