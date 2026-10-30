@@ -61,22 +61,16 @@ def load_cookies():
 
 
 async def read_catalogue(client) -> list[dict]:
-    """The stored PBP catalogue: one row per venue, each with its sessions.
-
-    Pack 5, 20 Oct 2026: asks for `sessions` only. It used to download every
-    venue's whole `data` (court days, prices, far rosters) each run and use
-    none of it. The rows keep the {"sessions": [...]} shape the rest of this
-    file reads."""
+    """The stored PBP catalogue: one row per venue, each with its sessions."""
     r = await client.get(
         f"{SUPABASE_URL}/rest/v1/availability_cache",
-        params={"select": "id,sessions:data->sessions", "platform": "eq.playbypoint"},
+        params={"select": "id,data", "platform": "eq.playbypoint"},
         headers=supabase_headers(),
     )
     if r.status_code != 200:
         print(f"  CATALOGUE READ FAILED: HTTP {r.status_code} {r.text[:200]}")
         return []
-    return [(row["id"], {"sessions": row.get("sessions") or []})
-            for row in r.json() if row.get("sessions") is not None]
+    return [(row["id"], row["data"]) for row in r.json() if row.get("data")]
 
 
 def collect_target_sessions(catalogue: list[dict]) -> list[dict]:
@@ -126,7 +120,9 @@ async def fetch_roster(api, lesson_id) -> list[dict] | None:
         return None
     return [
         {"id": u.get("id"), "name": u.get("name"),
-         "initials": u.get("name_initials"), "rating": u.get("rating")}
+         "initials": u.get("name_initials"), "rating": u.get("rating"),
+         # kept for the claimed tournaments' and leagues' lists (take_in_claimed)
+         "avatar": u.get("avatar") or "", "is_child": u.get("is_child") is True}
         for u in (rd or {}).get("users", [])
         if u.get("id") is not None
     ]
@@ -156,6 +152,70 @@ async def read_waitlists(api, slugs) -> tuple[dict, int]:
     return out, failed
 
 
+async def _rpc(client, name: str, body: dict):
+    r = await client.post(f"{SUPABASE_URL}/rest/v1/rpc/{name}", headers=supabase_headers(), json=body)
+    if r.status_code != 200:
+        raise RuntimeError(f"{name}: HTTP {r.status_code} {r.text[:160]}")
+    return r.json()
+
+
+def _ingest_users(players: list[dict]) -> list[dict]:
+    """A roster as the tournament and league ingests take it."""
+    return [{"id": p["id"], "name": p.get("name") or "", "name_initials": p.get("initials") or "",
+             "avatar": p.get("avatar") or "", "is_child": p.get("is_child") is True} for p in players]
+
+
+async def take_in_claimed(client, read: dict) -> None:
+    """Claimed tournament and league divisions take in the lists just read
+    (30 Oct 2026). Owner: "to pair players i have to click update from
+    playbypoint ... i dont want to have to click it everytime". The lists were
+    only taken in once a night (league_rosters.py), so a division set up
+    during the day sat empty until a coordinator pressed the button. This
+    run already reads every session in the next three weeks, hourly for
+    today and tomorrow, so it hands those lists on as well.
+
+    `read` is {lesson_id: players} for the sessions read OK this run. A
+    tournament division is only updated when ALL its sessions were read (the
+    ingest counts anyone not on the lists sent as gone). A league division
+    takes the nights that were read; its other nights keep what they had.
+    Never raises: the capture itself has already been saved."""
+    t_done = t_added = l_done = l_added = 0
+    try:
+        for div in await _rpc(client, "tournament_rosters_to_read", {}) or []:
+            lessons = [str(l.get("lesson_id")) for l in div.get("lessons") or []]
+            if not lessons or any(l not in read for l in lessons):
+                continue
+            try:
+                res = await _rpc(client, "tournament_roster_ingest", {
+                    "p_division": div["division_id"],
+                    "p_reads": [{"lesson_id": l, "users": _ingest_users(read[l])} for l in lessons]})
+                t_done += 1
+                t_added += res.get("added", 0)
+            except Exception as e:
+                print(f"  tournament {div.get('program_slug')}: not taken in ({e})")
+    except Exception as e:
+        print(f"  claimed tournaments skipped: {e}")
+    try:
+        for div in await _rpc(client, "league_rosters_to_read", {}) or []:
+            nights = [n for n in div.get("nights") or [] if str(n.get("lesson_id")) in read]
+            if not nights:
+                continue
+            try:
+                res = await _rpc(client, "league_roster_ingest", {
+                    "p_division": div["division_id"],
+                    "p_reads": [{"night_no": n.get("night_no"), "lesson_id": n.get("lesson_id"),
+                                 "night_date": n.get("night_date"),
+                                 "users": _ingest_users(read[str(n.get("lesson_id"))])} for n in nights]})
+                l_done += 1
+                l_added += res.get("added", 0)
+            except Exception as e:
+                print(f"  league {div.get('program_slug')}: not taken in ({e})")
+    except Exception as e:
+        print(f"  claimed leagues skipped: {e}")
+    print(f"Claimed lists: {t_done} tournament divisions ({t_added} new players), "
+          f"{l_done} league divisions ({l_added} new players)")
+
+
 async def main():
     if not SUPABASE_KEY:
         print("ERROR: no SUPABASE_KEY / SUPABASE_SERVICE_KEY in the environment")
@@ -173,6 +233,7 @@ async def main():
 
         run_at = datetime.now(timezone.utc).isoformat()
         observations, spot_updates, inv_observations, failures, empty, withppl = [], [], [], 0, 0, 0
+        read_ok = {}                              # lesson_id -> players, for take_in_claimed
         # One shared client session for all lesson_players calls.
         async with PlayByPointAPI(cookies=cookies, club_slug="thejar", **kw) as api:
             api._user_id = user_id
@@ -181,6 +242,7 @@ async def main():
                 if players is None:
                     failures += 1
                     continue                      # could-not-read: send nothing for it
+                read_ok[str(t["lesson_id"])] = players
                 if players:
                     withppl += 1
                 else:
@@ -274,6 +336,11 @@ async def main():
             else:
                 print(f"  RPC FAILED: HTTP {r.status_code} {r.text[:200]}")
                 sys.exit(1)
+
+        # Claimed tournaments and leagues take in these lists now, rather
+        # than waiting for the nightly read.
+        if read_ok and not os.environ.get("SKIP_CLAIMED"):
+            await take_in_claimed(client, read_ok)
 
         # Count write-back through the session-level merge (M2), so only the
         # named sessions' spots change -- never a whole-array overwrite (F30).
