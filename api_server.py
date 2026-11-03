@@ -2239,7 +2239,6 @@ _LEAGUE_REFUSAL_WORDS = {
     "team_full": "That team is full.",
     "bad_mode": "Pick how you're entering.",
     "partner_needed": "Pick your partner, or send them a link.",
-    "weekly_later": "Paying by the week isn't switched on yet. Pay for the season instead.",
 }
 
 
@@ -2321,6 +2320,222 @@ async def create_league_intent(req: LeagueIntentRequest, authorization: Optional
 async def confirm_league_payment(req: TournamentConfirmRequest, authorization: Optional[str] = Header(None)):
     """As /api/tournament/payment_confirm, for a league's season fee."""
     return await _confirm_entry_payment(req.payment_intent_id, authorization, "league:")
+
+
+class LeagueCardRequest(BaseModel):
+    division_id: str
+    purpose: str = "enter"            # enter | accept | spot
+    token: Optional[str] = None
+    gender: Optional[str] = None
+    mode: Optional[str] = None
+    partners: int = 0
+
+
+class LeagueCardConfirmRequest(BaseModel):
+    setup_intent_id: str
+
+
+class LeagueWeekIntentRequest(BaseModel):
+    charge_id: str
+    # PaySheet sends these too; unused here
+    division_id: Optional[str] = None
+    purpose: Optional[str] = None
+
+
+async def _league_customer(host_id: str, user_id: str, account_id: Optional[str]) -> str:
+    """The player's Stripe Customer on the host's account, made the first
+    time they save a card there (league_stripe_customers)."""
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.get(
+            f"{SUPABASE_URL}/rest/v1/league_stripe_customers?host_id=eq.{host_id}&user_id=eq.{user_id}&select=customer_id",
+            headers=_svc_headers(),
+        )
+    rows = r.json() if r.status_code == 200 else []
+    if rows:
+        return rows[0]["customer_id"]
+    kw = dict(metadata={"player_user_id": user_id, "host_user_id": host_id})
+    if account_id:
+        kw["stripe_account"] = account_id
+    customer = stripe.Customer.create(**kw)
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        w = await client.post(
+            f"{SUPABASE_URL}/rest/v1/league_stripe_customers",
+            headers={**_svc_headers(), "Content-Type": "application/json", "Prefer": "resolution=ignore-duplicates,return=minimal"},
+            json={"host_id": host_id, "user_id": user_id, "customer_id": customer.id},
+        )
+    if w.status_code >= 300:
+        logging.error("league_stripe_customers write failed: %s", w.text[:200])
+    return customer.id
+
+
+@app.post("/api/league/card/setup")
+async def create_league_card_setup(req: LeagueCardRequest, authorization: Optional[str] = Header(None)):
+    """Paying a host's league each week (20270106100000_host_league_weekly.sql).
+
+    The card is saved by Stripe, not PickleMatch: a SetupIntent for
+    off-session use, on the host's connected account, to the player's
+    Customer there. Recorded in league_cards; entering accepts it only once
+    /api/league/card/confirm has stamped it. charge_league_weeks.py charges
+    it the day before each week."""
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(status_code=500, detail="Stripe not configured")
+    caller = await _caller_id(authorization)
+    if not caller:
+        raise HTTPException(status_code=401, detail="Please sign in again to save your card.")
+    division = _user_id_ok(req.division_id)
+    purpose = (req.purpose or "enter").strip().lower()
+    if purpose not in ("enter", "accept", "spot"):
+        purpose = "enter"
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.post(
+            f"{SUPABASE_URL}/rest/v1/rpc/league_entry_quote",
+            headers={**_svc_headers(), "Content-Type": "application/json"},
+            json={"p_division": division, "p_user": caller, "p_purpose": purpose, "p_token": (req.token or "")[:40] or None,
+                  "p_gender": (req.gender or None) if (req.gender or "") in ("w", "m") else None,
+                  "p_mode": (req.mode or "alone").strip().lower()[:10],
+                  "p_partners": max(0, min(int(req.partners or 0), 6)), "p_pays": "night"},
+        )
+    if r.status_code >= 300:
+        raise HTTPException(status_code=502, detail="Couldn't check the entry. Try again in a moment.")
+    quote = r.json() or {}
+    if quote.get("refusal"):
+        raise HTTPException(status_code=409, detail=_LEAGUE_REFUSAL_WORDS.get(quote["refusal"], "You can't enter right now."))
+    if quote.get("pays") != "night" or int(quote.get("fee_cents") or 0) <= 0:
+        raise HTTPException(status_code=400, detail="This league isn't paid by the week.")
+
+    host_id = quote.get("host_id")
+    account_id = await _stripe_account_for({"user_id": host_id})
+    customer_id = await _league_customer(host_id, caller, account_id)
+    kw = dict(customer=customer_id, usage="off_session", payment_method_types=["card"],
+              description=(quote.get("description") or "PickleMatch league")[:200],
+              metadata={"league_division_id": division, "player_user_id": caller, "host_user_id": host_id, "purpose": purpose})
+    if account_id:
+        kw["stripe_account"] = account_id
+    setup = stripe.SetupIntent.create(**kw)
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        w = await client.post(
+            f"{SUPABASE_URL}/rest/v1/league_cards",
+            headers={**_svc_headers(), "Content-Type": "application/json", "Prefer": "return=minimal"},
+            json={"setup_intent_id": setup.id, "division_id": division, "user_id": caller, "host_id": host_id, "customer_id": customer_id},
+        )
+    if w.status_code >= 300:
+        try:
+            if account_id:
+                stripe.SetupIntent.cancel(setup.id, stripe_account=account_id)
+            else:
+                stripe.SetupIntent.cancel(setup.id)
+        except stripe.error.StripeError:
+            pass
+        logging.error("league_cards write failed: %s", w.text[:200])
+        raise HTTPException(status_code=500, detail="Couldn't start saving your card. Please try again.")
+    return {"client_secret": setup.client_secret, "setup_intent_id": setup.id, "account_id": account_id,
+            "amount": int(quote.get("fee_cents") or 0)}
+
+
+@app.post("/api/league/card/confirm")
+async def confirm_league_card(req: LeagueCardConfirmRequest, authorization: Optional[str] = Header(None)):
+    """After Stripe saves the card, before entering: is it really saved?
+    Asked of Stripe on the host's account; stamps succeeded_at and the
+    payment method in league_cards."""
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(status_code=500, detail="Stripe not configured")
+    caller = await _caller_id(authorization)
+    if not caller:
+        raise HTTPException(status_code=401, detail="Please sign in again.")
+    setup_id = (req.setup_intent_id or "").strip()
+    if not re.fullmatch(r"seti_[A-Za-z0-9]{8,64}", setup_id):
+        raise HTTPException(status_code=400, detail="That isn't a card reference.")
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.get(
+            f"{SUPABASE_URL}/rest/v1/league_cards?setup_intent_id=eq.{setup_id}&select=user_id,host_id,succeeded_at",
+            headers=_svc_headers(),
+        )
+    rows = r.json() if r.status_code == 200 else []
+    row = rows[0] if rows else None
+    if not row or row.get("user_id") != caller:
+        raise HTTPException(status_code=404, detail="That card isn't yours.")
+    if row.get("succeeded_at"):
+        return {"ok": True}
+    account_id = await _stripe_account_for({"user_id": row.get("host_id")})
+    try:
+        setup = (stripe.SetupIntent.retrieve(setup_id, stripe_account=account_id) if account_id
+                 else stripe.SetupIntent.retrieve(setup_id))
+    except stripe.error.StripeError:
+        raise HTTPException(status_code=502, detail="Couldn't check your card with Stripe. Try again in a moment.")
+    if setup.status != "succeeded" or not setup.payment_method:
+        raise HTTPException(status_code=402, detail="Your card wasn't saved, so you're not entered.")
+    pm = setup.payment_method if isinstance(setup.payment_method, str) else setup.payment_method.id
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        w = await client.patch(
+            f"{SUPABASE_URL}/rest/v1/league_cards?setup_intent_id=eq.{setup_id}&succeeded_at=is.null",
+            headers={**_svc_headers(), "Content-Type": "application/json", "Prefer": "return=minimal"},
+            json={"succeeded_at": datetime.utcnow().isoformat() + "Z", "payment_method_id": pm},
+        )
+    if w.status_code >= 300:
+        logging.error("league_cards confirm failed: %s", w.text[:200])
+        raise HTTPException(status_code=500, detail="Couldn't record your card. Try again in a moment.")
+    return {"ok": True}
+
+
+@app.post("/api/league/week/payment_intent")
+async def create_league_week_intent(req: LeagueWeekIntentRequest, authorization: Optional[str] = Header(None)):
+    """A week the saved card didn't pay (league_week_charges 'owed'), paid
+    in the app. As the season fee: league_week_quote, a direct charge on the
+    host's account, recorded as 'leagueweek:<charge>'; league_week_pay
+    accepts it once /api/league/week/payment_confirm has stamped it."""
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(status_code=500, detail="Stripe not configured")
+    caller = await _caller_id(authorization)
+    if not caller:
+        raise HTTPException(status_code=401, detail="Please sign in again to pay.")
+    charge = _user_id_ok(req.charge_id)
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.post(
+            f"{SUPABASE_URL}/rest/v1/rpc/league_week_quote",
+            headers={**_svc_headers(), "Content-Type": "application/json"},
+            json={"p_charge": charge, "p_user": caller},
+        )
+    if r.status_code >= 300:
+        raise HTTPException(status_code=502, detail="Couldn't check the week. Try again in a moment.")
+    quote = r.json() or {}
+    if quote.get("refusal"):
+        raise HTTPException(status_code=409, detail="That week is already paid." if quote["refusal"] == "not_owed" else "That week isn't yours to pay.")
+    amount = int(quote.get("fee_cents") or 0)
+    host_id = quote.get("host_id")
+    account_id = await _stripe_account_for({"user_id": host_id})
+    kw = dict(amount=amount, currency="aud", description=(quote.get("description") or "PickleMatch league")[:200],
+              metadata={"league_week_charge_id": charge, "player_user_id": caller, "host_user_id": host_id, "purpose": "week"},
+              capture_method="automatic")
+    if account_id:
+        kw["stripe_account"] = account_id
+    intent = stripe.PaymentIntent.create(**kw)
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        w = await client.post(
+            f"{SUPABASE_URL}/rest/v1/payment_intents_issued",
+            headers={**_svc_headers(), "Content-Type": "application/json", "Prefer": "return=minimal"},
+            json={"intent_id": intent.id, "session_id": f"leagueweek:{charge}", "user_id": caller,
+                  "amount_cents": amount, "capture_method": "automatic", "purpose": "league_week", "host_id": host_id},
+        )
+    if w.status_code >= 300:
+        try:
+            if account_id:
+                stripe.PaymentIntent.cancel(intent.id, stripe_account=account_id)
+            else:
+                stripe.PaymentIntent.cancel(intent.id)
+        except stripe.error.StripeError:
+            pass
+        logging.error("payment_intents_issued write failed (league week): %s", w.text[:200])
+        raise HTTPException(status_code=500, detail="Couldn't start the payment. Please try again.")
+    return {"client_secret": intent.client_secret, "payment_intent_id": intent.id,
+            "account_id": account_id, "capture_method": "automatic", "amount": amount}
+
+
+@app.post("/api/league/week/payment_confirm")
+async def confirm_league_week_payment(req: TournamentConfirmRequest, authorization: Optional[str] = Header(None)):
+    """As /api/league/payment_confirm, for a week paid in the app."""
+    return await _confirm_entry_payment(req.payment_intent_id, authorization, "leagueweek:")
 
 
 async def _connected_account_for_session(session_id: str, svc_headers: dict) -> str:
