@@ -2335,6 +2335,13 @@ class LeagueCardConfirmRequest(BaseModel):
     setup_intent_id: str
 
 
+class LeagueSubIntentRequest(BaseModel):
+    ask_id: str
+    # PaySheet sends these too; unused here
+    division_id: Optional[str] = None
+    purpose: Optional[str] = None
+
+
 class LeagueWeekIntentRequest(BaseModel):
     charge_id: str
     # PaySheet sends these too; unused here
@@ -2536,6 +2543,68 @@ async def create_league_week_intent(req: LeagueWeekIntentRequest, authorization:
 async def confirm_league_week_payment(req: TournamentConfirmRequest, authorization: Optional[str] = Header(None)):
     """As /api/league/payment_confirm, for a week paid in the app."""
     return await _confirm_entry_payment(req.payment_intent_id, authorization, "leagueweek:")
+
+
+@app.post("/api/league/sub/payment_intent")
+async def create_league_sub_intent(req: LeagueSubIntentRequest, authorization: Optional[str] = Header(None)):
+    """A sub saying yes to a week (phase 5a, 20270114100000_league_subs.sql):
+    league_sub_quote prices it, a direct charge on the host's account,
+    recorded as 'leaguesub:<ask>'; league_sub_answer accepts it once
+    /api/league/sub/payment_confirm has stamped it."""
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(status_code=500, detail="Stripe not configured")
+    caller = await _caller_id(authorization)
+    if not caller:
+        raise HTTPException(status_code=401, detail="Please sign in again to pay.")
+    ask = _user_id_ok(req.ask_id)
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.post(
+            f"{SUPABASE_URL}/rest/v1/rpc/league_sub_quote",
+            headers={**_svc_headers(), "Content-Type": "application/json"},
+            json={"p_ask": ask, "p_user": caller},
+        )
+    if r.status_code >= 300:
+        raise HTTPException(status_code=502, detail="Couldn't check the week. Try again in a moment.")
+    quote = r.json() or {}
+    if quote.get("refusal"):
+        raise HTTPException(status_code=409, detail={
+            "ask_gone": "You're not needed to sub this week any more.",
+            "free": "There's nothing to pay for this week.",
+        }.get(quote["refusal"], "That ask isn't yours to answer."))
+    amount = int(quote.get("fee_cents") or 0)
+    host_id = quote.get("host_id")
+    account_id = await _stripe_account_for({"user_id": host_id})
+    kw = dict(amount=amount, currency="aud", description=(quote.get("description") or "PickleMatch league sub")[:200],
+              metadata={"league_sub_ask_id": ask, "player_user_id": caller, "host_user_id": host_id, "purpose": "sub"},
+              capture_method="automatic")
+    if account_id:
+        kw["stripe_account"] = account_id
+    intent = stripe.PaymentIntent.create(**kw)
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        w = await client.post(
+            f"{SUPABASE_URL}/rest/v1/payment_intents_issued",
+            headers={**_svc_headers(), "Content-Type": "application/json", "Prefer": "return=minimal"},
+            json={"intent_id": intent.id, "session_id": f"leaguesub:{ask}", "user_id": caller,
+                  "amount_cents": amount, "capture_method": "automatic", "purpose": "league_sub", "host_id": host_id},
+        )
+    if w.status_code >= 300:
+        try:
+            if account_id:
+                stripe.PaymentIntent.cancel(intent.id, stripe_account=account_id)
+            else:
+                stripe.PaymentIntent.cancel(intent.id)
+        except stripe.error.StripeError:
+            pass
+        logging.error("payment_intents_issued write failed (league sub): %s", w.text[:200])
+        raise HTTPException(status_code=500, detail="Couldn't start the payment. Please try again.")
+    return {"client_secret": intent.client_secret, "payment_intent_id": intent.id,
+            "account_id": account_id, "capture_method": "automatic", "amount": amount}
+
+
+@app.post("/api/league/sub/payment_confirm")
+async def confirm_league_sub_payment(req: TournamentConfirmRequest, authorization: Optional[str] = Header(None)):
+    """As /api/league/payment_confirm, for a sub's week."""
+    return await _confirm_entry_payment(req.payment_intent_id, authorization, "leaguesub:")
 
 
 async def _connected_account_for_session(session_id: str, svc_headers: dict) -> str:
