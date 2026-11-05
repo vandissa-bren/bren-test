@@ -779,7 +779,7 @@ async def _warm_single_date(target, supabase_data=None):
         output = []
         for r in supabase_data:
             vid = r.get("id")
-            filtered_sessions = r.get("sessions", [])
+            filtered_sessions = _lift_abouts(r.get("sessions", []))   # as pbp_availability: no descriptions
             output.append({"id": vid, "name": r.get("name"), "slug": r.get("slug"), "platform": "playbypoint", "court_blocks": court_blocks_by_id.get(vid, []), "sessions": filtered_sessions, "error": None})
         response = {"date": date_str, "from": "00:00", "to": "23:30", "venues": output, "total_court_blocks": sum(len(v["court_blocks"]) for v in output), "total_sessions": sum(len(v["sessions"]) for v in output), "source": "live", "cached_count": len(output)}
         _cache_set(cache_key, response)
@@ -963,6 +963,61 @@ async def _personalise_prices(response, user_id):
     return out
 
 
+# ── Descriptions, read apart from the session list (6 Nov 2026) ────────────
+# Production, Slow 4G: /api/pbp/availability was 188 KB compressed (about 2 MB
+# of data) and took 3.1 s. Three quarters of it was descriptions: each
+# session carried its programme's description twice (description_html, up to
+# 5000 characters, and description), repeated for every night of the
+# fortnight. Without them the list is about 60 KB compressed.
+#
+# Each session now carries `about`, a key made from the description itself,
+# so it doesn't change between scrapes and the app can keep what it has read.
+# The app reads the one it needs from /api/pbp/abouts when a session's sheet
+# opens.
+_abouts: dict[str, dict] = {}
+_abouts_reread_at = 0.0
+
+
+def _about_key(html: str, plain: str) -> str:
+    return hashlib.sha1(f"{html}\x00{plain}".encode()).hexdigest()[:12]
+
+
+def _lift_abouts(sessions):
+    """Copies of the sessions with descriptions swapped for an `about` key."""
+    if len(_abouts) > 5000:   # old descriptions pile up over months; they're read again on demand
+        _abouts.clear()
+    out = []
+    for s in sessions or []:
+        if not isinstance(s, dict):
+            out.append(s)
+            continue
+        html = s.get("description_html") or ""
+        plain = s.get("description") or ""
+        s = {k: v for k, v in s.items() if k not in ("description", "description_html")}
+        if html or plain:
+            key = _about_key(html, plain)
+            _abouts[key] = {"description": plain or None, "description_html": html or None}
+            s["about"] = key
+        out.append(s)
+    return out
+
+
+@app.get("/api/pbp/abouts")
+async def pbp_abouts(
+    keys: Optional[str] = Query(None, description="Comma-separated about keys (up to 50)"),
+):
+    """Session descriptions by the `about` key /api/pbp/availability gives."""
+    wanted = [k for k in (keys or "").split(",") if re.fullmatch(r"[0-9a-f]{12}", k)][:50]
+    global _abouts_reread_at
+    if any(k not in _abouts for k in wanted) and _time.time() - _abouts_reread_at > 60:
+        # After a restart, or a key from a newer scrape: read them again, at
+        # most once a minute (an unknown key mustn't cost a read every time)
+        _abouts_reread_at = _time.time()
+        for r in await _read_from_supabase("playbypoint"):
+            _lift_abouts(r.get("sessions") or [])
+    return {k: _abouts[k] for k in wanted if k in _abouts}
+
+
 @app.get("/api/pbp/availability")
 async def pbp_availability(
     date: Optional[str] = Query(None, description="YYYY-MM-DD, default today"),
@@ -1041,8 +1096,9 @@ async def pbp_availability(
     for r in supabase_data:
         vid = r.get("id")
         all_sessions = r.get("sessions", [])
-        # Return all dates' sessions, frontend filters by date
-        filtered_sessions = all_sessions
+        # Return all dates' sessions, frontend filters by date. Without their
+        # descriptions, which are read by key from /api/pbp/abouts (_lift_abouts).
+        filtered_sessions = _lift_abouts(all_sessions)
         output.append({
             "id": vid,
             "name": r.get("name"),
