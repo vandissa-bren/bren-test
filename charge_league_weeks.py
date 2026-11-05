@@ -90,6 +90,7 @@ def main():
             accounts = {p["id"]: p.get("stripe_account_id") for p in rp.json()}
 
         paid = owed = skipped = 0
+        told = set()
         for d in due:
             cid = d["charge_id"]
             amount = int(d.get("amount_cents") or 0)
@@ -100,8 +101,12 @@ def main():
                 skipped += 1
                 continue
             if not account_id:
-                # left due (attempts 0): it's charged once the host's Stripe is back
+                # left due (attempts 0): it's charged once the host's Stripe is back,
+                # up to a week after the night. The host is told, at most once a day.
                 log(f"SKIP {label} — host has no Stripe account")
+                if not DRY and d.get("host_id") and d["host_id"] not in told:
+                    rpc(client, "league_host_no_stripe", {"p_host": d["host_id"]})
+                    told.add(d["host_id"])
                 skipped += 1
                 continue
             if DRY:
