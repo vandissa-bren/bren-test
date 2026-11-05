@@ -2512,12 +2512,20 @@ async def create_league_week_intent(req: LeagueWeekIntentRequest, authorization:
     amount = int(quote.get("fee_cents") or 0)
     host_id = quote.get("host_id")
     account_id = await _stripe_account_for({"user_id": host_id})
+    # nothing to charge, or the host can't take payments: never a charge on the platform (5 Nov 2026)
+    if amount <= 0:
+        raise HTTPException(status_code=409, detail="There's nothing to pay for this week.")
+    if not account_id:
+        raise HTTPException(status_code=409, detail="The host can't take payments right now. Try again later.")
     kw = dict(amount=amount, currency="aud", description=(quote.get("description") or "PickleMatch league")[:200],
               metadata={"league_week_charge_id": charge, "player_user_id": caller, "host_user_id": host_id, "purpose": "week"},
               capture_method="automatic")
     if account_id:
         kw["stripe_account"] = account_id
-    intent = stripe.PaymentIntent.create(**kw)
+    try:
+        intent = stripe.PaymentIntent.create(**kw)
+    except stripe.error.StripeError:
+        raise HTTPException(status_code=502, detail="Couldn't reach the payment server. Try again in a moment.")
     async with httpx.AsyncClient(timeout=10.0) as client:
         w = await client.post(
             f"{SUPABASE_URL}/rest/v1/payment_intents_issued",
@@ -2570,16 +2578,25 @@ async def create_league_sub_intent(req: LeagueSubIntentRequest, authorization: O
         raise HTTPException(status_code=409, detail={
             "ask_gone": "You're not needed to sub this week any more.",
             "free": "There's nothing to pay for this week.",
+            "paid_already": "You've already paid for this week. Tap Yes again to sub.",
         }.get(quote["refusal"], "That ask isn't yours to answer."))
     amount = int(quote.get("fee_cents") or 0)
     host_id = quote.get("host_id")
     account_id = await _stripe_account_for({"user_id": host_id})
+    # nothing to charge, or the host can't take payments: never a charge on the platform (5 Nov 2026)
+    if amount <= 0:
+        raise HTTPException(status_code=409, detail="There's nothing to pay for this week.")
+    if not account_id:
+        raise HTTPException(status_code=409, detail="The host can't take payments right now. Try again later.")
     kw = dict(amount=amount, currency="aud", description=(quote.get("description") or "PickleMatch league sub")[:200],
               metadata={"league_sub_ask_id": ask, "player_user_id": caller, "host_user_id": host_id, "purpose": "sub"},
               capture_method="automatic")
     if account_id:
         kw["stripe_account"] = account_id
-    intent = stripe.PaymentIntent.create(**kw)
+    try:
+        intent = stripe.PaymentIntent.create(**kw)
+    except stripe.error.StripeError:
+        raise HTTPException(status_code=502, detail="Couldn't reach the payment server. Try again in a moment.")
     async with httpx.AsyncClient(timeout=10.0) as client:
         w = await client.post(
             f"{SUPABASE_URL}/rest/v1/payment_intents_issued",
