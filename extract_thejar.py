@@ -397,40 +397,12 @@ class PlayByPointScraper:
             if self.proxy:
                 launch_kwargs["proxy"] = {"server": self.proxy}
 
-            try:
-                context = await pw.chromium.launch_persistent_context(
-                    user_data_dir=str(USER_DATA_DIR),
-                    viewport={"width": 1366, "height": 900},
-                    locale="en-AU",
-                    timezone_id=DEFAULT_TIMEZONE,
-                    user_agent=(
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/124.0.0.0 Safari/537.36"
-                    ),
-                    **launch_kwargs,
-                )
-            except Exception as exc:
-                # Real Chrome not installed — fall back to bundled Chromium.
-                logger.warning(
-                    "Could not launch real Chrome ({}). Falling back to "
-                    "bundled Chromium. For best Cloudflare-bypass results, "
-                    "install Chrome from https://www.google.com/chrome",
-                    exc,
-                )
-                launch_kwargs.pop("channel", None)
-                context = await pw.chromium.launch_persistent_context(
-                    user_data_dir=str(USER_DATA_DIR),
-                    viewport={"width": 1366, "height": 900},
-                    locale="en-AU",
-                    timezone_id=DEFAULT_TIMEZONE,
-                    user_agent=(
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/124.0.0.0 Safari/537.36"
-                    ),
-                    **launch_kwargs,
-                )
+            context = await _launch_pbp_context(
+                pw, str(USER_DATA_DIR), launch_kwargs,
+                viewport={"width": 1366, "height": 900},
+                locale="en-AU",
+                timezone_id=DEFAULT_TIMEZONE,
+            )
 
             page = await context.new_page()
 
@@ -3119,10 +3091,41 @@ def print_table(result: ScrapeResult) -> None:
 #       white-label club domain)
 #       → {clinics: [...]}  — program catalog (already used)
 
+# Only used by the httpx fallback. With curl_cffi we send NO User-Agent of our
+# own: curl_cffi's impersonate profile supplies the label that matches its
+# handshake. From 7 Nov 2026 Cloudflare blocks PlayByPoint requests whose label
+# (it was a fixed "Chrome/124") doesn't match a current-Chrome handshake.
 PBP_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
+
+
+async def _launch_pbp_context(pw, user_data_dir, launch_kwargs: dict, **ctx_kwargs):
+    """Open Playwright's persistent context with the browser's OWN label.
+
+    Never force a fixed Chrome version (Cloudflare blocks a label that doesn't
+    match the browser). Headless Chrome labels itself "HeadlessChrome", so in
+    that case reopen with the same label minus "Headless": same version, same
+    handshake. Tries installed Chrome first, then bundled Chromium."""
+    kwargs = dict(launch_kwargs)
+    try:
+        ctx = await pw.chromium.launch_persistent_context(user_data_dir=user_data_dir, **ctx_kwargs, **kwargs)
+    except Exception as exc:
+        logger.warning("Could not launch real Chrome ({}). Falling back to bundled Chromium.", exc)
+        kwargs.pop("channel", None)
+        ctx = await pw.chromium.launch_persistent_context(user_data_dir=user_data_dir, **ctx_kwargs, **kwargs)
+    try:
+        pg = ctx.pages[0] if ctx.pages else await ctx.new_page()
+        ua = await pg.evaluate("navigator.userAgent")
+    except Exception:
+        return ctx
+    if "HeadlessChrome" in ua:
+        await ctx.close()
+        ctx = await pw.chromium.launch_persistent_context(
+            user_data_dir=user_data_dir, user_agent=ua.replace("HeadlessChrome", "Chrome"),
+            **ctx_kwargs, **kwargs)
+    return ctx
 
 
 class PlayByPointAPI:
@@ -3156,7 +3159,7 @@ class PlayByPointAPI:
             cookies: dict[str, str],
             app_base_url: str = APP_BASE_URL,
             club_slug: str = DEFAULT_CLUB_SLUG,
-            user_agent: str = PBP_USER_AGENT,
+            user_agent: Optional[str] = None,
             timeout: float = 15.0,
             rate_limit: float = 0.05,
             proxy: Optional[str] = None,
@@ -3166,7 +3169,6 @@ class PlayByPointAPI:
         # PBP's API responds 401 without these standard XHR headers.
         # The Origin and Referer headers are checked server-side.
         self._headers = {
-            "User-Agent": user_agent,
             "Accept": "application/json, text/plain, */*",
             "Accept-Language": "en-AU,en;q=0.9",
             "Origin": self.app_base_url,
@@ -3191,6 +3193,8 @@ class PlayByPointAPI:
                 timeout=timeout,
                 impersonate="chrome",
             )
+            if user_agent:          # only if a caller insists; normally leave it to curl_cffi
+                session_kwargs["headers"] = {**self._headers, "User-Agent": user_agent}
             if proxy:
                 session_kwargs["proxies"] = {"https": proxy, "http": proxy}
             self._client = AsyncSession(**session_kwargs)
@@ -3200,7 +3204,7 @@ class PlayByPointAPI:
             import httpx  # type: ignore
             self._client = httpx.AsyncClient(
                 base_url=self.app_base_url,
-                headers=self._headers,
+                headers={**self._headers, "User-Agent": user_agent or PBP_USER_AGENT},
                 cookies=self._cookies,
                 timeout=timeout,
             )
@@ -4842,25 +4846,12 @@ async def harvest_cookies_via_playwright(
         }
         if proxy:
             launch_kwargs["proxy"] = {"server": proxy}
-        try:
-            context = await pw.chromium.launch_persistent_context(
-                user_data_dir=str(USER_DATA_DIR),
-                viewport={"width": 1366, "height": 900},
-                locale="en-AU",
-                timezone_id=DEFAULT_TIMEZONE,
-                user_agent=PBP_USER_AGENT,
-                **launch_kwargs,
-            )
-        except Exception:
-            launch_kwargs.pop("channel", None)
-            context = await pw.chromium.launch_persistent_context(
-                user_data_dir=str(USER_DATA_DIR),
-                viewport={"width": 1366, "height": 900},
-                locale="en-AU",
-                timezone_id=DEFAULT_TIMEZONE,
-                user_agent=PBP_USER_AGENT,
-                **launch_kwargs,
-            )
+        context = await _launch_pbp_context(
+            pw, str(USER_DATA_DIR), launch_kwargs,
+            viewport={"width": 1366, "height": 900},
+            locale="en-AU",
+            timezone_id=DEFAULT_TIMEZONE,
+        )
 
         page = await context.new_page()
         if _HAS_STEALTH and _stealth_apply is not None:
