@@ -73,8 +73,15 @@ COLS = {
     # tables directly, for the casual hire rate at each session's day and time
     "courtrates": ["facility_id", "court_id", "shift", "price", "member_price", "first_seen", "last_seen"],
     "slotshifts": ["facility_id", "slot_date", "slot_start", "shift"],
+    # optional: every fill-log reading with people waiting, for when a session's
+    # waitlist first appeared (merged into sessions.csv as waitlist_first_at /
+    # waitlist_first; court_free.waitlist_times)
+    "waitlists": ["session_key", "observed_at", "waitlist"],
+    # optional: courts free / taken / used by the venue's own sessions, per
+    # 30-minute slot that has started (ins_court_hire; court_free.py)
+    "courthire": ["fid", "slot_date", "slot_start", "n_courts", "taken", "programmed", "hire_taken", "hireable"],
 }
-OPTIONAL = {"programs", "firsts", "ratelog", "ratechecks", "courtrates", "slotshifts"}
+OPTIONAL = {"programs", "firsts", "ratelog", "ratechecks", "courtrates", "slotshifts", "waitlists", "courthire"}
 
 
 def sb():
@@ -123,12 +130,19 @@ def table(client, url, h, name, params, page=1000):
             return rows
 
 
-def export(client, url, h, frm, to, d: Path, chunk_days: int = 14):
-    """The three exports for sessions dated frm..to, fetched a fortnight at a time
-    so no single call runs long."""
+def export(client, url, h, frm, to, d: Path, chunk_days: int = 14, skip=(), courthire=None):
+    """The exports for sessions dated frm..to, fetched a fortnight at a time
+    so no single call runs long.
+
+    skip: kinds not to fetch (the period before needs no court or waitlist
+    detail). courthire: a dict shared across the run's windows; the longest
+    window (built first) fetches court hire once and the shorter ones take
+    their days from it rather than asking the server again."""
     import pandas as pd
     counts = {}
     for kind, cols in COLS.items():
+        if kind in skip:
+            continue
         rows, a = [], frm
         try:
             if kind == "programs":
@@ -144,6 +158,24 @@ def export(client, url, h, frm, to, d: Path, chunk_days: int = 14):
                 rows = table(client, url, h, "court_slot_states", {
                     "select": ",".join(cols), "and": f"(slot_date.gte.{frm},slot_date.lte.{to})",
                     "shift": "not.is.null", "order": "id"})
+            elif kind == "waitlists":
+                rows = table(client, url, h, "inventory_snapshots", {
+                    "select": ",".join(cols), "session_source": "eq.pbp", "waitlist": "gt.0",
+                    "and": f"(session_date.gte.{frm},session_date.lte.{to})", "order": "id"})
+            elif kind == "courthire":
+                import court_free
+                cache = courthire if courthire is not None else {}
+                got = cache.get("got")
+                if got is None or not (cache["frm"] <= frm and to <= cache["to"]):
+                    got = court_free.fetch(client, url, h, frm, to)
+                    cache.update(got=got, frm=frm, to=to)
+                rows = [x for x in got["rows"] if str(frm) <= str(x.get("slot_date", ""))[:10] <= str(to)]
+                # ok: every week the run asked for was read (for a window sliced from a
+                # longer one, that's the longer fetch's answer); weeksRead: weeks
+                # with any slot in this window
+                weeks_seen = {date.fromisoformat(str(x["slot_date"])[:10]).isocalendar()[:2] for x in rows}
+                meta = {"ok": got["ok"], "weeksRead": len(weeks_seen)}
+                (d / "courthire_meta.json").write_text(json.dumps(meta))
             else:
                 while a <= to:
                     b = min(to, a + timedelta(days=chunk_days - 1))
@@ -164,11 +196,28 @@ def export(client, url, h, frm, to, d: Path, chunk_days: int = 14):
                "ratelog": ["pbp_user_id", "seen_at", "rating"],
                "ratechecks": ["pbp_user_id", "session_key", "days_after"],
                "courtrates": ["facility_id", "court_id", "shift", "first_seen"],
-               "slotshifts": ["facility_id", "slot_date", "slot_start", "shift"]}[kind]
+               "slotshifts": ["facility_id", "slot_date", "slot_start", "shift"],
+               "waitlists": ["session_key", "observed_at"],
+               "courthire": ["fid", "slot_date", "slot_start"]}[kind]
         df = df.drop_duplicates(key)
         df.to_csv(d / f"{kind}.csv", index=False)
         counts[kind] = len(df)
+    if "waitlists" not in skip:
+        add_waitlist_times(d)
     return counts
+
+
+def add_waitlist_times(d: Path):
+    """sessions.csv gains waitlist_first_at and waitlist_first (empty when
+    waitlists.csv is missing or the session never had a queue)."""
+    import pandas as pd
+    import court_free
+    sp, wp = d / "sessions.csv", d / "waitlists.csv"
+    if not sp.exists():
+        return
+    s = pd.read_csv(sp)
+    w = pd.read_csv(wp) if wp.exists() else None
+    court_free.waitlist_times(s, w).to_csv(sp, index=False)
 
 
 def window(days: int, to: date) -> dict:
@@ -199,7 +248,21 @@ def build(data_dir: Path, work_dir: Path, covered: int | None = None):
     importlib.reload(B)
     B.COVERED_DAYS = covered
     M.main()                      # market-wide only; writes report_more.json, which build_overview reads
-    return B.main()
+    d, net = B.main()
+    # courts free for the whole hour, per venue x weekday x hour (court_free.py)
+    try:
+        import pandas as pd
+        import court_free
+        cp = Path(data_dir) / "courthire.csv"
+        d["courtFree"] = court_free.summarise(pd.read_csv(cp) if cp.exists() else None)
+        mp = Path(data_dir) / "courthire_meta.json"
+        meta = json.loads(mp.read_text()) if mp.exists() else {"ok": cp.exists(), "weeksRead": None}
+        d["courtFree"].update(ok=bool(meta.get("ok")) and bool(d["courtFree"]["rows"]),
+                              weeksRead=meta.get("weeksRead"))
+    except Exception as e:
+        print(f"  courtFree: skipped ({type(e).__name__})")
+        d["courtFree"] = {"cols": [], "rows": [], "ok": False, "weeksRead": 0}
+    return d, net
 
 
 def shareable(d: dict, net: dict) -> dict:
@@ -218,6 +281,9 @@ def shareable(d: dict, net: dict) -> dict:
     net["groups"] = [g for g in net.get("groups", []) if g["size"] >= MIN_GROUP]
     net["glinks"] = [l for l in net.get("glinks", []) if l["n"] >= MIN_GROUP]
     d["net"] = net
+    if d.get("courtFree"):
+        cf = d["courtFree"]
+        d["courtFree"] = dict(cf, rows=[r for r in cf.get("rows", []) if r[0] in ids])
     d["levelFit"] = [r for r in d.get("levelFit", []) if r["v"] in ids]
     d["levelClass"] = [r for r in d.get("levelClass", []) if r["v"] is None or r["v"] in ids]
     d["levelMix"] = [r for r in d.get("levelMix", []) if r["v"] in ids and r["players"] >= MIN_GROUP]
@@ -290,6 +356,7 @@ def main() -> int:
     pm = None                      # the PM level, fitted on the longest window, shown with every window
     to = datetime.now(MEL).date() - timedelta(days=1)
     ok = 0
+    courthire = {}                 # court hire, fetched once for the longest window (export())
     with httpx.Client(timeout=300) as client:
         for days in windows:
             w = window(days, to)
@@ -303,7 +370,7 @@ def main() -> int:
                     data_dir, work_dir = Path(tmp) / "data", Path(tmp) / "work"
                     data_dir.mkdir()
                     work_dir.mkdir()
-                    n = export(client, url, h, frm, to, data_dir)
+                    n = export(client, url, h, frm, to, data_dir, courthire=courthire)
                     if not n["sessions"]:
                         print(f"{days}d: no sessions between {frm} and {to}; skipped")
                         continue
@@ -335,7 +402,7 @@ def main() -> int:
                     else:
                         try:
                             p_frm, p_to = w["prev"]
-                            pn = export(client, url, h, p_frm, p_to, prev_dir)
+                            pn = export(client, url, h, p_frm, p_to, prev_dir, skip=("courthire", "waitlists"))
                             if pn["sessions"]:
                                 import build_overview as B
                                 d["prev"] = dict(B.prev_summary(prev_dir), asked=[str(p_frm), str(p_to)])
