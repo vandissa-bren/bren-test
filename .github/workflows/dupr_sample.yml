@@ -1,0 +1,50 @@
+name: DUPR sample
+# Run by hand, once. Reads PlayByPoint's signed-in ratings for up to `limit`
+# players seen only at the 13 venues whose public rosters hide DUPR, saves them
+# with the nightly job's pbp_ratings_ingest, and prints counts only (never
+# names or ids). Needs migration 20270205100000_dupr_sample_targets.sql.
+# Stops at the first 401/403/429 or 3 failed reads in a row. Refuses to start
+# 14:45-17:30 UTC, while the nightly scrape (15:00 UTC) may be running.
+on:
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: 'Most players to read (max 500)'
+        required: false
+        default: '200'
+      dry_run:
+        description: 'Only pick and count targets; no PlayByPoint calls'
+        type: boolean
+        required: false
+        default: false
+
+concurrency:
+  group: dupr-sample
+  cancel-in-progress: false
+
+jobs:
+  sample:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install httpx curl_cffi loguru python-dotenv rich supabase typer tenacity
+
+      - name: Run DUPR sample
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          PBP_COOKIES_JSON: ${{ secrets.PBP_COOKIES_JSON }}
+          PROXY_URL: ""
+          DUPR_SAMPLE_LIMIT: ${{ inputs.limit }}
+          DUPR_SAMPLE_DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          python dupr_sample.py
