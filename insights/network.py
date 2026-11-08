@@ -412,6 +412,7 @@ def build(f, m, ok, vmap, clean_name, area_of_fid):
             "reach2": float(np.median([players[k]["r2"] for k in here])),
             "oneTimers": round(100 * np.mean([players[k]["n"] == 1 for k in here]), 1),
             "cameBack": round(100 * np.mean([len(d) >= 2 for d in early]), 1) if len(early) >= 10 else None,
+            "cameBackN": len(early),       # base for the 5+ check (privacy.py); not published
             "regularPairs": int(regular_here[v]),
             "groups": sum(1 for c_, n in cms.items() if n >= 5),
             "groupMix": [[c_, n] for c_, n in cms.most_common(6) if n >= 5],
