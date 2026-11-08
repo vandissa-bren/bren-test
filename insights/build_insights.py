@@ -36,7 +36,7 @@ import os
 import sys
 import tempfile
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -45,6 +45,12 @@ sys.path.insert(0, str(HERE))
 
 MEL = ZoneInfo("Australia/Melbourne")
 MIN_GROUP = 5
+# No window, and no "period before", starts earlier than this. Before it the
+# fill log's venue and session type are mostly missing (31% filled in the week
+# of 14 Sep, 92%+ from 21 Sep), so sessions can't be placed or grouped and
+# every per-venue or per-format figure would be undercounted. A window that
+# would reach back further is cut to start here, and says so (window.clamped).
+DATA_START = date(2026, 9, 21)
 COLS = {
     "sessions": ["session_key", "session_date", "start_time", "capacity", "price", "status", "starts_at",
                  "venue_id", "session_type", "first_obs", "last_obs", "n_obs", "n_obs_before", "last_obs_before",
@@ -62,8 +68,13 @@ COLS = {
     # optional: every DUPR change (20261026100000) and the played-roster re-reads (20261027100000)
     "ratelog": ["pbp_user_id", "rating", "prev_rating", "seen_at", "prev_seen_at", "session_key", "source"],
     "ratechecks": ["pbp_user_id", "session_key", "session_date", "days_after", "rating", "observed_at"],
+    # optional: court-hire rates (court_rate_states, 20261016110000) and each
+    # half-hour slot's PlayByPoint price shift (court_slot_states), read from the
+    # tables directly, for the casual hire rate at each session's day and time
+    "courtrates": ["facility_id", "court_id", "shift", "price", "member_price", "first_seen", "last_seen"],
+    "slotshifts": ["facility_id", "slot_date", "slot_start", "shift"],
 }
-OPTIONAL = {"programs", "firsts", "ratelog", "ratechecks"}
+OPTIONAL = {"programs", "firsts", "ratelog", "ratechecks", "courtrates", "slotshifts"}
 
 
 def sb():
@@ -88,6 +99,30 @@ def rpc(client, url, h, name, args):
     return r.json() or []
 
 
+def table(client, url, h, name, params, page=1000):
+    """All rows of a table read straight through the REST API, a page at a time.
+
+    PostgREST caps every response at its max-rows setting (1,000 on Supabase by
+    default), whatever Range asks for, so a short page doesn't mean the end.
+    We step by the rows actually returned and stop only on an empty page or
+    when Content-Range says we've reached the total."""
+    rows, off = [], 0
+    while True:
+        r = client.get(f"{url}/rest/v1/{name}", headers={**h, "Range-Unit": "items", "Range": f"{off}-{off + page - 1}"},
+                       params=params)
+        if r.status_code >= 300:
+            raise RuntimeError(f"{name}: HTTP {r.status_code}")
+        got = r.json() or []
+        if not got:
+            return rows
+        rows += got
+        off += len(got)
+        cr = r.headers.get("Content-Range", "")          # e.g. "0-999/4521" or "0-999/*"
+        total = cr.rsplit("/", 1)[-1] if "/" in cr else "*"
+        if total.isdigit() and off >= int(total):
+            return rows
+
+
 def export(client, url, h, frm, to, d: Path, chunk_days: int = 14):
     """The three exports for sessions dated frm..to, fetched a fortnight at a time
     so no single call runs long."""
@@ -102,12 +137,19 @@ def export(client, url, h, frm, to, d: Path, chunk_days: int = 14):
                 rows = rpc(client, url, h, "insights_export_firsts", {"p_to": str(to)})
             elif kind == "ratelog":
                 rows = rpc(client, url, h, "insights_export_ratelog", {})
+            elif kind == "courtrates":
+                rows = table(client, url, h, "court_rate_states", {
+                    "select": ",".join(cols), "last_seen": f"gte.{frm}", "order": "id"})
+            elif kind == "slotshifts":
+                rows = table(client, url, h, "court_slot_states", {
+                    "select": ",".join(cols), "and": f"(slot_date.gte.{frm},slot_date.lte.{to})",
+                    "shift": "not.is.null", "order": "id"})
             else:
                 while a <= to:
                     b = min(to, a + timedelta(days=chunk_days - 1))
                     rows += rpc(client, url, h, f"insights_export_{kind}", {"p_from": str(a), "p_to": str(b)})
                     a = b + timedelta(days=1)
-        except RuntimeError as e:
+        except Exception as e:
             if kind not in OPTIONAL:
                 raise
             print(f"  {kind}: not available ({str(e)[:80]}); carrying on without")
@@ -120,15 +162,32 @@ def export(client, url, h, frm, to, d: Path, chunk_days: int = 14):
         key = {"sessions": ["session_key"], "rosters": ["pbp_user_id", "session_key"], "catalogue": ["lesson_id"],
                "programs": ["venue_id", "program_slug"], "firsts": ["pbp_user_id", "fid"],
                "ratelog": ["pbp_user_id", "seen_at", "rating"],
-               "ratechecks": ["pbp_user_id", "session_key", "days_after"]}[kind]
+               "ratechecks": ["pbp_user_id", "session_key", "days_after"],
+               "courtrates": ["facility_id", "court_id", "shift", "first_seen"],
+               "slotshifts": ["facility_id", "slot_date", "slot_start", "shift"]}[kind]
         df = df.drop_duplicates(key)
         df.to_csv(d / f"{kind}.csv", index=False)
         counts[kind] = len(df)
     return counts
 
 
-def build(data_dir: Path, work_dir: Path):
-    """Run the prototype's analysis over the CSVs in data_dir."""
+def window(days: int, to: date) -> dict:
+    """A window of `days` ending `to`, cut so it starts no earlier than
+    DATA_START. covered: the days it actually spans (what any per-week figure
+    divides by). prev: the period before, the same length, or None when that
+    would start before DATA_START (a shorter one wouldn't compare like for like;
+    the page shows no comparison without it)."""
+    asked = to - timedelta(days=days - 1)
+    frm = max(asked, DATA_START)
+    covered = max(0, (to - frm).days + 1)
+    p_frm, p_to = frm - timedelta(days=covered), frm - timedelta(days=1)
+    return {"days": days, "from": frm, "to": to, "covered": covered, "asked": asked,
+            "clamped": frm != asked, "prev": (p_frm, p_to) if p_frm >= DATA_START else None}
+
+
+def build(data_dir: Path, work_dir: Path, covered: int | None = None):
+    """Run the prototype's analysis over the CSVs in data_dir. covered: the
+    days the window spans, for per-week figures (else the sessions' own span)."""
     import importlib
     os.environ["INSIGHTS_DATA"] = str(data_dir)
     os.environ["INSIGHTS_WORK"] = str(work_dir)
@@ -138,6 +197,7 @@ def build(data_dir: Path, work_dir: Path):
     import build_overview as B
     importlib.reload(M)
     importlib.reload(B)
+    B.COVERED_DAYS = covered
     M.main()                      # market-wide only; writes report_more.json, which build_overview reads
     return B.main()
 
@@ -230,7 +290,11 @@ def main() -> int:
     ok = 0
     with httpx.Client(timeout=300) as client:
         for days in windows:
-            frm = to - timedelta(days=days - 1)
+            w = window(days, to)
+            frm = w["from"]
+            if w["covered"] <= 0:
+                print(f"{days}d: ends before {DATA_START}; skipped")
+                continue
             t0 = time.time()
             try:
                 with tempfile.TemporaryDirectory() as tmp:
@@ -241,7 +305,7 @@ def main() -> int:
                     if not n["sessions"]:
                         print(f"{days}d: no sessions between {frm} and {to}; skipped")
                         continue
-                    d, net = build(data_dir, work_dir)
+                    d, net = build(data_dir, work_dir, w["covered"])
                     if pm is None:
                         try:
                             pm, levels = pm_run(frm, to)
@@ -259,21 +323,27 @@ def main() -> int:
                             pm = False
                     if pm:
                         d["pm"] = pm
-                    # the period before, the same length
+                    # the period before, the same length (as covered), never before
+                    # DATA_START: when it would be, there is no "prev" and the page
+                    # shows no comparison
                     prev_dir = Path(tmp) / "prev"
                     prev_dir.mkdir()
-                    # (the page only compares when this covers the whole period: early on
-                    # the log doesn't reach back far enough for the 90-day one)
-                    try:
-                        p_frm, p_to = frm - timedelta(days=days), frm - timedelta(days=1)
-                        pn = export(client, url, h, p_frm, p_to, prev_dir)
-                        if pn["sessions"]:
-                            import build_overview as B
-                            d["prev"] = dict(B.prev_summary(prev_dir), asked=[str(p_frm), str(p_to)])
-                    except Exception as e:
-                        print(f"{days}d: previous period skipped ({type(e).__name__}: {e})")
+                    if w["prev"] is None:
+                        print(f"{days}d: previous period would start before {DATA_START}; omitted")
+                    else:
+                        try:
+                            p_frm, p_to = w["prev"]
+                            pn = export(client, url, h, p_frm, p_to, prev_dir)
+                            if pn["sessions"]:
+                                import build_overview as B
+                                d["prev"] = dict(B.prev_summary(prev_dir), asked=[str(p_frm), str(p_to)])
+                        except Exception as e:
+                            print(f"{days}d: previous period skipped ({type(e).__name__}: {e})")
+                # days: the window asked for (the page's period and the row key);
+                # from/to/covered: what it actually spans after the DATA_START cut
                 out = clean(dict(shareable(d, net), window={
-                    "days": days, "from": str(frm), "to": str(to),
+                    "days": days, "from": str(frm), "to": str(to), "covered": w["covered"],
+                    "clamped": w["clamped"], "askedFrom": str(w["asked"]), "dataStart": str(DATA_START),
                     "builtAt": datetime.now(timezone.utc).isoformat(), "exported": n}))
                 body = json.dumps({"days": days, "built_at": out["window"]["builtAt"], "data": out},
                                   separators=(",", ":"), default=str)
