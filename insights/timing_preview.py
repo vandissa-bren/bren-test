@@ -17,6 +17,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+import cancellations as CX
+
 MEL = "Australia/Melbourne"
 EXACT_GAP_MIN = 20          # same rule as player_booking_leads / the feed's LEAD trait
 LEAD_BUCKETS = [(0, 1, "Same day"), (1, 2, "1 day"), (2, 4, "2–3 days"),
@@ -91,17 +93,10 @@ def build(s, r, now):
     # either exact or known to be LEAD_WINDOW_DAYS+ ahead.
     r["lead_ok"] = (r["starts_at"] < now) & (
         (r["starts_at"] - r["watch_start"]) >= pd.Timedelta(days=LEAD_WINDOW_DAYS))
-    # cancelled: gone while we kept watching, and gone before the start. The
-    # capture job must have run again within 6 h of their last sighting --
-    # otherwise the gap is ours (an outage), not theirs, and it isn't counted.
-    runs = pd.DatetimeIndex(np.sort(pd.concat([r["first_seen"], r["last_seen"]]).dt.floor("min").unique()))
-    nxt = runs.searchsorted(r["last_seen"].dt.floor("min"), side="right")
-    next_run = pd.Series([runs[i] if i < len(runs) else pd.NaT for i in nxt], index=r.index)
-    r["left_roster"] = (r["last_seen"] < r["session_last_pass"]) & (r["last_seen"] < r["starts_at"])
-    r["capture_gap"] = r["left_roster"] & ((next_run - r["last_seen"]) > pd.Timedelta(hours=6))
-    r["cancelled"] = r["left_roster"] & ~r["capture_gap"]
-    r["cancel_hours_before"] = np.where(
-        r["cancelled"], (r["starts_at"] - r["last_seen"]).dt.total_seconds() / 3600, np.nan)
+    # cancelled: seen gone by a roster pass that ran before the start, with no
+    # capture outage after their last sighting (cancellations.py: the one rule
+    # every Insights figure uses; a player removed after the start attended)
+    r = CX.classify(r, s)
     r["finished"] = r["starts_at"] < now
     return r
 
