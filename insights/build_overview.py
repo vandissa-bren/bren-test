@@ -351,20 +351,86 @@ def prev_summary(data_dir: Path) -> dict:
             "venuePlayers": {str(int(k)): int(v) for k, v in per_v.items() if v >= MIN_GROUP}}
 
 
+# Players per court, to estimate the courts a session uses (ceil(capacity / n)).
+# An ESTIMATE: PlayByPoint doesn't say which courts a session blocks. Socials
+# and open play rotate 5-6 players per court (5 used, so the court count isn't
+# understated); coached sessions run about 8 per court; everything else is
+# doubles, 4 a court. Formats are venue_report's `fmt`.
+PLAYERS_PER_COURT = {"social": 5, "open_play": 5, "clinic": 8, "coaching": 8, "learn_to_play": 8}
+PLAYERS_PER_COURT_DEFAULT = 4
+
+
+def courts_used(g) -> pd.Series:
+    """Estimated courts each session uses (PLAYERS_PER_COURT)."""
+    per = g["fmt"].map(PLAYERS_PER_COURT).fillna(PLAYERS_PER_COURT_DEFAULT) if "fmt" in g else PLAYERS_PER_COURT_DEFAULT
+    return np.ceil(g["capacity"].clip(lower=1) / per)
+
+
+def hire_rates(f, rates, shifts) -> pd.Series:
+    """The casual court-hire rate for each session's venue, day and time: the
+    PlayByPoint price shift of the half-hour slot it starts in (court_slot_states
+    for that date, else the venue's usual shift for that weekday and time), then
+    the median casual rate across the venue's courts for that shift, as it stood
+    when the session ran (court_rate_states). None where either is missing."""
+    out = pd.Series(np.nan, index=f.index)
+    if rates is None or shifts is None or rates.empty or shifts.empty or f.empty:
+        return out
+    sh = shifts.dropna(subset=["shift"]).copy()
+    sh["fid"] = sh["facility_id"].astype(int)
+    sh["hm"] = sh["slot_start"].astype(str).str[:5]
+    sh["dow"] = pd.to_datetime(sh["slot_date"]).dt.dayofweek
+    sh["date"] = pd.to_datetime(sh["slot_date"]).dt.strftime("%Y-%m-%d")
+    by_date = sh.groupby(["fid", "date", "hm"])["shift"].agg(lambda x: x.mode().iloc[0]).to_dict()
+    by_dow = sh.groupby(["fid", "dow", "hm"])["shift"].agg(lambda x: x.mode().iloc[0]).to_dict()
+    rt = rates.dropna(subset=["price"]).copy()
+    rt["fid"] = rt["facility_id"].astype(int)
+    rt["first_seen"] = pd.to_datetime(rt["first_seen"], utc=True, errors="coerce", format="mixed")
+    rt["shift"] = rt["shift"].astype(str)
+    by_shift = {k: x for k, x in rt.sort_values("first_seen").groupby(["fid", "shift"])}
+    loc = f["starts_at"].dt.tz_convert(R.MEL)
+    hm = loc.dt.floor("30min").dt.strftime("%H:%M")
+    for i in f.index:
+        fid, d = int(f.at[i, "fid"]), loc[i]
+        s = by_date.get((fid, d.strftime("%Y-%m-%d"), hm[i])) or by_dow.get((fid, d.dayofweek, hm[i]))
+        x = by_shift.get((fid, str(s))) if s is not None else None
+        if x is None:
+            continue
+        # each court's rate as it stood at the start (its first logged one if
+        # the log began later)
+        now = x[x["first_seen"] <= f.at[i, "starts_at"]]
+        per = now.groupby("court_id")["price"].last() if len(now) else x.groupby("court_id")["price"].first()
+        out[i] = float(per.median())
+    return out
+
+
 def money(g) -> dict:
     """Takings and the value of empty places, from per-session prices
     (venue_report.session_prices). Listed prices, so an upper bound: members
     may pay less. spendLow is the same if everyone paid the member price where
     one is published. Sessions whose season price couldn't be split are left
-    out and counted. $ per court-hour assumes a court per 4 places."""
+    out and counted.
+
+    Per court-hour, like for like with court hire (sessions with a length; 5+):
+      fullCourtHour   what a session takes per court-hour when full:
+                      Σ price × capacity ÷ Σ length × courts
+      takenCourtHour  what it actually took: Σ price × booked ÷ the same
+      hireRate        median casual hire rate for the same venue, day and time
+                      slot (hire_rates; the session's `hire_rate`)
+    courts = courts_used (an estimate by format, PLAYERS_PER_COURT).
+    perCourtHour: the old figure (a court per 4 places, takings), kept one
+    release for the page; use takenCourtHour."""
     p = g[g["price_n"].notna()]
     low = p["mprice_n"].where(p["mprice_n"].notna(), p["price_n"])
     both = p[p["mprice_n"].notna() & (p["price_n"] > 0)]
     hrs = p["dur_h"] * np.ceil(p["capacity"].clip(lower=1) / 4)
     timed = p[hrs.notna() & (hrs > 0)]
+    chrs = p["dur_h"] * courts_used(p)
+    ctimed = p[chrs.notna() & (chrs > 0)]
+    hire = g["hire_rate"].dropna() if "hire_rate" in g else pd.Series(dtype=float)
     return {
         "spend": int((p["price_n"] * p["booked"]).sum()) if len(p) else None,
         "spendLow": int((low * p["booked"]).sum()) if len(both) else None,
+        # list price × places left empty at the start (an upper bound, like spend)
         "emptyValue": int((p["price_n"] * p["spots_at_start"]).sum()) if len(p) else None,
         "priced": int(len(p)),
         "memberPriced": int(len(both)),
@@ -372,6 +438,10 @@ def money(g) -> dict:
         "seasonLeftOut": int((g["price_basis"] == "season").sum()),
         "seasonSplit": int(g["price_basis"].isin(["season-weeks", "season-listing", "package"]).sum()),
         "perCourtHour": r1(float((timed["price_n"] * timed["booked"]).sum() / hrs[timed.index].sum())) if len(timed) >= 5 else None,
+        "fullCourtHour": r1(float((ctimed["price_n"] * ctimed["capacity"]).sum() / chrs[ctimed.index].sum())) if len(ctimed) >= 5 else None,
+        "takenCourtHour": r1(float((ctimed["price_n"] * ctimed["booked"]).sum() / chrs[ctimed.index].sum())) if len(ctimed) >= 5 else None,
+        "hireRate": r1(float(hire.median())) if len(hire) else None,
+        "hireRated": int(len(hire)),
         "waitlisted": int((g["waitlist_max"].fillna(0) > 0).sum()) if "waitlist_max" in g else 0,
     }
 
@@ -490,6 +560,22 @@ def market(m, s, fin, ok, fid) -> dict:
 
 
 LAST: dict = {}
+# The days the window actually spans (build_insights.window, after the 21 Sep
+# cut). Per-week figures divide by this; None = the finished sessions' own span.
+COVERED_DAYS = None
+
+
+def covered_days(start, end) -> int:
+    """Days the window spans, for city.days and every per-week figure."""
+    return int(COVERED_DAYS) if COVERED_DAYS else (end - start).days + 1
+
+
+def _optional_csv(name):
+    p = R.DATA / f"{name}.csv"
+    if not p.exists():
+        return None
+    x = pd.read_csv(p, na_values=["null"])
+    return x if len(x) else None
 
 
 def main():
@@ -505,7 +591,7 @@ def main():
 
     start = fin["starts_at"].min()
     end = fin["starts_at"].max()
-    days = (end - start).days + 1
+    days = covered_days(start, end)
     weeks = days / 7
 
     # ── venues (registry: all 43, tracked or not) ──
@@ -533,6 +619,8 @@ def main():
     loc = f["starts_at"].dt.tz_convert(R.MEL)
     f["date"] = loc.dt.strftime("%Y-%m-%d")
     f["co_list"] = (f["coaches"] if "coaches" in f else pd.Series([None] * len(f), index=f.index)).map(_coach_list)
+    f["hire_rate"] = hire_rates(f, _optional_csv("courtrates"), _optional_csv("slotshifts"))
+    f["courts"] = courts_used(f)
     f["slot"] = np.where(f["weekend"], "Weekend", "Weekday " + f["daypart"].map(
         {"early": "before 9am", "day": "9am–5pm", "evening": "after 5pm"}))
     # fill 7 / 3 / 1 days out, each where we were watching the session by then
@@ -554,6 +642,9 @@ def main():
             # per-session member price where published; length in hours; how the
             # price was worked out (venue_report.session_prices); longest waitlist
             "mprice": r1(x.mprice_n), "dur": r1(x.dur_h), "pb": x.price_basis,
+            # estimated courts (courts_used, by format) and the casual hire rate
+            # for the same venue, day and time (hire_rates), for like-for-like money
+            "ct": int(x.courts), "hire": r1(x.hire_rate),
             "wl": int(x.waitlist_max) if x.waitlist_max == x.waitlist_max and x.waitlist_max is not None else None,
             "co": x.co_list or None,       # coaches as PlayByPoint lists them (from 6 Oct)
             "ps": x.program_slug if isinstance(x.program_slug, str) and x.program_slug else None,   # its program, for listing horizon
