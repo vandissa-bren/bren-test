@@ -15,6 +15,7 @@ import pandas as pd
 
 import venue_report as R
 import report_more as M
+import series as SER
 
 HERE = Path(__file__).resolve().parent
 CBD = (-37.8136, 144.9631)
@@ -488,8 +489,8 @@ def quality(s, f, tl, start, end, vmap):
     """What each venue's listings say and leave out, and how well we read
     them. Counts; the page turns them into shares. Listing: sessions logged
     in the window, pulled before they ran, moved, repriced; of the finished
-    ones with a title, those stating no level; fixtures (same day and time,
-    3+ runs) and those whose title varies. Our data: finished sessions with a
+    ones with a title, those stating no level; fixtures (the same weekly
+    session, series.py, 3+ runs) and those whose title varies. Our data: finished sessions with a
     title, an end time, a roster read, a roster that matches places taken
     (within 1), and a last reading within 6 h of the start."""
     gone = R.pulled(s)
@@ -501,12 +502,13 @@ def quality(s, f, tl, start, end, vmap):
     held = tl[~tl["cancelled"]].groupby("session_key").size()
     roster = f["session_key"].map(held)
     out = {}
+    sid = SER.assign_series(f)        # the same weekly session (series.py)
     for fid in vmap:
         ww, ff = w[w["fid"] == fid], f[f["fid"] == fid]
         if not len(ff):
             continue
-        titled = ff[ff["title"].notna()]
-        fx = titled.groupby(["dow", "hm"])["title"].agg(["size", "nunique"])
+        titled = ff[ff["title"].notna()].assign(_sid=sid.reindex(ff.index)).dropna(subset=["_sid"])
+        fx = titled.groupby("_sid")["title"].agg(["size", "nunique"])
         fx = fx[fx["size"] >= 3]
         rr = roster[ff.index]
         has = rr.notna()
