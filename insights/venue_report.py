@@ -24,6 +24,7 @@ import numpy as np
 import pandas as pd
 
 from catalogue_terms import session_terms as parse
+import cancellations as CX
 
 HERE = Path(__file__).resolve().parent
 MEL = "Australia/Melbourne"
@@ -374,10 +375,10 @@ def finished(s):
 def rosters(s, r):
     m = r.merge(s[["session_key", "fid", "starts_at", "title", "family", "label", "band_lo", "band_hi",
                    "dow", "hour", "hm"]], on="session_key", how="left")
+    # the one cancellation rule (cancellations.py), on every row before any are
+    # dropped: all rows are evidence of when the capture job ran
+    m = CX.classify(m, s)
     m = m[m["fid"].notna()].copy()
-    g = m.groupby("session_key")
-    last_pass = g["last_seen"].transform("max")
-    m["cancelled"] = (m["last_seen"] < last_pass) & (m["last_seen"] < m["starts_at"])
     m["rating"] = m["rating_at_time"].where(~m["rating_at_time"].isin([1.0, 2.0]) & (m["rating_at_time"] <= 6.0))
     return m
 
