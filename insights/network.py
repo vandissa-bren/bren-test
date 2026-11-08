@@ -17,6 +17,8 @@ import networkx as nx
 import numpy as np
 import pandas as pd
 from scipy import sparse
+
+import series as SER
 from scipy.sparse.csgraph import shortest_path, connected_components
 
 EVENT_CAP = 50
@@ -50,6 +52,7 @@ def codes(ids):
 
 
 def series_key(x):
+    """Kept for callers outside the build; the build uses series.assign_series."""
     t = x.title if isinstance(x.title, str) else (x.label if isinstance(x.label, str) else "Untitled session")
     return (int(x.fid), t, int(x.dow), x.hm)
 
@@ -63,10 +66,15 @@ def build(f, m, ok, vmap, clean_name, area_of_fid):
     fin_ok["si"] = fin_ok["session_key"].map(sk2i)
     meta = f.set_index("i")
 
-    # ── series: same venue, title, weekday and start time ──
-    f["series"] = [series_key(x) for x in f.itertuples()]
-    skeys = sorted(set(f["series"]), key=lambda k: (k[0], k[2], k[3], k[1]))
-    sidx = {k: j for j, k in enumerate(skeys)}
+    # ── series: the same weekly session (series.py: venue, weekday, programme
+    #    or title and time, chained week to week) ──
+    #    Competition sessions (team fixtures) have no series and are left out.
+    f["series"] = SER.assign_series(f)
+    lab = SER.series_label(f).set_index("sid")
+    lab["fid"] = f.groupby("series")["fid"].first().astype(int).reindex(lab.index)
+    lab = lab.sort_values(["fid", "dow", "hm", "title"])
+    skeys = [(int(r.fid), r.title, int(r.dow), r.hm) for r in lab.itertuples()]
+    sidx = {k: j for j, k in enumerate(lab.index)}
     f["sj"] = f["series"].map(sidx)
     i2sj = dict(zip(f["i"], f["sj"]))
     fin_ok["sj"] = fin_ok["si"].map(i2sj)
@@ -235,7 +243,7 @@ def build(f, m, ok, vmap, clean_name, area_of_fid):
 
     # ── sessions to try: series your partners play that you haven't ──
     nb = [list(G.neighbors(k)) for k in range(N)]
-    p_series = {int(k_): set(int(v) for v in g) for k_, g in fin_ok.groupby("pi")["sj"]}
+    p_series = {int(k_): set(int(v) for v in g) for k_, g in fin_ok.dropna(subset=["sj"]).groupby("pi")["sj"]}
     for k, p in enumerate(players):
         mine = p_series.get(k, set())
         score = Counter()
