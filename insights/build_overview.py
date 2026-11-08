@@ -699,6 +699,7 @@ def main():
             "loyal": round(100 * (p["share"] > 0.8).mean(), 1) if len(p) else None,
             "homeHere": int(len(homes_here)),
             "fromAfar": round(100 * np.mean([km > 5 for km in away]), 1) if away else None,
+            "fromAfarN": len(away),        # base for the 5+ check (privacy.py); not published
             "cancel": round(100 * tlv["cancelled"].mean(), 1) if len(tlv) else None,
             "lead": (lp["median_days"] if isinstance(lp["median_days"], (int, float)) else 8.0) if lp["n"] >= 20 else None,
             "leadN": int(lp["n"]),
