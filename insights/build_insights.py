@@ -233,7 +233,9 @@ def shareable(d: dict, net: dict) -> dict:
         p["sessions"] = [x for x in p["sessions"] if x[0] in ids]
         p["venuePlayers"] = {k: n for k, n in p.get("venuePlayers", {}).items() if int(k) in ids}
         d["prev"] = p
-    return d
+    # last: every player count and player-based rate must be 5+ (privacy.py)
+    import privacy
+    return privacy.enforce(d)
 
 
 def pm_run(frm, to):
