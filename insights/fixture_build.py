@@ -80,6 +80,34 @@ def write(out: Path, start=date(2026, 9, 28), weeks=5, players=420, seed=7):
                                  "last_seen": last.isoformat(),
                                  "rating_at_time": None if r is None else (f"{r:.3f}" if r > 2 else "1.0")})
     s, r, c = pd.DataFrame(sess), pd.DataFrame(rost), pd.DataFrame(cat)
+    # waitlists: fill-log readings with people waiting, for full sessions with a queue
+    wl = []
+    for x in sess:
+        if x["waitlist_max"]:
+            st = datetime.fromisoformat(x["starts_at"])
+            for hrs, n in ((50, 1), (30, x["waitlist_max"])):
+                wl.append({"session_key": x["session_key"], "observed_at": (st - timedelta(hours=hrs)).isoformat(),
+                           "waitlist": n})
+    pd.DataFrame(wl, columns=["session_key", "observed_at", "waitlist"]).to_csv(out / "waitlists.csv", index=False)
+    # courthire: each venue's courts, 6am-10pm, every day; its sessions take
+    # courts at their hour, and hire fills evenings more than mornings
+    ch = []
+    days = sorted({x["session_date"] for x in sess})
+    prog = {}
+    for x in sess:
+        k = (int(x["venue_id"][4:]), x["session_date"], int(x["start_time"][:2]))
+        prog[k] = prog.get(k, 0) + -(-int(x["capacity"]) // 4)
+    for v in VENUES + [TINY]:
+        n = 6 + int(v) % 4
+        for dd in days:
+            for hr in range(6, 22):
+                for mm in (0, 30):
+                    pg = min(n, prog.get((int(v), dd, hr), 0))
+                    hire = min(n - pg, rnd.randint(0, n) if hr >= 17 else rnd.randint(0, 2))
+                    ch.append({"fid": int(v), "slot_date": dd, "slot_start": f"{hr:02d}:{mm:02d}:00",
+                               "n_courts": n, "taken": pg + hire, "programmed": pg, "hire_taken": hire,
+                               "hireable": n - pg})
+    pd.DataFrame(ch).to_csv(out / "courthire.csv", index=False)
     s.to_csv(out / "sessions.csv", index=False)
     r.to_csv(out / "rosters.csv", index=False)
     c.to_csv(out / "catalogue.csv", index=False)
