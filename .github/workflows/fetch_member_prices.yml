@@ -1,13 +1,24 @@
 name: Fetch Member Court Prices
+# Member court-hire rates for every venue where Esta's PlayByPoint account is a
+# member (Dink & Drive today), saved to availability_cache.member_court_prices
+# and logged to court_rate_states.member_price (record_court_rates).
+# 8 Nov 2026: minute moved off :00 (GitHub drops scheduled runs there, F66);
+# the script now fails the run when it saves nothing, instead of going green.
+# Secrets: SUPABASE_URL, SUPABASE_SERVICE_KEY, ESTA_SUPABASE_USER_ID.
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 */6 * * *'  # every 6 hours
+    - cron: '17 */6 * * *'  # every 6 hours, at :17
+
+concurrency:
+  group: fetch-member-prices
+  cancel-in-progress: false
 
 jobs:
   fetch:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
