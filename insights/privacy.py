@@ -17,7 +17,18 @@ players per venue). So the published build passes through one last filter here:
   PARTS   (partitions()) every total published next to its breakdown or a
           subset of it: subtracting the visible parts must never leave 1-4
           ("40 players, 36 of them new" says 4 returned). The smallest visible
-          part is hidden until no remainder is 1-4.
+          part is hidden until no remainder is 1-4. Three kinds:
+            subset  the parts are some of the total (quiet regulars of all
+                    regulars): total minus visible parts must not be 1-4;
+            exact   the parts add up to the total (quiet = booked elsewhere +
+                    not seen): as subset, and also no single hidden number may
+                    be worked back out (one hidden among total and parts is
+                    total minus the rest, or the sum of the rest);
+            city    a city figure next to the venue figures it covers (players
+                    can be in more than one venue, so it's not exact): city
+                    minus the visible venues must not be 1-4, and when it is,
+                    the CITY figure is hidden, not a venue's.
+          Repeated until nothing changes.
 
 Paths: dot-separated keys; "*" is every key of a dict; "[]" after a key is
 every item of a list; "[2]" is item 2. A path that isn't in the build is
@@ -71,6 +82,14 @@ COUNTS = [
     "ratings.venues.*.*[0]", "ratings.programmes[].players", "ratings.programmes[].after[0]",
     # the period before
     "prev.players", "prev.venuePlayers.*",
+    # the seven figures (figures.py)
+    "figures.quiet.city.regulars", "figures.quiet.city.quiet",
+    "figures.quiet.venues.*.regulars", "figures.quiet.venues.*.quiet",
+    "figures.quiet.venues.*.elsewhere", "figures.quiet.venues.*.notSeen", "figures.quiet.venues.*.to[][1]",
+    "figures.retention.city[].n", "figures.retention.venues.*[].n",
+    "figures.sameFaces.venues.*[].players",
+    "figures.where.venues.*[].players",
+    "figures.leaning.venues.*.players", "figures.leaning.venues.*.top",
 ]
 
 # (rate path, base path), both relative to the same parent object. The rate is
@@ -84,6 +103,10 @@ RATES = [
     ("ratings.progression", 2, 0), ("ratings.progression", 3, 0),
     ("pm.regulars", 1, 0),
     ("pm.venues.*", 4, 0),
+    # new players coming back: wK is a % of the cohort's n
+    *[(p, f"w{k}", "n") for p in ("figures.retention.city[]", "figures.retention.venues.*[]") for k in (1, 2, 4, 8)],
+    # same faces: % of a run's players (its median size) who were at the run before
+    ("figures.sameFaces.venues.*[]", "pct", "players"),
 ]
 # bases the builders add only for this check; removed before publishing
 INTERNAL = [("venues[]", "fromAfarN"), ("venues[]", "cameBackN")]
@@ -158,24 +181,31 @@ def partitions(d: dict):
     """Every (total, parts) pair the build publishes where the parts are a
     breakdown, or a subset, of the total, as (container, key) references.
     Subtracting the visible parts from the total must never leave 1-4: that
-    remainder is a group of players too. Used by enforce() and by the tests."""
+    remainder is a group of players too. Used by the tests; enforce() uses
+    partitions_ex(), which also says what kind each pair is."""
+    return [(t, p) for t, p, _ in partitions_ex(d)]
+
+
+def partitions_ex(d: dict):
+    """partitions() with each pair's kind: 'subset', 'exact' or 'city'."""
     G = []
 
-    def add(total, parts):
+    def add(total, parts, kind="subset"):
         parts = [p for p in parts if _ref_ok(p)]
         if _ref_ok(total) and parts:
-            G.append((total, parts))
+            G.append((total, parts, kind))
 
     pl = d.get("players")
     if isinstance(pl, dict):
         for sub in ("freq", "venues", "level"):
             if isinstance(pl.get(sub), dict):
-                add((pl, "total"), [(pl[sub], k) for k in pl[sub]])
+                # freq and venues bins cover every player; level only the rated
+                add((pl, "total"), [(pl[sub], k) for k in pl[sub]], "exact" if sub != "level" else "subset")
     nr = d.get("newret")
     if isinstance(nr, dict):
         c = nr.get("city")
         if isinstance(c, dict):
-            add((c, "players"), [(c, "new"), (c, "returning")])
+            add((c, "players"), [(c, "new"), (c, "returning")], "exact")
         for w in nr.get("weeks") or []:
             if isinstance(w, list) and len(w) >= 3:
                 add((w, 1), [(w, 2)])
@@ -192,7 +222,7 @@ def partitions(d: dict):
         for card in cards:
             if isinstance(card, dict) and isinstance((card.get("series") or {}).get("newHere"), list):
                 wk = card["series"]["newHere"]
-                add((card, "newHere"), [(wk, i) for i in range(len(wk))])
+                add((card, "newHere"), [(wk, i) for i in range(len(wk))], "exact")
     base = (d.get("shares") or {}).get("base") or {}
     for v in d.get("venues") or []:
         if not isinstance(v, dict):
@@ -206,7 +236,7 @@ def partitions(d: dict):
         if isinstance(tr, dict):
             add((tr, "players"), [(tr, "travellers")])
             if isinstance(tr.get("classes"), dict):
-                add((tr, "travellers"), [(tr["classes"], k) for k in tr["classes"]])
+                add((tr, "travellers"), [(tr["classes"], k) for k in tr["classes"]], "exact")
     for s in ((d.get("net") or {}).get("series") or []):
         if isinstance(s, dict):
             add((s, "players"), [(s, "regulars")])
@@ -216,6 +246,23 @@ def partitions(d: dict):
     for r in (d.get("levelFit") or []) + (d.get("levelClass") or []):
         if isinstance(r, dict):
             add((r, "players"), [(r, "verified")])
+    # regulars who've gone quiet: quiet = elsewhere + not seen; quiet is a
+    # subset of regulars; each "now books at X" is a subset of elsewhere
+    q = ((d.get("figures") or {}).get("quiet") or {})
+    if isinstance(q.get("city"), dict):
+        add((q["city"], "regulars"), [(q["city"], "quiet")])
+    qv = [vv for vv in (q.get("venues") or {}).values() if isinstance(vv, dict)]
+    for vv in qv:
+        add((vv, "quiet"), [(vv, "elsewhere"), (vv, "notSeen")], "exact")
+        add((vv, "regulars"), [(vv, "quiet")])
+        for t in vv.get("to") or []:
+            if isinstance(t, list) and len(t) >= 2:
+                add((vv, "elsewhere"), [(t, 1)])
+    # the city's quiet regulars (and regulars) against the venues listed:
+    # "15 city-wide, 12 at the only venue shown" says 3 at the hidden ones
+    if isinstance(q.get("city"), dict) and qv:
+        for k in ("quiet", "regulars"):
+            add((q["city"], k), [(vv, k) for vv in qv], "city")
     return G
 
 
@@ -226,21 +273,55 @@ def remainder(total_ref, parts) -> float | None:
     return t - sum(_get(*p) for p in parts if _num(_get(*p)))
 
 
-def _complements(d: dict) -> None:
-    """Hide parts until no total minus its visible parts comes to 1-4: the
-    smallest visible non-zero part goes each time (it gives the least away)."""
-    for _ in range(20):
+def _hide_smallest(parts) -> bool:
+    vis = [p for p in parts if _num(_get(*p)) and _get(*p) > 0]
+    if not vis:
+        return False
+    o, k = min(vis, key=lambda p: _get(*p))
+    o[k] = None
+    return True
+
+
+def _exact_totals(d: dict) -> set:
+    """The 'exact' breakdowns that really add up in this build (checked before
+    anything is hidden): only those can be worked back out. One that doesn't
+    add up (a 6-week series under a 90-day total) is treated as a subset."""
+    out = set()
+    for total, parts, kind in partitions_ex(d):
+        if kind != "exact":
+            continue
+        vals = [_get(*r) for r in [total] + parts]
+        if all(_num(v) for v in vals) and abs(vals[0] - sum(vals[1:])) < 1e-9:
+            out.add((id(total[0]), total[1]))
+    return out
+
+
+def _complements(d: dict, exact: set | None = None) -> None:
+    """Hide numbers until no total minus its visible parts comes to 1-4 and
+    no hidden number in an exact breakdown can be worked back out; repeat to a
+    fixpoint (hiding one number can expose another pair)."""
+    for _ in range(100):
         changed = False
-        for total, parts in partitions(d):
+        for total, parts, kind in partitions_ex(d):
+            t = _get(*total)
+            if kind == "exact" and (exact is None or (id(total[0]), total[1]) in exact):
+                # exactly one unknown among the total and its parts can be
+                # worked out from the others: hide one more
+                unknown = [r for r in [total] + parts if not _num(_get(*r))]
+                if len(unknown) == 1 and _hide_smallest(parts if unknown[0] is total else
+                                                        [p for p in parts if p is not unknown[0]] or parts):
+                    changed = True
+                    continue
             rem = remainder(total, parts)
             if rem is None or not small(rem):
                 continue
-            vis = [p for p in parts if _num(_get(*p)) and _get(*p) > 0]
-            if not vis:
+            if kind == "city":
+                if _num(t):
+                    total[0][total[1]] = None             # hide the city figure, not a venue's
+                    changed = True
                 continue
-            o, k = min(vis, key=lambda p: _get(*p))
-            o[k] = None
-            changed = True
+            if _hide_smallest(parts):
+                changed = True
         if not changed:
             return
 
@@ -257,9 +338,24 @@ def _shares_bases(d: dict) -> None:
             r[3] = r[4] = None
 
 
+def _quiet_split(d: dict) -> None:
+    """Regulars who've gone quiet: the split is shown whole or not at all
+    (half a split next to the total gives the other half away), and when
+    "booked elsewhere" is hidden, the venues they now book at go too."""
+    q = ((d.get("figures") or {}).get("quiet") or {})
+    for vv in (q.get("venues") or {}).values():
+        if not isinstance(vv, dict):
+            continue
+        if vv.get("elsewhere") is None or vv.get("notSeen") is None:
+            vv["elsewhere"] = vv["notSeen"] = None
+        if vv.get("elsewhere") is None and vv.get("to"):
+            vv["to"] = []
+
+
 def enforce(d: dict) -> dict:
     """Apply RATES then COUNTS, then hide whatever subtraction would give away
     (partitions), to the build in place; returns it."""
+    exact = _exact_totals(d)
     for parent_path, rate_k, base_k in RATES:
         for o in _objects(d, _parse(parent_path)):
             rate, base = _get(o, rate_k), _get(o, base_k)
@@ -277,8 +373,10 @@ def enforce(d: dict) -> dict:
         for parent, k in list(_parents(d, _parse(path))):
             if small(parent[k]):
                 parent[k] = None
-    _complements(d)
-    _shares_bases(d)
+    for _ in range(3):                    # the follow-on rules can hide more; check again
+        _complements(d, exact)
+        _shares_bases(d)
+        _quiet_split(d)
     for parent_path, k in INTERNAL:
         for o in _objects(d, _parse(parent_path)):
             if isinstance(o, dict):
