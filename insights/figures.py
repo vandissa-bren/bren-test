@@ -744,8 +744,14 @@ def cut_or_move(f: pd.DataFrame, km, vname, end_day: date | None = None) -> dict
         rows.append({"sid": sid, "v": v0, "label": _label_text(l) if l else sid, "kind": kind_name(*k0),
                      "fills": fills, "better": better, "text": txt})
     rows.sort(key=lambda r: np.mean(r["fills"]))
-    out["city"] = rows[:20]
-    for r in rows:
+    # Nobody booked in any of the 4 weeks (PlayByPoint's own count and the roster
+    # agree, 9 Nov check). Venues list these in case someone books, and likely
+    # release the court when nobody does, so "cut or move" means nothing for
+    # them. Kept apart (neverBooked) so the list is sessions that ran half-empty.
+    ran, never = [r for r in rows if any(v > 0 for v in r["fills"])], [r for r in rows if not any(v > 0 for v in r["fills"])]
+    out["city"] = ran[:20]
+    out["neverBooked"] = never
+    for r in ran:
         out["venues"].setdefault(str(r["v"]), []).append(r)
     return out
 
