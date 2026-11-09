@@ -34,6 +34,12 @@ DATA = Path(os.environ.get("INSIGHTS_DATA", HERE / "data"))
 WORK = Path(os.environ.get("INSIGHTS_WORK", HERE / "work"))
 
 
+def hhmm(col: pd.Series) -> pd.Series:
+    """Clock times as written anywhere in the export: "19:00", "19:00:00" or
+    "7:30". Seconds are dropped; anything else is NaT."""
+    t = col.astype("string").str.strip().str.extract(r"^(\d{1,2}):(\d{2})")
+    return pd.to_datetime(t[0].str.zfill(2) + ":" + t[1], format="%H:%M", errors="coerce")
+
 def registry():
     data = json.loads((HERE.parent / "venues.json").read_text())
     if isinstance(data, dict):
@@ -118,8 +124,7 @@ def attach_titles(s, c):
     s["dow"], s["hm"] = loc.dt.dayofweek, loc.dt.strftime("%H:%M")
     s["hour"] = loc.dt.hour
     c["dow"] = pd.to_datetime(c["date"]).dt.dayofweek
-    c["dur_h"] = (pd.to_datetime(c["end_time"], format="%H:%M", errors="coerce")
-                  - pd.to_datetime(c["start"], format="%H:%M", errors="coerce")).dt.total_seconds() / 3600
+    c["dur_h"] = (hhmm(c["end_time"]) - hhmm(c["start"])).dt.total_seconds() / 3600
     by_key = c.set_index("key")
     fx = (c.groupby(["venue_id", "dow", "start", "type"])
            .agg(titles=("title", lambda x: sorted(set(x))), skill=("skill_level", "first"), dur=("dur_h", "median"))
@@ -148,8 +153,8 @@ def attach_titles(s, c):
     s["title"], s["skill_level"], s["dur_h"], s["title_how"] = titles, skills, durs, how
     # The session's own logged end time (20261016100000) beats the catalogue's.
     if "end_time" in s:
-        end = pd.to_datetime(s["end_time"], format="%H:%M", errors="coerce")
-        start = pd.to_datetime(s["hm"], format="%H:%M", errors="coerce")
+        end = hhmm(s["end_time"])
+        start = hhmm(s["hm"])
         own = (end - start).dt.total_seconds() / 3600
         s["dur_h"] = own.where(own > 0, s["dur_h"])
     terms = [parse(t, ty if isinstance(ty, str) else None, sk if isinstance(sk, str) else None) if isinstance(t, str) and t else None
