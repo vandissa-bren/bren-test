@@ -34,8 +34,11 @@ def write(out: Path, start=date(2026, 9, 28), weeks=5, players=420, seed=7):
         home = rnd.choice(VENUES)
         k = rnd.random()
         rating = (round(rnd.uniform(2.5, 4.6), 3) if k < 0.3 else (1.0 if k < 0.7 else None))
+        # half the players also play at the next venue along, so venues share
+        # enough players for every "shares players" pair to be published
+        nxt = VENUES[(VENUES.index(home) + 1) % len(VENUES)]
         habit[p] = {"home": home, "rating": rating, "keen": rnd.random(),
-                    "other": rnd.choice(VENUES) if rnd.random() < 0.3 else None}
+                    "other": nxt if rnd.random() < 0.5 else None}
     sess, rost, cat = [], [], []
     lesson = 500000
     for p in pool[:3]:
