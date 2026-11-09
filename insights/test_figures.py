@@ -78,9 +78,9 @@ def test_need_court_already_full_counts_only_when_seen_48h_out():
 def test_need_court_waitlist_must_appear_a_day_ahead_when_known():
     late = F(weekly(4, wl=3, wfa_h=5))
     assert FG.need_court(late)["city"] == []
-    early = F(weekly(4, wl=3, wfa_h=30))
+    early = F(weekly(4, wl=3, wfa_h=30, booked=15))
     assert FG.need_court(early)["city"][0]["waitlist"] is True
-    one = F(weekly(4, wl=1, wfa_h=30))           # a waitlist of 1 isn't pressure
+    one = F(weekly(4, wl=1, wfa_h=30, booked=15))           # a waitlist of 1 isn't pressure
     assert FG.need_court(one)["city"] == []
 
 
@@ -239,9 +239,12 @@ def test_where_candidates_and_finish():
     got = d["figures"]["where"]["venues"]["1"]
     top = got[0]
     assert (top["dow"], top["h"], top["confidence"]) == (2, 19, "High")
-    assert top["text"].startswith("8 of your players who come twice or more play intermediate social & open play elsewhere on Wednesday evenings around 7pm")
-    assert "Venue 2 Wed 7pm (2.0 km)" in top["text"] and "sold out at least 2 days early in 6 of its last 6 weeks" in top["text"]
-    assert "You have 2 or more courts free at 7pm in 5 of the last 6 weeks (usually 3)." in top["text"]
+    assert top["text"].startswith("8 of your players who come twice or more book intermediate social & open play elsewhere on Wednesday evenings around 7pm")
+    assert "Venue 2 (2.0 km) runs intermediate social & open play on Wednesdays at 7pm" in top["text"]
+    assert "sold out at least 2 days early in 6 of its last 6 weeks" in top["text"]
+    assert "You have 2 or more courts free on Wednesdays at 7pm in 5 of the last 6 weeks (usually 3)." in top["text"]
+    # 6pm rests on the same format the same evening: one suggestion, not two
+    assert not any(r["dow"] == 2 and r["h"] == 18 for r in got)
     assert "more sold out" not in top["text"] and " and 1 more" not in top["text"]
     assert all(r["h"] != 20 for r in got)          # 20:00 has courts free in only 1 of 6 weeks
 
@@ -400,7 +403,7 @@ def test_need_court_full_at_any_reading_and_hours_from_sold_out_weeks():
         r["sold_out"] = False
     assert len(FG.need_court(F(rows))["city"]) == 1
     # 3 sold-out weeks at 72 h and a waitlist-only week: hoursEarly from the sold-out weeks
-    rows = weekly(4, so_h=lambda w: 72 if w < 3 else None, booked=lambda w: 16 if w < 3 else 10,
+    rows = weekly(4, so_h=lambda w: 72 if w < 3 else None, booked=lambda w: 16 if w < 3 else 15,
                   wl=lambda w: 0 if w < 3 else 4, wfa_h=lambda w: None if w < 3 else 30)
     r = FG.need_court(F(rows))["city"][0]
     assert r["hoursEarly"] == 72.0 and r["runs"] == [True, True, True, True]
@@ -505,3 +508,49 @@ def test_carry_over_names_the_window_that_built():
     d90 = {"figures": {"needCourt": {}}, "digest": {"from": "x"}}
     f2, _ = BI.carry_over(d90, 90, 49, None, None)
     assert d90["figures"]["fromCovered"] == 49
+
+
+# ── 9 Nov fixes after the first real build ──
+def test_need_court_sold_out_early_but_started_half_empty_is_not_listed():
+    # a term programme: full a week ahead every week, but only 9 of 16 there at the start
+    rows = weekly(4, so_h=170, booked=9)
+    for r in rows:
+        r["sold_out"] = False
+    assert FG.need_court(F(rows))["city"] == []
+
+
+def test_need_court_coached_sessions_listed_apart():
+    rows = weekly(4, so_h=60, booked=16, title="Youth Pickleball Growth Program", fgroup="Unknown")
+    out = FG.need_court(F(rows))
+    assert out["city"] == [] and out["venues"] == {}
+    assert len(out["needCoach"]) == 1 and out["needCoach"][0]["coached"] is True
+    rows = weekly(4, so_h=60, booked=16, title="Fundamentals", fgroup="Coaching & clinics")
+    assert len(FG.need_court(F(rows))["needCoach"]) == 1
+    assert FG.need_court(F(weekly(4, so_h=60, booked=16)))["city"][0]["coached"] is False
+
+
+def test_where_skips_unknown_formats_and_thin_nearby_evidence():
+    f, o = _where_world()
+    f = f.copy()
+    f["fgroup"] = "Unknown"
+    cand = FG.where_candidates(f, o, _km, lambda v: f"Venue {v}", [1, 2])
+    assert all(r["kind"] != "unknown" and r["fmt"] != "Unknown" for rows in cand.values() for r in rows)
+    # a nearby session seen only twice is no evidence
+    f2, o2 = _where_world()
+    keep = f2[f2["fid"] == 2].sort_values("starts_at").tail(2).index
+    f2 = f2[(f2["fid"] != 2) | f2.index.isin(keep)]
+    cand = FG.where_candidates(f2, o2.iloc[0:0], _km, lambda v: f"Venue {v}", [1, 2])
+    assert all(r["nearby"] == 0 for rows in cand.values() for r in rows)
+
+
+def test_where_same_nearby_session_once():
+    near = {"v": 2, "km": 1.0, "runs": 4, "earlyRuns": 4, "early": 1.0, "fill": 1.0, "name": "Venue 2",
+            "dow": 4, "h": 16, "kind": "social & open play", "label": "Venue 2 Fri 4pm", "key": "2|4|16"}
+    rows = [{"dow": 4, "h": h, "fmt": fm, "lvl": "all levels", "kind": "x", "players": None, "nearby": 1,
+             "nearbyBest": near} for h, fm in ((15, "Social & open play"), (16, "Social & open play"), (16, "Round robin"),
+                                              (17, "Round robin"))]
+    cols = ["v", "dow", "h", "weeks", "free2", "freeMed", "courts"]
+    d = {"_where": {"1": rows}, "courtFree": {"cols": cols, "rows": [[1, 4, h, 5, 5, 3, 6] for h in (15, 16, 17)]}}
+    FG.where_finish(d)
+    got = d["figures"]["where"]["venues"]["1"]
+    assert len(got) == 1 and "on Fridays at 4pm" in got[0]["text"]
