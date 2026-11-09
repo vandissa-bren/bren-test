@@ -25,6 +25,7 @@ and privacy.enforce checks every path again (FIG_COUNTS / FIG_RATES there).
 from __future__ import annotations
 
 import math
+import re
 from datetime import date, timedelta
 
 import numpy as np
@@ -46,6 +47,13 @@ WAIT_AHEAD_H = 24           # ... first seen at least this long before the start
 NEED_RUNS = 4               # look at the last 4 runs
 NEED_FLAGS = 3              # under pressure in 3 of them
 NEED_WATCHED = 3            # with at least 3 watched from 48 h out
+NEED_FILL = 0.85            # ... and a pressure week only counts if it started 85%+ full: a session that
+                            # sold out early but lost places before the start (term programmes, mass
+                            # cancellations, places added) doesn't need another court
+# coached sessions: another court needs a coach as well, so they're listed apart (needCoach)
+COACHED_GROUPS = {"Coaching & clinics", "Learn to play"}
+COACHED_WORDS = re.compile(r"\b(coach\w*|clinics?|lessons?|programs?|programmes?|kids|youth|juniors?|starter|"
+                           r"learn to play|academy|drills?|skills)\b", re.I)
 # regulars who've gone quiet
 REG_WEEKS, REG_OF = 4, 6    # played in 4 of the 6 weeks up to their last visit
 QUIET_X, QUIET_MIN_D = 2, 14
@@ -63,6 +71,9 @@ OWN_CLASH_MIN = 90          # nothing of the kind at the venue within 90 minutes
 OWN_HALF_EMPTY = 70         # ... and no own session within 90 minutes under 70% full
 COURTS_FREE, COURTS_SHARE, COURTS_WEEKS, HIGH_WEEKS = 2, 0.6, 4, 6
 WHERE_TOP = 5
+NEAR_MIN_RUNS = 3           # a nearby session counts as evidence only after 3 runs seen
+WHERE_SPREAD_H = 2          # suggestions on the same day within 2 hours that rest on the same
+                            # format or the same nearby session are one suggestion: the best is kept
 # freed places refilled
 REFILL_MIN_SESSIONS = 10
 # leaning on a few players
@@ -112,6 +123,11 @@ def kind_name(fgroup, lvl) -> str:
     return f"{lv} {g}"
 
 
+def _known(k) -> bool:
+    """A (format, level) kind whose format is known."""
+    return isinstance(k[0], str) and k[0] not in ("", "Unknown")
+
+
 def _ts(x):
     return pd.to_datetime(x, utc=True, errors="coerce", format="mixed")
 
@@ -151,6 +167,11 @@ def _end_day(x: pd.DataFrame, end_day):
 def _current(g: pd.DataFrame, end_day: date) -> bool:
     """A weekly session still running: its latest run within 10 days of the end."""
     return (end_day - g["_date"].iloc[-1]).days <= STALE_DAYS
+
+
+def coached(fgroup, title) -> bool:
+    """A session run by a coach: its format, or its title, says so."""
+    return (isinstance(fgroup, str) and fgroup in COACHED_GROUPS) or bool(COACHED_WORDS.search(str(title or "")))
 
 
 def _full_hours(x: pd.DataFrame):
@@ -196,7 +217,8 @@ def need_court(f: pd.DataFrame, end_day: date | None = None, top_city=20) -> dic
     else:                                                 # an old export: no timing at all
         timely = pd.Series(True, index=x.index)
     x["_wait"] = (wl >= WAIT_MIN) & timely
-    x["_press"] = x["_early"] | x["_wait"]
+    started_full = pd.to_numeric(x["fill"], errors="coerce").fillna(0) >= NEED_FILL
+    x["_press"] = (x["_early"] | x["_wait"]) & started_full
     rows = []
     for sid, g in x.sort_values("starts_at").groupby("sid", sort=False):
         if not _current(g, end_day):
@@ -209,13 +231,18 @@ def need_court(f: pd.DataFrame, end_day: date | None = None, top_city=20) -> dic
             continue
         hrs = _median(last.loc[last["_early"], "_fullH"].tolist())   # sold-out weeks only
         l = lab.get(sid, {})
+        fg = g["fgroup"].iloc[-1] if "fgroup" in g else None
         rows.append({"sid": sid, "v": int(g["fid"].iloc[0]), "label": _label_text(l) if l else sid,
                      "title": l.get("title"), "dow": l.get("dow"), "hm": l.get("hm"),
                      "runs": flags, "hoursEarly": _r1(hrs), "waitlist": bool(last["_wait"].any()),
-                     "fill": _r1(100 * last["fill"].mean())})
+                     "fill": _r1(100 * last["fill"].mean()),
+                     "coached": coached(fg, l.get("title") or (g["title"].iloc[-1] if "title" in g else None))})
     rows.sort(key=lambda r: (-sum(r["runs"]), -(r["hoursEarly"] or 0)))
-    out["city"] = rows[:top_city]
-    for r in rows:
+    # coached sessions need a coach as well as a court: kept apart so the court list is courts only
+    courts, coach = [r for r in rows if not r["coached"]], [r for r in rows if r["coached"]]
+    out["city"] = courts[:top_city]
+    out["needCoach"] = coach[:top_city]
+    for r in courts:
         out["venues"].setdefault(str(r["v"]), []).append(r)
     return out
 
@@ -425,9 +452,12 @@ def where_candidates(f: pd.DataFrame, okv: pd.DataFrame, km, vname, tracked, end
     # nearby demand groups: venue x dow x hour x kind
     grp = {}
     for (v, d, h, k), g in x.groupby(["fid", "_dow", "_h", "_kind"]):
+        if not _known(k) or len(g) < NEAR_MIN_RUNS:
+            continue                                      # an unknown format, or too few runs to go on
         early = float(((g["so_h"] >= EARLY_H)).mean())
         grp[(int(v), int(d), int(h), k)] = {"runs": int(len(g)), "earlyRuns": int((g["so_h"] >= EARLY_H).sum()),
                                            "fill": float(g["fill"].mean()), "early": early,
+                                           "name": vname(int(v)), "dow": int(d), "h": int(h), "kind": kind_name(*k),
                                            "label": f"{vname(int(v))} {DOW3[int(d)]} {ampm(f'{int(h):02d}:00')}"}
     # the venue's own recent sessions, for "it runs nothing like it" and the clash check
     recent = x[x["_date"] > end_day - timedelta(days=RECENT_DAYS)]
@@ -442,6 +472,8 @@ def where_candidates(f: pd.DataFrame, okv: pd.DataFrame, km, vname, tracked, end
         if base:
             ob = o[o["pbp_user_id"].isin(base) & (o["fid"] != v) & o["fid"].isin(tracked)]
             for (d, h, k), g in ob.groupby(["_dow", "_h", "_kind"]):
+                if not _known(k):
+                    continue                              # "unknown" isn't a kind of session to suggest
                 cands.setdefault((int(d), int(h), k), set()).update(g["pbp_user_id"])
         # widen each slot to its neighbouring hours
         a_count = {}
@@ -463,7 +495,7 @@ def where_candidates(f: pd.DataFrame, okv: pd.DataFrame, km, vname, tracked, end
                     ev = b_ev.setdefault((d, hh, k), {})
                     cur = ev.get(w)                       # one entry per nearby venue: its best slot
                     if cur is None or (gr["early"], gr["fill"]) > (cur["early"], cur["fill"]):
-                        ev[w] = dict(gr, v=w, km=round(dist, 1))
+                        ev[w] = dict(gr, v=w, km=round(dist, 1), key=f"{w}|{d}|{h}")   # one nearby venue and hour, whatever the kind
         slots = set(a_count) | set(b_ev)
         rows = []
         for (d, h, k) in slots:
@@ -492,21 +524,37 @@ def _where_text(r: dict, courts: dict | None) -> str:
     dname, hh = DOW[r["dow"]], ampm(f"{r['h']:02d}:00")
     parts = []
     if r.get("players"):
-        parts.append(f"{r['players']} of your players who come twice or more play {r['kind']} elsewhere on "
+        parts.append(f"{r['players']} of your players who come twice or more book {r['kind']} elsewhere on "
                      f"{dname} {daypart(r['h'])} around {hh}, when you run nothing like it.")
     nb = r.get("nearbyBest")
     if nb:                                                # the best nearby session only
+        nh = nb.get("h")
+        when = f"{DOW[nb['dow']]}s at {ampm(f'{nh:02d}:00')}" if "dow" in nb and nh is not None else nb["label"]
+        what = f"{nb['name']} ({nb['km']} km) runs {nb['kind']} on {when}" if "name" in nb else \
+            f"{nb['label']} ({nb['km']} km)"
         if nb["earlyRuns"] and nb["early"] >= 0.5:
-            how = f"sold out at least 2 days early in {nb['earlyRuns']} of its last {nb['runs']} weeks"
+            how = f"it sold out at least 2 days early in {nb['earlyRuns']} of its last {nb['runs']} weeks"
         else:
-            how = f"runs {100 * nb['fill']:.0f}% full on average"
-        parts.append(f"Nearby, {nb['label']} ({nb['km']} km) {how}.")
+            how = f"it was {100 * nb['fill']:.0f}% full on average over its last {nb['runs']} weeks"
+        parts.append(f"Nearby, {what}, and {how}.")
     if courts:
         usual = courts.get("freeMed")
         tail = f" (usually {usual})" if isinstance(usual, int) and usual >= COURTS_FREE else ""
-        parts.append(f"You have {COURTS_FREE} or more courts free at {hh} in {courts['free2']} of the last "
-                     f"{courts['weeks']} weeks{tail}.")
+        parts.append(f"You have {COURTS_FREE} or more courts free on {dname}s at {hh} in {courts['free2']} of the "
+                     f"last {courts['weeks']} weeks{tail}.")
     return " ".join(parts)
+
+
+def _same_idea(a: dict, b: dict) -> bool:
+    """Two suggestions for the same day within 2 hours that rest on the same
+    format, or the same nearby session, are the same suggestion (the same
+    players or the same competitor, an hour either way)."""
+    if a["dow"] != b["dow"] or abs(a["h"] - b["h"]) > WHERE_SPREAD_H:
+        return False
+    if a["fmt"] == b["fmt"]:
+        return True
+    na, nb = a.get("near"), b.get("near")
+    return bool(na and nb and na.get("key") == nb.get("key"))
 
 
 def where_finish(d: dict) -> None:
@@ -562,11 +610,19 @@ def where_finish(d: dict) -> None:
                 "dow": r["dow"], "h": r["h"], "fmt": r["fmt"], "lvl": r["lvl"], "kind": r["kind"],
                 "confidence": "High" if high else "Medium", "players": r.get("players"),
                 "nearby": r["nearby"], "near": ({"v": nb["v"], "km": nb["km"], "runs": nb["runs"],
-                                                 "earlyRuns": nb["earlyRuns"], "fill": _r1(100 * nb["fill"])} if nb else None),
+                                                 "earlyRuns": nb["earlyRuns"], "fill": _r1(100 * nb["fill"]),
+                                                 "key": nb.get("key")} if nb else None),
                 "courts": courts, "text": _where_text(r, courts)}))
         keep.sort(key=lambda t: t[0], reverse=True)
-        if keep:
-            out[v] = [k for _, k in keep[:WHERE_TOP]]
+        picked = []
+        for _, k in keep:
+            if any(_same_idea(k, p) for p in picked):
+                continue                                  # a near-copy of a better suggestion
+            picked.append(k)
+            if len(picked) == WHERE_TOP:
+                break
+        if picked:
+            out[v] = picked
     figs["where"] = {"venues": out, "reason": None if out else "No time passed all the checks yet."}
 
 
