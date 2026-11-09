@@ -238,6 +238,15 @@ def build(data_dir: Path, work_dir: Path, covered: int | None = None):
     """Run the prototype's analysis over the CSVs in data_dir. covered: the
     days the window spans, for per-week figures (else the sessions' own span)."""
     import importlib
+    # a --csv folder straight from an export has the waitlist readings but not
+    # yet the two columns export() merges into sessions.csv
+    try:
+        import pandas as pd
+        sp, wp = Path(data_dir) / "sessions.csv", Path(data_dir) / "waitlists.csv"
+        if sp.exists() and wp.exists() and "waitlist_first_at" not in pd.read_csv(sp, nrows=0).columns:
+            add_waitlist_times(Path(data_dir))
+    except Exception as e:
+        print(f"  waitlist times: skipped ({type(e).__name__})")
     os.environ["INSIGHTS_DATA"] = str(data_dir)
     os.environ["INSIGHTS_WORK"] = str(work_dir)
     import venue_report as R
@@ -264,7 +273,51 @@ def build(data_dir: Path, work_dir: Path, covered: int | None = None):
         d["courtFree"] = {"cols": [], "rows": [], "ok": False, "weeksRead": 0}
     import views as VW
     VW.hire_takings(d)
+    import figures as FG
+    FG.where_finish(d)            # where to run a new session needs the courts free (figures.py)
     return d, net
+
+
+def carry_over(d: dict, days: int, covered, figures, digest):
+    """The seven figures and "what changed" are worked out once, on the first
+    window that builds (the longest asked for, unless it was skipped or
+    failed), and every later window shows that window's. Each carries the
+    source window's length as asked (fromWindow) and the days it really
+    covers (fromCovered), so the page never says "90 days" for 49. Returns the
+    (figures, digest) to carry into the next window."""
+    if figures is None:
+        if d.get("figures") is not None:
+            d["figures"] = dict(d["figures"], fromWindow=days, fromCovered=covered)
+            figures = d["figures"]
+    elif figures:
+        d["figures"] = dict(figures)              # keeps the source's fromWindow / fromCovered
+    dg = d.get("digest") or {}
+    if digest is None and dg.get("from"):
+        d["digest"] = dict(dg, fromWindow=days, fromCovered=covered)
+        digest = d["digest"]
+    elif digest:
+        d["digest"] = dict(digest)
+    return figures, digest
+
+
+def _figures_for(fg: dict, ids: set) -> dict:
+    """The seven figures, tracked venues only."""
+    import copy
+    fg = copy.deepcopy(fg)
+    keep = lambda dct: {k: v for k, v in (dct or {}).items() if int(k) in ids}
+    for k in ("needCourt", "cutOrMove"):
+        if isinstance(fg.get(k), dict):
+            fg[k]["city"] = [r for r in fg[k].get("city", []) if r["v"] in ids]
+            fg[k]["venues"] = keep(fg[k].get("venues"))
+    for k in ("retention", "sameFaces", "refilled", "leaning", "where"):
+        if isinstance(fg.get(k), dict) and "venues" in fg[k]:
+            fg[k]["venues"] = keep(fg[k]["venues"])
+    q = fg.get("quiet")
+    if isinstance(q, dict):
+        q["venues"] = keep(q.get("venues"))
+        for vv in q["venues"].values():
+            vv["to"] = [t for t in vv.get("to", []) if t[0] in ids]
+    return fg
 
 
 def shareable(d: dict, net: dict) -> dict:
@@ -293,6 +346,9 @@ def shareable(d: dict, net: dict) -> dict:
     for k in ("digest", "scorecard"):
         if d.get(k) and isinstance(d[k].get("venues"), dict):
             d[k] = dict(d[k], venues={vk: vv for vk, vv in d[k]["venues"].items() if int(vk) in ids})
+    d.pop("_where", None)
+    if d.get("figures"):
+        d["figures"] = _figures_for(d["figures"], ids)
     if d.get("courtFree"):
         cf = d["courtFree"]
         d["courtFree"] = dict(cf, rows=[r for r in cf.get("rows", []) if r[0] in ids])
@@ -371,6 +427,7 @@ def main() -> int:
     to = datetime.now(MEL).date() - timedelta(days=1)
     ok = 0
     courthire = {}                 # court hire, fetched once for the longest window (export())
+    figures = None                 # the seven figures are "as of now": every window shows the longest's
     digest = None                  # "what changed" is the same last 7 days vs the 4 weeks before for
                                    # every window; windows too short to hold 5 weeks use the longest's
     with httpx.Client(timeout=300) as client:
@@ -426,11 +483,7 @@ def main() -> int:
                             print(f"{days}d: previous period skipped ({type(e).__name__}: {e})")
                     import views as VW
                     VW.scorecard_changes(d)
-                    dg = d.get("digest") or {}
-                    if dg.get("from"):
-                        digest = digest or dg
-                    elif digest:
-                        d["digest"] = dict(digest, fromWindow=windows[0])
+                    figures, digest = carry_over(d, days, w["covered"], figures, digest)
                 # days: the window asked for (the page's period and the row key);
                 # from/to/covered: what it actually spans after the DATA_START cut
                 out = clean(dict(shareable(d, net), window={
