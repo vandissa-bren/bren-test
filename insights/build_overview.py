@@ -152,7 +152,7 @@ def level_supply(okv, f, vmap):
     home["area"] = home["fid"].map(lambda x: vmap.get(int(x), {}).get("area"))
     home["cls"] = home["pbp_user_id"].map(rating).map(M.rating_class)
     fa = f.assign(area=f["fid"].map(lambda x: vmap.get(int(x), {}).get("area")))
-    hold = lambda n: int(n) if n >= MIN_GROUP else None
+    hold = lambda n: int(n) if n >= MIN_GROUP or n == 0 else None
     out = []
     for area in [None] + sorted({v.get("area") for v in vmap.values() if v.get("tracked") and v.get("area")}):
         h = home if area is None else home[home["area"] == area]
@@ -194,7 +194,7 @@ def coaches(f, okv):
     if not rows:
         return []
     c = pd.DataFrame(rows, columns=["k", "name", "session_key", "fid"])
-    hold = lambda n: int(n) if n >= MIN_GROUP else None
+    hold = lambda n: int(n) if n >= MIN_GROUP or n == 0 else None
     out = []
     for k, g in c.groupby("k"):
         pl = okv[okv["session_key"].isin(set(g["session_key"]))]
@@ -236,7 +236,7 @@ def new_returning(okv, f, vmap, start, end):
     x = x[x["first"].notna()]
     kind = f.set_index("session_key")[["fgroup", "lvl"]]
     x = x.join(kind, on="session_key")
-    hold = lambda n: int(n) if n >= MIN_GROUP else None
+    hold = lambda n: int(n) if n >= MIN_GROUP or n == 0 else None
     players = x["pbp_user_id"].unique()
     is_new = {p for p in players if first_all[p] >= s0}
     # weeks, Monday first
@@ -411,20 +411,18 @@ def money(g) -> dict:
     one is published. Sessions whose season price couldn't be split are left
     out and counted.
 
-    Per court-hour, like for like with court hire (sessions with a length; 5+):
-      fullCourtHour   what a session takes per court-hour when full:
-                      Σ price × capacity ÷ Σ length × courts
-      takenCourtHour  what it actually took: Σ price × booked ÷ the same
-      hireRate        median casual hire rate for the same venue, day and time
-                      slot (hire_rates; the session's `hire_rate`)
+    Per court-hour, like for like with court hire (sessions with a length; 5+;
+    names as the page's glossary, views.GLOSSARY):
+      sessionTakingsPerCourtHourIfFull   Σ price × capacity ÷ Σ length × courts
+      sessionTakingsPerCourtHour         Σ price × booked ÷ the same
+      hireRatePerCourtHour               median casual hire rate for the same
+                                         venue, day and time (hire_rates)
     courts = courts_used (an estimate by format, PLAYERS_PER_COURT).
-    perCourtHour: the old figure (a court per 4 places, takings), kept one
-    release for the page; use takenCourtHour."""
+    hireTakingsPerCourtHour is added later from the court log (views.hire_takings).
+    """
     p = g[g["price_n"].notna()]
     low = p["mprice_n"].where(p["mprice_n"].notna(), p["price_n"])
     both = p[p["mprice_n"].notna() & (p["price_n"] > 0)]
-    hrs = p["dur_h"] * np.ceil(p["capacity"].clip(lower=1) / 4)
-    timed = p[hrs.notna() & (hrs > 0)]
     chrs = p["dur_h"] * courts_used(p)
     ctimed = p[chrs.notna() & (chrs > 0)]
     hire = g["hire_rate"].dropna() if "hire_rate" in g else pd.Series(dtype=float)
@@ -438,10 +436,9 @@ def money(g) -> dict:
         "memberDisc": round(100 * float((1 - both["mprice_n"] / both["price_n"]).median()), 1) if len(both) >= 3 else None,
         "seasonLeftOut": int((g["price_basis"] == "season").sum()),
         "seasonSplit": int(g["price_basis"].isin(["season-weeks", "season-listing", "package"]).sum()),
-        "perCourtHour": r1(float((timed["price_n"] * timed["booked"]).sum() / hrs[timed.index].sum())) if len(timed) >= 5 else None,
-        "fullCourtHour": r1(float((ctimed["price_n"] * ctimed["capacity"]).sum() / chrs[ctimed.index].sum())) if len(ctimed) >= 5 else None,
-        "takenCourtHour": r1(float((ctimed["price_n"] * ctimed["booked"]).sum() / chrs[ctimed.index].sum())) if len(ctimed) >= 5 else None,
-        "hireRate": r1(float(hire.median())) if len(hire) else None,
+        "sessionTakingsPerCourtHourIfFull": r1(float((ctimed["price_n"] * ctimed["capacity"]).sum() / chrs[ctimed.index].sum())) if len(ctimed) >= 5 else None,
+        "sessionTakingsPerCourtHour": r1(float((ctimed["price_n"] * ctimed["booked"]).sum() / chrs[ctimed.index].sum())) if len(ctimed) >= 5 else None,
+        "hireRatePerCourtHour": r1(float(hire.median())) if len(hire) else None,
         "hireRated": int(len(hire)),
         "waitlisted": int((g["waitlist_max"].fillna(0) > 0).sum()) if "waitlist_max" in g else 0,
     }
@@ -531,8 +528,9 @@ def market(m, s, fin, ok, fid) -> dict:
     """A venue's market, for its insights page: who it really competes with,
     why travellers come, its prices against the market, and when its players
     play elsewhere. The venue report's own functions, for every venue. Counts
-    of players under MIN_GROUP are held back (None), as everywhere."""
-    hold = lambda n: int(n) if n >= MIN_GROUP else None
+    of players under MIN_GROUP are held back (None), as everywhere; a real 0
+    stays 0 (none, which gives nothing away)."""
+    hold = lambda n: int(n) if n >= MIN_GROUP or n == 0 else None
     rv = R.rivals(m, s, fin, fid)
     rivals = [{"v": x["fid"], "km": x["km"], "players": x["shared_players"], "sharePlay": x["shared_play_pct"],
                "headToHead": x["head_to_head_pct"], "fill": x["avg_fill"]}
@@ -654,8 +652,12 @@ def main():
         })
 
     # ── per-venue player facts ──
-    okv = ok[ok["fid"].isin(vmap)].copy()
+    # players: one definition everywhere (views.GLOSSARY.players): non-cancelled
+    # bookings in FINISHED sessions at the venues
+    okv = ok[ok["fid"].isin(vmap) & ok["session_key"].isin(set(f["session_key"]))].copy()
     okv["fid"] = okv["fid"].astype(int)
+    import views as VW
+    end_day = end.tz_convert(R.MEL).date()
     per = okv.groupby(["pbp_user_id", "fid"]).size().reset_index(name="n")
     tot = per.groupby("pbp_user_id")["n"].sum()
     per["share"] = per["n"] / per["pbp_user_id"].map(tot)
@@ -682,7 +684,8 @@ def main():
         logged = s[(s["fid"] == fid) & (s["starts_at"] >= start) & (s["starts_at"] <= end)]
         lv = okv[okv["fid"] == fid]
         cc = canc[canc["fid"] == fid]
-        rr = lv["rating"].dropna()
+        v_rating, v_rated = VW.median_rating(lv)
+        v_back, v_back_n = VW.came_back(okv, fid, end_day)
         tlv = tl[tl["fid"] == fid]
         lp = TP.lead_profile(tlv)
         pb = pub[pub["fid"] == fid]["ahead"]
@@ -694,10 +697,11 @@ def main():
             "fill": round(100 * g["fill"].mean(), 1), "soldOut": round(100 * g["sold_out"].mean(), 1),
             "soH": r1(g["so_h"].median()) if g["so_h"].notna().any() else None,
             "empty": int(g["spots_at_start"].sum()),
-            "pph": r1(g["price_hr"].median()) if g["price_hr"].notna().any() else None,
+            "pricePerPlayerHour": r1(g["price_hr"].median()) if g["price_hr"].notna().any() else None,
             **money(g),
             "players": int(p["pbp_user_id"].nunique()),
-            "repeat": round(100 * (p["n"] >= 2).mean(), 1) if len(p) else None,
+            "cameBack": v_back,
+            "cameBackN": v_back_n,         # base for the 5+ check (privacy.py); not published
             "loyal": round(100 * (p["share"] > 0.8).mean(), 1) if len(p) else None,
             "homeHere": int(len(homes_here)),
             "fromAfar": round(100 * np.mean([km > 5 for km in away]), 1) if away else None,
@@ -707,19 +711,12 @@ def main():
             "leadN": int(lp["n"]),
             "lastMinute": lp["last_minute_share"] if lp["n"] >= 20 else None,
             "listed": r1(pb.median()) if len(pb) >= 5 else None,
-            "rated": int(len(rr)), "avgRating": round(float(rr.mean()), 2) if len(rr) >= 10 else None,
+            "rated": v_rated, "rating": v_rating,
             "titled": round(100 * g["title"].notna().mean(), 1),
         })
 
-    # ── network: players shared between venue pairs ──
-    vs = okv.groupby("pbp_user_id")["fid"].apply(lambda x: sorted(set(x)))
-    pairs = {}
-    for lst in vs:
-        for a_i in range(len(lst)):
-            for b_i in range(a_i + 1, len(lst)):
-                k = (lst[a_i], lst[b_i])
-                pairs[k] = pairs.get(k, 0) + 1
-    links = [{"a": a, "b": b, "n": n} for (a, b), n in pairs.items() if n >= MIN_GROUP]
+    # ── venues that share players, both directions, against chance (views.shares) ──
+    shares = VW.shares(okv, [k for k, v in vmap.items() if v.get("tracked")])
 
     # ── city players ──
     pl = okv.groupby("pbp_user_id").agg(n=("session_key", "size"), venues=("fid", "nunique"), rating=("rating", "median"))
@@ -745,7 +742,7 @@ def main():
         "venuesKnown": len(venues), "sessions": len(f), "offered": int(f["capacity"].sum()),
         "taken": int(f["booked"].sum()), "fill": round(100 * f["fill"].mean(), 1),
         "soldOut": round(100 * f["sold_out"].mean(), 1), "empty": int(f["spots_at_start"].sum()),
-        **money(f), "pph": r1(f["price_hr"].median()),
+        **money(f), "pricePerPlayerHour": r1(f["price_hr"].median()),
         "players": int(len(pl)), "bookings": int(len(okv)),
         "titled": round(100 * f["title"].notna().mean(), 1),
         "unplaced": int(fin["fid"].isna().sum()),
@@ -754,17 +751,21 @@ def main():
     import network as NET
     f2 = f.assign(i=np.arange(len(f)), fmt=f["fgroup"])
     net = NET.build(f2, m, ok, vmap, clean_name, lambda fid: vmap[fid]["area"])
-    for fid, extra in net["venues"].items():
-        vmap[fid].update(extra)
+    # the network's per-venue figures (partners, groups, its own "came back")
+    # are no longer published: one definition of each lives above
     net = {k: v for k, v in net.items() if k != "venues"}
-    data = {"city": city, "venues": venues, "sessions": sess, "links": links, "players": city_players,
+    vname = lambda fid: vmap[fid]["name"] if fid in vmap else str(fid)
+    data = {"city": city, "venues": venues, "sessions": sess, "shares": shares, "players": city_players,
             "ranges": ranges, "travel": travel, "levelFit": level_fit(okv, vmap, dict(zip(s["session_key"], s["level_class"]))),
             "levelClass": level_by_class(okv, dict(zip(s["session_key"], s["level_class"]))),
             "market": {str(fid): market(m, s, fin, okv, fid) for fid, v in vmap.items() if v.get("tracked")},
             "timing": timing(tl, f), "quality": quality(s, f, tl, start, end, vmap),
             "levelMix": level_mix(okv, dict(zip(s["session_key"], s["level_class"]))),
             "levelSupply": level_supply(okv, f, vmap), "coaches": coaches(f, okv),
-            "newret": new_returning(okv, f, vmap, start, end)}
+            "newret": new_returning(okv, f, vmap, start, end),
+            "digest": VW.digest(f, okv, vname),
+            "scorecard": VW.scorecard(f, okv, R.FIRSTS, venues, city, weeks),
+            "glossary": VW.GLOSSARY}
 
     # ── ratings: how DUPRs move (Insights › Ratings; ratings.py) ──
     import ratings as RT
@@ -787,4 +788,4 @@ def main():
 if __name__ == "__main__":
     d, _ = main()
     print(json.dumps(d["city"], indent=1))
-    print(len(d["sessions"]), "sessions;", len(d["links"]), "links;", len(d["venues"]), "venues")
+    print(len(d["sessions"]), "sessions;", len(d["shares"]["rows"]), "shared pairs;", len(d["venues"]), "venues")
