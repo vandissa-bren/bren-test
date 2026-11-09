@@ -52,7 +52,7 @@ def test_hour_needs_both_slots_free():
     assert out["cols"] == C.OUT_COLS
     (r,) = out["rows"]
     rec = dict(zip(C.OUT_COLS, r))
-    assert rec["v"] == 1 and rec["dow"] == 1 and rec["h"] == 19
+    assert rec["v"] == 1 and rec["dow"] == 0 and rec["h"] == 19   # 0 = Monday
     assert rec["weeks"] == 2 and rec["free2"] == 1      # week 2's hour has only 1 free throughout
     assert rec["freeMed"] == 2.0 and rec["courts"] == 6
     assert rec["prog"] == round(8 / 24, 3)
