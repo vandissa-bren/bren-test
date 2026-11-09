@@ -17,6 +17,7 @@ fetch() reads it a week at a time, paged (PostgREST returns at most 1,000 rows
 per call), retrying like rpc() and keeping the weeks it could read. summarise() turns the slots into one row per venue x weekday x hour,
 for "where could a new session go":
 
+    dow       0 = Monday (the same as heat and sessions[].dow)
     weeks     weeks with both of that hour's half-hour slots read
     free2     of those weeks, how many had 2+ courts free for the whole hour
               (the hour's two slots both had 2+ free)
@@ -30,7 +31,7 @@ Court counts, not players: the 5-or-more rule doesn't apply.
 from datetime import date, timedelta
 
 COLS = ["fid", "slot_date", "slot_start", "n_courts", "taken", "programmed", "hire_taken", "hireable"]
-OUT_COLS = ["v", "dow", "h", "weeks", "free2", "freeMed", "courts", "hire", "prog"]
+OUT_COLS = ["v", "dow", "h", "weeks", "free2", "freeMed", "courts", "hire", "prog", "hireH"]
 PAGE = 1000
 
 
@@ -95,8 +96,8 @@ def summarise(df) -> dict:
         return {"cols": OUT_COLS, "rows": []}
     d["fid"] = d["fid"].astype(int)
     day = pd.to_datetime(d["slot_date"], errors="coerce")
-    d["dow"] = day.dt.isocalendar().day.astype(int)            # 1 = Monday
-    d["week"] = (day - pd.to_timedelta(d["dow"] - 1, unit="D")).dt.strftime("%Y-%m-%d")
+    d["dow"] = day.dt.dayofweek.astype(int)                    # 0 = Monday, like heat and sessions
+    d["week"] = (day - pd.to_timedelta(d["dow"], unit="D")).dt.strftime("%Y-%m-%d")
     d["h"] = d["slot_start"].astype(str).str.slice(0, 2).astype(int)
     d["free"] = (d["n_courts"] - d["taken"].fillna(0)).clip(lower=0)
     # the whole hour: the fewest courts free across its two half-hour slots,
@@ -118,8 +119,10 @@ def summarise(df) -> dict:
     for (v, dow, hr), r in per.sort_index().iterrows():
         hire = round(float(r.ht) / float(r.hb), 3) if r.hb and r.hb > 0 else None
         prog = round(float(r.pg) / float(r.nc), 3) if r.nc and r.nc > 0 else None
+        # hireH: hireable court-hours in the period (each slot is half an hour)
+        hire_h = round(float(r.hb) / 2, 1) if r.hb and r.hb > 0 else 0.0
         rows.append([int(v), int(dow), int(hr), int(r.weeks), int(r.free2),
-                     float(r.freeMed), int(r.courts), hire, prog])
+                     float(r.freeMed), int(r.courts), hire, prog, hire_h])
     return {"cols": OUT_COLS, "rows": rows}
 
 
