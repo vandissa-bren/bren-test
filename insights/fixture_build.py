@@ -24,7 +24,7 @@ TYPES = [("Intermediate Open Play", "open play", "intermediate", 16, 22.0, 2.0),
          ("Round Robin", "round robin", None, 16, 25.0, 2.0)]
 
 
-def write(out: Path, start=date(2026, 9, 28), weeks=5, players=420, seed=7):
+def write(out: Path, start=date(2026, 9, 28), weeks=8, players=420, seed=7):
     rnd = random.Random(seed)
     out.mkdir(parents=True, exist_ok=True)
     pool = list(range(100000, 100000 + players))
@@ -38,7 +38,20 @@ def write(out: Path, start=date(2026, 9, 28), weeks=5, players=420, seed=7):
         # enough players for every "shares players" pair to be published
         nxt = VENUES[(VENUES.index(home) + 1) % len(VENUES)]
         habit[p] = {"home": home, "rating": rating, "keen": rnd.random(),
-                    "other": nxt if rnd.random() < 0.5 else None}
+                    "other": nxt if rnd.random() < 0.5 else None, "start": 0, "quit": None}
+    # the seven figures need some shape (figures.py):
+    #  * late joiners from week 3: new-player cohorts from the week of 12 Oct
+    #  * keen regulars who stop at their home venue after week 4 (gone quiet);
+    #    half of them keep playing at their second venue (booked elsewhere)
+    late = list(range(100000 + players, 100000 + players + 40 * 4))
+    for j, p in enumerate(late):
+        home = VENUES[j % len(VENUES)]
+        habit[p] = {"home": home, "rating": None, "keen": 0.9, "other": None, "start": 2 + j // 40, "quit": None}
+    pool = pool + late
+    for j, p in enumerate([q for q in pool[3:players] if habit[q]["home"] == VENUES[1]][:16]):
+        habit[p]["keen"] = 1.0
+        habit[p]["quit"] = 5
+        habit[p]["other"] = VENUES[(VENUES.index(habit[p]["home"]) + 1) % len(VENUES)] if j % 2 else None
     sess, rost, cat = [], [], []
     lesson = 500000
     for p in pool[:3]:
@@ -52,9 +65,15 @@ def write(out: Path, start=date(2026, 9, 28), weeks=5, players=420, seed=7):
                 key = f"pbp-{lesson}"
                 st = datetime.combine(d, time(hour), MEL).astimezone(timezone.utc)
                 first_obs = st - timedelta(days=10)
-                regulars = [p for p in pool if habit[p]["home"] == v or habit[p]["other"] == v]
+                regulars = [p for p in pool if w >= habit[p]["start"] and (
+                    (habit[p]["home"] == v and (habit[p]["quit"] is None or w < habit[p]["quit"]))
+                    or habit[p]["other"] == v)]
                 keen = [p for p in regulars if rnd.random() < 0.15 + 0.5 * habit[p]["keen"]]
-                booked = keen[: rnd.randint(max(2, cap // 3), cap)]
+                rnd.shuffle(keen)          # who gets the places isn't decided by player id
+                keen.sort(key=lambda p: habit[p]["quit"] is None)   # the regulars who'll go quiet book first
+                # two weekly sessions always sell out early (another court)
+                hot = v in (VENUES[0], VENUES[2]) and ti == 0
+                booked = keen[:cap] if hot else keen[: rnd.randint(max(2, cap // 3), cap)]
                 full = len(booked) >= cap
                 spots = cap - len(booked)
                 sess.append({
@@ -68,7 +87,7 @@ def write(out: Path, start=date(2026, 9, 28), weeks=5, players=420, seed=7):
                     "spots_7d": min(cap, spots + 6), "spots_3d": min(cap, spots + 3), "spots_1d": spots,
                     "n_prices": 1, "n_start_times": 1, "venue_name": f"Venue {v}",
                     "end_time": f"{int(hour + dur):02d}:{30 if dur % 1 else 0:02d}:00", "price_tiers": None,
-                    "program_slug": f"prog-{v}-{ti}", "waitlist_max": rnd.choice([0, 0, 1, 3, 6]) if full else 0,
+                    "program_slug": f"prog-{v}-{ti}", "waitlist_max": rnd.choice([0, 1, 3, 3, 6]) if full else 0,
                     "coaches": json.dumps(["Coach A"]) if typ == "clinic" else None})
                 cat.append({"venue_id": f"pbp-{v}", "venue_name": f"Venue {v}", "lesson_id": lesson,
                             "title": title, "type": typ, "category": typ, "skill_level": lvl,
