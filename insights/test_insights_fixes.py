@@ -218,20 +218,20 @@ def sessions(fmt, n, cap, price, booked, dur, hire=None):
 def test_full_court_hour_arithmetic():
     # doubles: 8 places → 2 courts; $20 × 8 / (2 h × 2 courts) = $40 full, $20 × 6 / 4 = $30 taken
     m = B.money(sessions("round_robin", 5, 8, 20, 6, 2, hire=40.0))
-    assert m["fullCourtHour"] == 40.0
-    assert m["takenCourtHour"] == 30.0
-    assert m["perCourtHour"] == 30.0              # old key kept, old rule (a court per 4)
-    assert m["hireRate"] == 40.0
+    assert m["sessionTakingsPerCourtHourIfFull"] == 40.0
+    assert m["sessionTakingsPerCourtHour"] == 30.0
+    assert "perCourtHour" not in m                # old figure removed (redesign)
+    assert m["hireRatePerCourtHour"] == 40.0
     assert m["emptyValue"] == 5 * 20 * 2
 
 
 def test_courts_by_format():
     # social: 10 places / 5 a court = 2 courts → $15 × 10 / (2 h × 2) = $37.5
-    assert B.money(sessions("social", 5, 10, 15, 10, 2))["fullCourtHour"] == 37.5
+    assert B.money(sessions("social", 5, 10, 15, 10, 2))["sessionTakingsPerCourtHourIfFull"] == 37.5
     # clinic: 8 places / 8 a court = 1 court → $40 × 8 / 1 h = $320
-    assert B.money(sessions("clinic", 5, 8, 40, 8, 1))["fullCourtHour"] == 320.0
+    assert B.money(sessions("clinic", 5, 8, 40, 8, 1))["sessionTakingsPerCourtHourIfFull"] == 320.0
     # under 5 timed sessions: no figure
-    assert B.money(sessions("social", 4, 10, 15, 10, 2))["fullCourtHour"] is None
+    assert B.money(sessions("social", 4, 10, 15, 10, 2))["sessionTakingsPerCourtHourIfFull"] is None
 
 
 def test_hire_rate_for_venue_day_and_slot():
