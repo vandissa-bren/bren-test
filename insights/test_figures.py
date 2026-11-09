@@ -554,3 +554,11 @@ def test_where_same_nearby_session_once():
     FG.where_finish(d)
     got = d["figures"]["where"]["venues"]["1"]
     assert len(got) == 1 and "on Fridays at 4pm" in got[0]["text"]
+
+
+def test_cut_or_move_keeps_never_booked_apart():
+    rows = weekly(5, booked=0, title="Power Lunch") + weekly(5, booked=3, title="Quiet Social", h=12)
+    out = FG.cut_or_move(F(rows), _km, str)
+    assert [r["label"] for r in out["neverBooked"]] == ["Mon 7pm Power Lunch"]
+    assert [r["label"] for r in out["city"]] == ["Mon 12pm Quiet Social"]
+    assert all(r["label"] != "Mon 7pm Power Lunch" for rs in out["venues"].values() for r in rs)
