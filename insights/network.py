@@ -227,19 +227,10 @@ def build(f, m, ok, vmap, clean_name, area_of_fid):
             "r": round(float(np.median(rr)), 2) if len(rr) >= 5 else None,
             "cm": Counter(int(cm[p]) for p in pc).most_common(1)[0][0] if pc else None,
         })
-    # who also plays: Jaccard on player sets
-    sets = {j: set(ser_players.get(j, {}).keys()) for j in range(len(skeys))}
-    for s_ in series:
-        a = sets[s_["j"]]
-        sims = []
-        if len(a) >= 3:
-            for j2, b2 in sets.items():
-                if j2 == s_["j"] or len(b2) < 3:
-                    continue
-                inter = len(a & b2)
-                if inter >= 3:
-                    sims.append([j2, round(100 * inter / len(a | b2)), inter])
-        s_["also"] = sorted(sims, key=lambda t: (-t[2], -t[1]))[:6]
+    # sessions that share a regular crowd (views.shared_regulars: 5+ shared
+    # regulars, 15%+ of the smaller session's regulars). Replaces "also".
+    import views as VW
+    shared = VW.shared_regulars(series, ser_players, lambda v: clean_name(vmap[v]["name"]) if v in vmap else str(v))
 
     # ── sessions to try: series your partners play that you haven't ──
     nb = [list(G.neighbors(k)) for k in range(N)]
@@ -443,4 +434,4 @@ def build(f, m, ok, vmap, clean_name, area_of_fid):
     }
     edges = [[int(a), int(b2), int(w)] for (a, b2), w in W.items()]
     return {"city": city, "players": players, "edges": edges, "groups": groups, "glinks": glinks,
-            "series": series, "venues": {int(k): v for k, v in vnet.items()}}
+            "series": series, "shared": shared, "venues": {int(k): v for k, v in vnet.items()}}
