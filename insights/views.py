@@ -110,6 +110,23 @@ GLOSSARY = {
                        "definition": f"Two weekly sessions with at least {SHARED_MIN} regulars in common, who make up at least {SHARED_PCT}% of the smaller session's regulars."},
     "cancelled": {"name": "Dropped out",
                   "definition": "A booking counts as cancelled only if a check at least 30 minutes before the start no longer found the player on the list."},
+    # the seven figures (figures.py)
+    "needCourt": {"name": "Sessions that need another court",
+                  "definition": "Weekly sessions still running (a run in the last 10 days) that, in 3 of their last 4 weeks, were full at least 2 days before the start (even if a place freed up later) or had a waitlist of 2 or more seen at least a day before the start. Needs 4 weeks, 3 of them watched from 2 days out."},
+    "quietRegulars": {"name": "Regulars who've gone quiet",
+                      "definition": "Players who played at the venue in 4 of the 6 weeks up to their last visit, and haven't booked there for over twice their usual gap (at least 14 days). \"Booked at another tracked venue\" means one of the venues we follow; we can't see club or private play. Holiday weeks push this up."},
+    "cohortBack": {"name": "New players coming back",
+                   "definition": "Players grouped by the week of their first session (anywhere, or at this venue), from the week of 12 Oct. The share who booked again within 1, 2, 4 and 8 weeks, shown once that time has passed for the whole group. Weeks with fewer than 20 new players join their month."},
+    "sameFaces": {"name": "Same faces each week",
+                  "definition": "Of a weekly session's players, the share who also played the week before. The middle value of its last 4 such weeks, each with 8 to 50 players; a week after a skipped week isn't compared. Low isn't bad: beginner sessions should turn over."},
+    "whereToRun": {"name": "Where to run a new session",
+                   "definition": "A kind of session at a day and time. Medium: at least 2 courts free in 60% of the weeks read; no session of its own of that format, or under 70% full, within 90 minutes (its sessions in the last 4 weeks); and either its players who came twice or more already play that kind elsewhere then (5 or more), or a similar session within 6 km sells out early or runs in the top quarter for fill. High: both reasons, over 6 or more weeks of court records."},
+    "refilled": {"name": "Freed places refilled",
+                 "definition": "Of sessions that had a waitlist, the share where a place freed after the session sold out was taken again before the start: a new player appeared after it sold out, and more people were on the list over time than it has places. We can't tell whether they came off the waitlist. Shown with 10 or more such sessions."},
+    "leaning": {"name": "Leaning on a few players",
+                "definition": "The share of a venue's bookings over the last 28 days made by its busiest 20% of players. Shown with 50 or more players. Includes coaches booked as players: the lists don't say who's coaching."},
+    "cutOrMove": {"name": "Sessions to cut or move",
+                  "definition": "Weekly sessions still running that were under 40% full in 3 of their last 4 weeks, the latest included. A session that started after our data did isn't judged on its first 4 weeks. Where a weekly session of the same kind within 6 km at the same day and time fills 20 or more points better, it's named."},
 }
 
 
