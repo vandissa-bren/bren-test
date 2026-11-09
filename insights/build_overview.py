@@ -767,6 +767,13 @@ def main():
             "scorecard": VW.scorecard(f, okv, R.FIRSTS, venues, city, weeks),
             "glossary": VW.GLOSSARY}
 
+    # ── the seven figures and "sessions to cut or move" (figures.py); "where to
+    #    run a new session" is finished in build_insights once the court log is in ──
+    import figures as FG
+    tracked = [k for k, v in vmap.items() if v.get("tracked")]
+    allr = m.loc[m["session_key"].isin(set(f["session_key"])), ["session_key", "pbp_user_id"]]
+    data["figures"], data["_where"] = FG.build(f, okv, R.FIRSTS, end_day, R.km, vname, tracked, allr)
+
     # ── ratings: how DUPRs move (Insights › Ratings; ratings.py) ──
     import ratings as RT
     from catalogue_terms import dupr_rated
