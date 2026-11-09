@@ -262,6 +262,8 @@ def build(data_dir: Path, work_dir: Path, covered: int | None = None):
     except Exception as e:
         print(f"  courtFree: skipped ({type(e).__name__})")
         d["courtFree"] = {"cols": [], "rows": [], "ok": False, "weeksRead": 0}
+    import views as VW
+    VW.hire_takings(d)
     return d, net
 
 
@@ -272,15 +274,25 @@ def shareable(d: dict, net: dict) -> dict:
     d["venues"] = [v for v in d["venues"] if v.get("tracked")]
     ids = {v["id"] for v in d["venues"]}
     d["sessions"] = [s for s in d["sessions"] if s["v"] in ids]
-    d["links"] = [l for l in d["links"] if l["a"] in ids and l["b"] in ids and l["n"] >= MIN_GROUP]
+    sh = d.get("shares") or {}
+    if sh:
+        d["shares"] = dict(sh, rows=[r for r in sh.get("rows", []) if r[0] in ids and r[1] in ids and r[2] >= MIN_GROUP],
+                           base={k: n for k, n in sh.get("base", {}).items() if int(k) in ids})
+    # the co-play network: only the weekly sessions, sessions that share
+    # regulars, and a few counts for Staff. Player-level groups, ties, layouts
+    # and the "partners" figures stay inside the build (play circle, later).
     net = dict(net)
-    net.pop("players", None)
-    net.pop("edges", None)
-    for s in net.get("series", []):
-        s["also"] = [a for a in s.get("also", []) if a[2] >= MIN_GROUP]
-    net["groups"] = [g for g in net.get("groups", []) if g["size"] >= MIN_GROUP]
-    net["glinks"] = [l for l in net.get("glinks", []) if l["n"] >= MIN_GROUP]
-    d["net"] = net
+    keep_city = ("events", "eventCap", "rosterSessions", "sessions", "bookings")
+    series = [{k: v for k, v in x.items() if k not in ("cm", "also")} for x in net.get("series", [])]
+    shared = net.get("shared") or {"city": [], "venues": {}}
+    shared = {"city": [p for p in shared["city"] if p["va"] in ids and p["vb"] in ids and p["shared"] >= MIN_GROUP],
+              "venues": {k: [p for p in lst if p["va"] in ids and p["vb"] in ids and p["shared"] >= MIN_GROUP]
+                         for k, lst in shared["venues"].items() if int(k) in ids}}
+    d["net"] = {"city": {k: v for k, v in net.get("city", {}).items() if k in keep_city},
+                "series": series, "shared": shared}
+    for k in ("digest", "scorecard"):
+        if d.get(k) and isinstance(d[k].get("venues"), dict):
+            d[k] = dict(d[k], venues={vk: vv for vk, vv in d[k]["venues"].items() if int(vk) in ids})
     if d.get("courtFree"):
         cf = d["courtFree"]
         d["courtFree"] = dict(cf, rows=[r for r in cf.get("rows", []) if r[0] in ids])
@@ -345,6 +357,8 @@ def main() -> int:
             if a.csv_prev:
                 import build_overview as B
                 d["prev"] = B.prev_summary(Path(a.csv_prev))
+            import views as VW
+            VW.scorecard_changes(d)
         out = clean(dict(shareable(d, net), window={"days": None, "builtAt": datetime.now(timezone.utc).isoformat()}))
         Path(a.out or "insights.json").write_text(json.dumps(out, separators=(",", ":"), default=str))
         print(f"{len(out['venues'])} venues, {len(out['sessions'])} sessions -> {a.out or 'insights.json'}")
@@ -357,6 +371,8 @@ def main() -> int:
     to = datetime.now(MEL).date() - timedelta(days=1)
     ok = 0
     courthire = {}                 # court hire, fetched once for the longest window (export())
+    digest = None                  # "what changed" is the same last 7 days vs the 4 weeks before for
+                                   # every window; windows too short to hold 5 weeks use the longest's
     with httpx.Client(timeout=300) as client:
         for days in windows:
             w = window(days, to)
@@ -408,6 +424,13 @@ def main() -> int:
                                 d["prev"] = dict(B.prev_summary(prev_dir), asked=[str(p_frm), str(p_to)])
                         except Exception as e:
                             print(f"{days}d: previous period skipped ({type(e).__name__}: {e})")
+                    import views as VW
+                    VW.scorecard_changes(d)
+                    dg = d.get("digest") or {}
+                    if dg.get("from"):
+                        digest = digest or dg
+                    elif digest:
+                        d["digest"] = dict(digest, fromWindow=windows[0])
                 # days: the window asked for (the page's period and the row key);
                 # from/to/covered: what it actually spans after the DATA_START cut
                 out = clean(dict(shareable(d, net), window={
