@@ -1,0 +1,52 @@
+name: DUPR monthly read
+# Monthly, 2nd of the month 03:23 UTC (well clear of the 15:00 UTC nightly
+# scrape), or by hand. Reads PlayByPoint's signed-in ratings for regulars at
+# the 13 venues whose public rosters hide DUPR, saves them with the nightly
+# job's pbp_ratings_ingest, and prints counts only (never names or ids).
+# Needs migration 20270215100000_dupr_monthly_targets.sql.
+# Stops at the first 401/403/429 or 3 failed reads in a row, and before 14:45 UTC.
+on:
+  schedule:
+    - cron: '23 3 2 * *'
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: 'Most players to read (max 2000)'
+        required: false
+        default: '1000'
+      dry_run:
+        description: 'Only pick and count targets; no PlayByPoint calls'
+        type: boolean
+        required: false
+        default: false
+
+concurrency:
+  group: dupr-sample
+  cancel-in-progress: false
+
+jobs:
+  read:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install httpx curl_cffi loguru python-dotenv rich supabase typer tenacity
+
+      - name: Run DUPR monthly read
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          PBP_COOKIES_JSON: ${{ secrets.PBP_COOKIES_JSON }}
+          PROXY_URL: ""
+          DUPR_MONTHLY_LIMIT: ${{ inputs.limit || '1000' }}
+          DUPR_MONTHLY_DRY_RUN: ${{ inputs.dry_run || 'false' }}
+        run: |
+          python dupr_monthly.py
