@@ -76,6 +76,8 @@ CFG = dict(
     sL=0.50, sV=0.70, label_with_dupr=0.25, sS=0.50, city=3.1, sC=1.00,
     conf_k=10.0, damp=0.7, rounds=40, tol=0.003, nu=4.0,
     sure_sd=0.40, room_runs=8,
+    centre_cap=2.0,                            # most the room middles together can weigh (see solve)
+    label_anchor_n=3, label_shrink=5,          # venue label offset: sessions with 3+ DUPR players, shrunk to the city's
 )
 SETTINGS = dict(CFG)
 BINS = [0, 2.5, 3.0, 3.5, 4.0, 9]
@@ -235,6 +237,9 @@ def solve(d, sess, dn: pd.DataFrame, self_cal, hide=frozenset(), asof=None, cfg=
     # each pair's kind of session: its most common group
     pair_grp = np.zeros(len(pkeys), dtype=int)
     pair_grp[pinv] = grp_of_s[vs]                 # a weekly session keeps one kind; any visit's will do
+    pair_coaching = np.zeros(len(pkeys), bool)
+    pair_coaching[pinv] = (np.isin(pids, list(self_cal.get("coaches", set())))[vi]
+                           & sess["coached"].fillna(False).to_numpy().astype(bool)[vs])
 
     # DUPR
     dn = dn.reindex(pids)
@@ -250,10 +255,14 @@ def solve(d, sess, dn: pd.DataFrame, self_cal, hide=frozenset(), asof=None, cfg=
     wS = np.where(has_s, 1 / c["sS"] ** 2, 0.0)
 
     coach = np.isin(pids, list(self_cal.get("coaches", set())))
+    # a likely coach's coached sessions say nothing about how they play: they
+    # run them. Their level comes from everything else (or their venue's).
+    coached_s = sess["coached"].fillna(False).to_numpy().astype(bool)
+    coaching = coach[vi] & coached_s[vs]
 
     # labels: per player, recency-weighted mean label midpoint of what they book
     lm = label_mid[vs]
-    ok = ~np.isnan(lm)
+    ok = ~np.isnan(lm) & ~coaching
     lab_w = np.bincount(vi[ok], weights=rec[ok], minlength=P)
     venue_ids = np.unique(venue_of_s)
     lab_off = pd.Series(0.0, index=venue_ids)
@@ -301,12 +310,23 @@ def solve(d, sess, dn: pd.DataFrame, self_cal, hide=frozenset(), asof=None, cfg=
                     mad = float(np.median(np.abs(gap - med))) * 1.4826
                     grp_off[g] = med
                     grp_sd[g] = float(np.clip(mad, c["s_floor"], c["s_ceil"]))
-            # how high or low each venue's labels run against its rooms
-            sroom = np.where(Csum > 0.3, Ssum / np.maximum(Csum, 1e-9), np.nan)
-            okl = ~np.isnan(sroom) & ~np.isnan(label_mid) & (Nsum >= MIN_GROUP)
+            # how high or low each venue's labels run, measured ONLY from the
+            # DUPR players in its sessions (a room level built from players with
+            # no DUPR leans on the labels themselves, and at a venue with few
+            # DUPRs that circle erased what the labels say). Each venue's
+            # offset is shrunk to the city's by how many sessions back it.
+            dsel = has_d[vi]
+            Dsum = np.bincount(vs[dsel], weights=d_target[vi[dsel]], minlength=S)
+            Dn = np.bincount(vs[dsel], minlength=S)
+            dmean = np.where(Dn >= c["label_anchor_n"], Dsum / np.maximum(Dn, 1), np.nan)
+            okl = ~np.isnan(dmean) & ~np.isnan(label_mid)
             if okl.any():
-                lab_off = pd.Series(sroom[okl] - label_mid[okl]).groupby(venue_of_s[okl]).median().reindex(
-                    venue_ids).fillna(0.0)
+                gap_s = pd.Series(dmean[okl] - label_mid[okl])
+                city_off = float(gap_s.median())
+                per = gap_s.groupby(venue_of_s[okl]).agg(["median", "size"])
+                k0 = c["label_shrink"]
+                lab_off = ((per["median"] * per["size"] + city_off * k0) / (per["size"] + k0)).reindex(
+                    venue_ids).fillna(city_off)
 
         # labels, corrected per venue
         corr = lab_off.reindex(venue_of_s[vs]).to_numpy()
@@ -338,9 +358,17 @@ def solve(d, sess, dn: pd.DataFrame, self_cal, hide=frozenset(), asof=None, cfg=
         # weakest and strongest in any room sit away from it); only the firm
         # pull up below the edge moves them. A player without one has little
         # else to go on, so the middle pulls both ways.
-        w_c = np.where(has_d[pair_player], 0.0, w_c)
+        w_c = np.where(has_d[pair_player] | pair_coaching, 0.0, w_c)
+        # the middles of the rooms a player shares with the same people aren't
+        # separate pieces of evidence: cap their total, so a player in many
+        # sessions isn't squeezed to their venue's middle (labels and their
+        # DUPR-anchored offsets keep their say)
+        if c["centre_cap"]:
+            tot_c = np.bincount(pair_player, weights=w_c, minlength=P)
+            w_c = w_c * np.minimum(1.0, c["centre_cap"] / np.maximum(tot_c, 1e-9))[pair_player]
         # the firm pull up is for players who KEEP COMING BACK to a stronger room
-        w_e = np.where(okp & ~np.isnan(edge) & (pair_visits >= c["edge_visits"]), base / c["s_edge"] ** 2, 0.0)
+        w_e = np.where(okp & ~np.isnan(edge) & (pair_visits >= c["edge_visits"]) & ~pair_coaching,
+                       base / c["s_edge"] ** 2, 0.0)
         wR = np.bincount(pair_player, weights=w_c + w_e, minlength=P)
         xR = np.bincount(pair_player, weights=w_c * np.nan_to_num(val) + w_e * np.nan_to_num(edge), minlength=P)
 
@@ -367,7 +395,7 @@ def solve(d, sess, dn: pd.DataFrame, self_cal, hide=frozenset(), asof=None, cfg=
                   "selfRaw": sv, "wL": wL, "lab": lab_val, "labOwn": lab_w > 0, "prec": prec, "new": new,
                   "pPlayer": pair_player, "pSeries": ser_codes[pkeys % len(ser_codes)], "pVisits": pair_visits,
                   "pRoom": pair_room, "pVal": val, "pLo": lo, "pEdge": edge, "wC": w_c, "wE": w_e,
-                  "pOpen": pair_obot, "grpOff": grp_off[pair_grp]}}
+                  "pOpen": pair_obot, "grpOff": grp_off[pair_grp], "pCoaching": pair_coaching}}
     return T, meta
 
 
