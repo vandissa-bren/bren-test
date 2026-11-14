@@ -210,10 +210,10 @@ async def run_sample(client, api, targets: list[dict], sleep: float = SLEEP,
     return {"totals": totals, "per_venue": per_venue, "stopped": stopped}
 
 
-def report(res: dict, picked: int) -> None:
+def report(res: dict, picked: int, title: str = "DUPR sample") -> None:
     t = res["totals"]
     pct = lambda a, b: f"{100 * a / b:.0f}%" if b else "-"
-    console.print(f"DUPR sample: {picked} picked · {t['tried']} tried · {t['read']} read · {t['failed']} failed")
+    console.print(f"{title}: {picked} picked · {t['tried']} tried · {t['read']} read · {t['failed']} failed")
     console.print(f"  with a DUPR entry {t['dupr']} ({pct(t['dupr'], t['read'])}) · DUPR doubles {t['doubles']}"
                   f" ({pct(t['doubles'], t['read'])}) · DUPR singles {t['singles']} · DUPR id {t['id']}"
                   f" ({pct(t['id'], t['read'])}) · doubles verified {t['doubles_verified']}")
