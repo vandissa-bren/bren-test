@@ -71,6 +71,10 @@ COLS = {
     # optional: every DUPR change (20261026100000) and the played-roster re-reads (20261027100000)
     "ratelog": ["pbp_user_id", "rating", "prev_rating", "seen_at", "prev_seen_at", "session_key", "source"],
     "ratechecks": ["pbp_user_id", "session_key", "session_date", "days_after", "rating", "observed_at"],
+    # optional: every signed-in DUPR doubles reading (pbp_rating_readings: the nightly
+    # league read and the monthly read at the venues that hide DUPR, dupr_monthly.py).
+    # A row only when the value changed. For the PM level's DUPR history only.
+    "pbpreads": ["pbp_user_id", "doubles", "read_at"],
     # optional: court-hire rates (court_rate_states, 20261016110000) and each
     # half-hour slot's PlayByPoint price shift (court_slot_states), read from the
     # tables directly, for the casual hire rate at each session's day and time
@@ -84,7 +88,7 @@ COLS = {
     # 30-minute slot that has started (ins_court_hire; court_free.py)
     "courthire": ["fid", "slot_date", "slot_start", "n_courts", "taken", "programmed", "hire_taken", "hireable"],
 }
-OPTIONAL = {"programs", "firsts", "ratelog", "ratechecks", "courtrates", "slotshifts", "waitlists", "courthire"}
+OPTIONAL = {"programs", "firsts", "ratelog", "ratechecks", "pbpreads", "courtrates", "slotshifts", "waitlists", "courthire"}
 
 
 def sb():
@@ -154,6 +158,9 @@ def export(client, url, h, frm, to, d: Path, chunk_days: int = 14, skip=(), cour
                 rows = rpc(client, url, h, "insights_export_firsts", {"p_to": str(to)})
             elif kind == "ratelog":
                 rows = rpc(client, url, h, "insights_export_ratelog", {})
+            elif kind == "pbpreads":
+                rows = table(client, url, h, "pbp_rating_readings", {
+                    "select": ",".join(cols), "provider": "eq.dupr", "doubles": "not.is.null", "order": "id"})
             elif kind == "courtrates":
                 rows = table(client, url, h, "court_rate_states", {
                     "select": ",".join(cols), "last_seen": f"gte.{frm}", "order": "id"})
@@ -198,6 +205,7 @@ def export(client, url, h, frm, to, d: Path, chunk_days: int = 14, skip=(), cour
                "programs": ["venue_id", "program_slug"], "firsts": ["pbp_user_id", "fid"],
                "ratelog": ["pbp_user_id", "seen_at", "rating"],
                "ratechecks": ["pbp_user_id", "session_key", "days_after"],
+               "pbpreads": ["pbp_user_id", "read_at"],
                "courtrates": ["facility_id", "court_id", "shift", "first_seen"],
                "slotshifts": ["facility_id", "slot_date", "slot_start", "shift"],
                "waitlists": ["session_key", "observed_at"],
@@ -379,6 +387,18 @@ def shareable(d: dict, net: dict) -> dict:
     return privacy.enforce(d)
 
 
+def dupr_log(ratelog, reads):
+    """The roster rating log plus the signed-in DUPR readings, in the log's
+    shape (pbp_user_id, seen_at, rating), for pm_v2's DUPR history."""
+    import pandas as pd
+    if reads is None or not len(reads):
+        return ratelog
+    r = reads.rename(columns={"read_at": "seen_at", "doubles": "rating"})[["pbp_user_id", "seen_at", "rating"]]
+    if ratelog is None or not len(ratelog):
+        return r
+    return pd.concat([ratelog, r], ignore_index=True)
+
+
 def pm_run(frm, to):
     """The PM level: fitted once a day on the longest window. v1 (pm_level.py)
     and v2 (pm_v2.py) both run; v2 sits in summary["v2"]. Returns (summary for
@@ -395,7 +415,7 @@ def pm_run(frm, to):
     v2, levels = None, []
     try:
         import pm_v2 as V2
-        v2, levels = V2.fit(B.LAST["m"], B.LAST["s"], R.RATELOG, frm, to)
+        v2, levels = V2.fit(B.LAST["m"], B.LAST["s"], dupr_log(R.RATELOG, R.PBPREADS), frm, to)
     except Exception as e:                       # v2 never stops the build
         print(f"PM level v2: skipped ({type(e).__name__}: {e})")
     if summary is not None and v2:
@@ -499,7 +519,7 @@ def main() -> int:
                     else:
                         try:
                             p_frm, p_to = w["prev"]
-                            pn = export(client, url, h, p_frm, p_to, prev_dir, skip=("courthire", "waitlists"))
+                            pn = export(client, url, h, p_frm, p_to, prev_dir, skip=("courthire", "waitlists", "pbpreads"))
                             if pn["sessions"]:
                                 import build_overview as B
                                 d["prev"] = dict(B.prev_summary(prev_dir), asked=[str(p_frm), str(p_to)])
