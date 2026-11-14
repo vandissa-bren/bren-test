@@ -469,6 +469,61 @@ def clean(o):
     return o
 
 
+PM_DAYS = int(os.environ.get("PM_WINDOW_DAYS") or 365)   # the PM level's own window (the fade does the rest)
+
+
+def fit_pm(client, url, h, frm, to):
+    """Fit the PM level on the data build_overview last loaded (B.LAST), store
+    its levels and player pages, and return its summary (False if it failed)."""
+    pm = None
+    try:
+        pm, v2, levels = pm_run(frm, to)
+        if v2 and levels:
+            # v2's levels are the ones kept each night (the history
+            # progression and graduation will read)
+            res = rpc(client, url, h, "record_pm_run", {
+                "p_run": clean({"version": v2["version"], "from": str(frm), "to": str(to),
+                                "settings": v2["settings"], "tests": v2["tests"],
+                                "summary": {k: v for k, v in v2.items()
+                                            if k not in ("tests", "venues", "rooms", "settings")}}),
+                "p_levels": levels})
+            pm["runId"] = res.get("run_id") if isinstance(res, dict) else None
+            try:
+                print(f"PM level players stored: {store_pm_players(client, url, h, pm['runId'])}")
+            except Exception as e:
+                print(f"PM level players: not stored ({type(e).__name__})")
+            print(f"PM level v2: {v2['players']} players, tests {v2['tests']}, "
+                  f"{v2.get('seconds')}s, stored {res}")
+        if pm and pm.get("tests") is not None:
+            print(f"PM level v1: {pm.get('players')} players, tests {pm['tests']}")
+    except Exception as e:
+        print(f"PM level: skipped ({type(e).__name__}: {e})")
+        pm = False
+    return pm
+
+
+def pm_window(client, url, h, to, longest_from):
+    """The PM level on up to PM_DAYS of data, when that reaches further back
+    than the longest Insights window; None when it doesn't (then it's fitted on
+    the longest window as before, at no extra cost). Old sessions fade with
+    the 8-week half-life rather than dropping off at 90 days."""
+    w = window(PM_DAYS, to)
+    if w["covered"] <= 0 or w["from"] >= longest_from:
+        return None
+    t0 = time.time()
+    with tempfile.TemporaryDirectory() as tmp:
+        data_dir, work_dir = Path(tmp) / "data", Path(tmp) / "work"
+        data_dir.mkdir()
+        work_dir.mkdir()
+        n = export(client, url, h, w["from"], to, data_dir, skip=("courthire", "waitlists", "slotshifts"))
+        if not n["sessions"]:
+            return None
+        build(data_dir, work_dir, w["covered"])
+        pm = fit_pm(client, url, h, w["from"], to)
+    print(f"PM level window {PM_DAYS}d ({w['from']} to {to}) in {time.time() - t0:.0f}s")
+    return pm
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--csv", help="build from CSV exports in this folder instead of Supabase")
@@ -503,6 +558,13 @@ def main() -> int:
     digest = None                  # "what changed" is the same last 7 days vs the 4 weeks before for
                                    # every window; windows too short to hold 5 weeks use the longest's
     with httpx.Client(timeout=300) as client:
+        if windows:
+            try:
+                got = pm_window(client, url, h, to, window(windows[0], to)["from"])
+                if got is not None:
+                    pm = got
+            except Exception as e:
+                print(f"PM level window: skipped ({type(e).__name__}: {e})")
         for days in windows:
             w = window(days, to)
             frm = w["from"]
@@ -521,29 +583,7 @@ def main() -> int:
                         continue
                     d, net = build(data_dir, work_dir, w["covered"])
                     if pm is None:
-                        try:
-                            pm, v2, levels = pm_run(frm, to)
-                            if v2 and levels:
-                                # v2's levels are the ones kept each night (the history
-                                # progression and graduation will read)
-                                res = rpc(client, url, h, "record_pm_run", {
-                                    "p_run": clean({"version": v2["version"], "from": str(frm), "to": str(to),
-                                                    "settings": v2["settings"], "tests": v2["tests"],
-                                                    "summary": {k: v for k, v in v2.items()
-                                                                if k not in ("tests", "venues", "rooms", "settings")}}),
-                                    "p_levels": levels})
-                                pm["runId"] = res.get("run_id") if isinstance(res, dict) else None
-                                try:
-                                    print(f"PM level players stored: {store_pm_players(client, url, h, pm['runId'])}")
-                                except Exception as e:
-                                    print(f"PM level players: not stored ({type(e).__name__})")
-                                print(f"PM level v2: {v2['players']} players, tests {v2['tests']}, "
-                                      f"{v2.get('seconds')}s, stored {res}")
-                            if pm and pm.get("tests") is not None:
-                                print(f"PM level v1: {pm.get('players')} players, tests {pm['tests']}")
-                        except Exception as e:
-                            print(f"PM level: skipped ({type(e).__name__}: {e})")
-                            pm = False
+                        pm = fit_pm(client, url, h, frm, to)
                     if pm:
                         d["pm"] = pm
                     # the period before, the same length (as covered), never before
