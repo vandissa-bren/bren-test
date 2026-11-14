@@ -139,3 +139,13 @@ def test_travel_uses_venues_played_twice():
     home, km = PP.travel({"a": 6, "b": 2, "c": 1}, S, VMAP)
     assert home == 101 and abs(km - 6.67) < 0.1          # 106 (once) doesn't count
     assert PP.travel({"a": 6}, S, VMAP) == (101, None)
+
+
+def test_coaches_sessions_they_run_add_nothing(built):
+    _, P, series, _ = built
+    for cid in (9101, 9102):
+        r = P.loc[cid]
+        assert r["coach"]
+        coached = [x for x in r["sessions"] if series[x["s"]]["coached"]]
+        assert coached and all(x["place"] == "coaching" and x["share"] == 0 for x in coached)
+        assert all(t.get("s") not in {x["s"] for x in coached} for t in r["terms"])
