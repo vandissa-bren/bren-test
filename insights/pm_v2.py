@@ -360,7 +360,14 @@ def solve(d, sess, dn: pd.DataFrame, self_cal, hide=frozenset(), asof=None, cfg=
     groups = [{"family": FAMS[g // 2], "banded": bool(g % 2), "offset": _r(grp_off[g]), "spread": _r(grp_sd[g]),
                "pairs": _hold((pair_grp == g).sum())} for g in range(8) if (pair_grp == g).any()]
     meta = {"rounds": rounds, "groups": groups, "labelOffsets": lab_off, "vi": vi, "vs": vs, "rec": rec,
-            "pids": pids, "skeys": skeys}
+            "pids": pids, "skeys": skeys,
+            # the last round's evidence, for each player's breakdown (pm_player.py):
+            # level ~= (wD*dT + sum over pairs (wC*val + wE*edge) + wL*lab + wS*self) / prec
+            "x": {"wD": wD, "dT": d_target, "sD": sD, "hasD": has_d, "wS": wS, "self": s_val, "hasS": has_s,
+                  "selfRaw": sv, "wL": wL, "lab": lab_val, "labOwn": lab_w > 0, "prec": prec, "new": new,
+                  "pPlayer": pair_player, "pSeries": ser_codes[pkeys % len(ser_codes)], "pVisits": pair_visits,
+                  "pRoom": pair_room, "pVal": val, "pLo": lo, "pEdge": edge, "wC": w_c, "wE": w_e,
+                  "pOpen": pair_obot, "grpOff": grp_off[pair_grp]}}
     return T, meta
 
 
@@ -500,7 +507,9 @@ def _privacy(sm: dict) -> dict:
 
 
 # ── the build's entry point ───────────────────────────────────────────────────
-def fit(m: pd.DataFrame, s: pd.DataFrame, ratelog, frm, to, self_cal_ab=None):
+def fit(m: pd.DataFrame, s: pd.DataFrame, ratelog, frm, to, self_cal_ab=None, detail=None):
+    """detail: a dict to fill with the fit's working (visits, sessions, players,
+    evidence, DUPR history, rooms) for pm_player.py's per-player pages."""
     import time
     t0 = time.time()
     d, sess = prepare(m, s)
@@ -551,6 +560,8 @@ def fit(m: pd.DataFrame, s: pd.DataFrame, ratelog, frm, to, self_cal_ab=None):
     }
     summary = _privacy(summary)
     summary["seconds"] = round(time.time() - t0)
+    if detail is not None:
+        detail.update(d=d, sess=sess, T=T, meta=meta, dn=dn, h=h, rooms=room_list, coaches=coaches, end=end)
     levels = [{"id": int(p), "level": round(float(r.level), 2), "sd": round(float(r.sd), 2), "n": int(r.n), "kind": r.kind}
               for p, r in T.iterrows()]
     return summary, levels
