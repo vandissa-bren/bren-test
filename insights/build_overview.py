@@ -788,7 +788,7 @@ def main():
                 c.update(x)
     # kept for the PM level, which the daily build fits once on its longest window
     global LAST
-    LAST = {"m": m, "s": s, "start": start, "end": end}
+    LAST = {"m": m, "s": s, "start": start, "end": end, "vmap": vmap}
     return data, net
 
 
