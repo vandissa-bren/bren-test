@@ -169,3 +169,22 @@ def test_protect_hides_what_subtraction_would_give_away():
     assert out == {"a": 12, "b": None, "c": None}
     assert V2._protect(30, {"a": 10, "b": 20}, exact=True) == {"a": 10, "b": 20}
     assert V2._protect(None, {"a": 9}) == {"a": None}
+
+
+def test_a_venue_with_no_duprs_keeps_its_spread():
+    """Strip every DUPR at one venue: its players must still spread out by what
+    they book (labels, anchored by other venues' DUPRs), not all collapse to
+    one middle or drift off (the PickleBoom case, 14 Nov)."""
+    m, s, rl, truth = world()
+    fid = m["session_key"].map(s.set_index("session_key")["fid"])
+    home = m.assign(f=fid).groupby("pbp_user_id")["f"].agg(lambda x: x.mode().iat[0])
+    blind = set(home[home == 101].index) & set(truth.index)
+    m.loc[m["pbp_user_id"].isin(blind), "rating_at_time"] = None
+    rl = rl[~rl["pbp_user_id"].isin(blind)]
+    _, lv = V2.fit(m, s, rl, "2026-09-21", "2026-11-15")
+    L = pd.DataFrame(lv).set_index("id")["level"]
+    ids = sorted(blind & set(L.index))
+    a, b = L[ids], truth.loc[ids, "true"]
+    assert abs((a - b).mean()) < 0.1, (a - b).mean()          # no drift
+    assert np.polyfit(b, a, 1)[0] > 0.65                        # spread kept
+    assert (a - b).abs().mean() < 0.18
