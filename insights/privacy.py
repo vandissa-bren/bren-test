@@ -74,6 +74,13 @@ COUNTS = [
     # PM level
     "pm.players", "pm.kinds.*", "pm.mix.*[]", "pm.tests.players", "pm.tests.high.n", "pm.tests.low.n",
     "pm.selfCal.players", "pm.regulars[0]", "pm.venues.*[0]",
+    # PM level v2 (pm_v2.py holds these at source and checks subtraction; listed as a second guard)
+    "pm.v2.players", "pm.v2.kinds.*", "pm.v2.sure", "pm.v2.regulars", "pm.v2.regularsSure", "pm.v2.coaches",
+    "pm.v2.mix.*[]", "pm.v2.vsDupr.players", "pm.v2.vsDupr.above", "pm.v2.vsDupr.below", "pm.v2.vsDupr.within",
+    "pm.v2.rooms[].players", "pm.v2.groups[].pairs",
+    "pm.v2.tests.forward.players", "pm.v2.tests.forward.movers", "pm.v2.tests.forward.called",
+    "pm.v2.tests.forward.above.players", "pm.v2.tests.forward.below.players", "pm.v2.tests.forward.near.players",
+    "pm.v2.tests.hidden.players", "pm.v2.tests.hidden.fresh.players",
     # ratings
     "ratings.city.dupr", "ratings.city.players", "ratings.city.measured", "ratings.city.changes",
     "ratings.city.up", "ratings.city.down",
