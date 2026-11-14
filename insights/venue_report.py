@@ -106,12 +106,17 @@ def load():
     lf, cf = DATA / "ratelog.csv", DATA / "ratechecks.csv"
     RATELOG = pd.read_csv(lf, na_values=["null"]) if lf.exists() else None
     RATECHECKS = pd.read_csv(cf, na_values=["null"]) if cf.exists() else None
+    global PBPREADS
+    pf = DATA / "pbpreads.csv"
+    PBPREADS = pd.read_csv(pf, na_values=["null"]) if pf.exists() else None
     return s, r, c
 
 
 # the rating log and played-roster re-reads (build_insights "ratelog" / "ratechecks")
 RATELOG = None
 RATECHECKS = None
+# signed-in DUPR readings (build_insights "pbpreads"): the PM level's DUPR history only
+PBPREADS = None
 PROGRAMS = pd.DataFrame(columns=["venue_id", "program_slug", "tiers", "lessons_ahead_max"])
 # each player's first session at each venue, up to the period's end (build_insights "firsts")
 FIRSTS = pd.DataFrame(columns=["pbp_user_id", "fid", "first_date", "first_key"])
