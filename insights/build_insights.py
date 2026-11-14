@@ -19,8 +19,11 @@ before" for any filter.
 
 Ratings (from 8 Oct): the rating log and played-roster re-reads are exported
 too (optional, 20261028100000) for data["ratings"] (ratings.py). The PM level
-(pm_level.py) is fitted once a run, on the longest window, stored privately
-through record_pm_run and summarised in data["pm"] for every window.
+(pm_level.py) is fitted once a run, on the longest window, and summarised in
+data["pm"] for every window. Version 2 (pm_v2.py, 13 Nov: each player's true
+level from DUPR, the rooms they keep playing in, labels and rating changes)
+runs beside it in data["pm"]["v2"]; v2's per-player levels are what
+record_pm_run stores each night (v1's summary stays for comparison).
 
 Environment: SUPABASE_URL, SUPABASE_SERVICE_KEY (or SUPABASE_KEY).
 Optional: INSIGHTS_WINDOWS="7,28,90".
@@ -362,6 +365,10 @@ def shareable(d: dict, net: dict) -> dict:
                             programmes=[x for x in d["ratings"]["programmes"] if x["v"] in ids])
     if d.get("pm"):
         d["pm"] = dict(d["pm"], venues={k: v for k, v in d["pm"].get("venues", {}).items() if int(k) in ids})
+        if d["pm"].get("v2"):
+            v2 = d["pm"]["v2"]
+            d["pm"]["v2"] = dict(v2, venues={k: v for k, v in v2.get("venues", {}).items() if int(k) in ids},
+                                 rooms=[r for r in v2.get("rooms", []) if r["v"] in ids])
     if d.get("prev"):
         p = dict(d["prev"])
         p["sessions"] = [x for x in p["sessions"] if x[0] in ids]
@@ -373,17 +380,29 @@ def shareable(d: dict, net: dict) -> dict:
 
 
 def pm_run(frm, to):
-    """The PM level: fitted once a day on the longest window (pm_level.py).
-    Returns (summary for the build, per-player levels for record_pm_run)."""
+    """The PM level: fitted once a day on the longest window. v1 (pm_level.py)
+    and v2 (pm_v2.py) both run; v2 sits in summary["v2"]. Returns (summary for
+    the build, v2's summary and per-player levels for record_pm_run)."""
     import build_overview as B
     import pm_level as PM
+    import venue_report as R
     if not B.LAST:
-        return None, []
+        return None, None, []
     t0 = time.time()
-    summary, levels = PM.fit_and_test(B.LAST["m"], B.LAST["s"], frm, to)
+    summary, _ = PM.fit_and_test(B.LAST["m"], B.LAST["s"], frm, to)
     if summary:
         summary["seconds"] = round(time.time() - t0)
-    return summary, levels
+    v2, levels = None, []
+    try:
+        import pm_v2 as V2
+        v2, levels = V2.fit(B.LAST["m"], B.LAST["s"], R.RATELOG, frm, to)
+    except Exception as e:                       # v2 never stops the build
+        print(f"PM level v2: skipped ({type(e).__name__}: {e})")
+    if summary is not None and v2:
+        summary["v2"] = v2
+    elif v2:
+        summary = {"version": "v1", "status": "not fitted", "v2": v2}
+    return summary, v2, levels
 
 
 def clean(o):
@@ -407,7 +426,7 @@ def main() -> int:
     if a.csv:
         with tempfile.TemporaryDirectory() as w:
             d, net = build(Path(a.csv), Path(w))
-            pm, _ = pm_run(d["city"]["from"], d["city"]["to"])
+            pm, _, _ = pm_run(d["city"]["from"], d["city"]["to"])
             if pm:
                 d["pm"] = pm
             if a.csv_prev:
@@ -450,16 +469,21 @@ def main() -> int:
                     d, net = build(data_dir, work_dir, w["covered"])
                     if pm is None:
                         try:
-                            pm, levels = pm_run(frm, to)
-                            if pm:
+                            pm, v2, levels = pm_run(frm, to)
+                            if v2 and levels:
+                                # v2's levels are the ones kept each night (the history
+                                # progression and graduation will read)
                                 res = rpc(client, url, h, "record_pm_run", {
-                                    "p_run": clean({"version": pm["version"], "from": str(frm), "to": str(to),
-                                                    "settings": __import__("pm_level").SETTINGS, "tests": pm["tests"],
-                                                    "summary": {k: v for k, v in pm.items() if k not in ("tests", "venues")}}),
+                                    "p_run": clean({"version": v2["version"], "from": str(frm), "to": str(to),
+                                                    "settings": v2["settings"], "tests": v2["tests"],
+                                                    "summary": {k: v for k, v in v2.items()
+                                                                if k not in ("tests", "venues", "rooms", "settings")}}),
                                     "p_levels": levels})
                                 pm["runId"] = res.get("run_id") if isinstance(res, dict) else None
-                                print(f"PM level {pm['version']}: {pm['players']} players, tests {pm['tests']}, "
-                                      f"{pm.get('seconds')}s, stored {res}")
+                                print(f"PM level v2: {v2['players']} players, tests {v2['tests']}, "
+                                      f"{v2.get('seconds')}s, stored {res}")
+                            if pm and pm.get("tests") is not None:
+                                print(f"PM level v1: {pm.get('players')} players, tests {pm['tests']}")
                         except Exception as e:
                             print(f"PM level: skipped ({type(e).__name__}: {e})")
                             pm = False
