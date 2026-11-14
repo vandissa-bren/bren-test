@@ -149,6 +149,8 @@ def series_table(d: pd.DataFrame, sess: pd.DataFrame, rooms: list, end, cfg=CFG)
 # ── the maths behind each level ───────────────────────────────────────────────
 def _place(x, k, has_d, theta):
     """Where a player sits in one weekly session (k: index into the pair arrays)."""
+    if x.get("pCoaching") is not None and x["pCoaching"][k]:
+        return "coaching"                             # a likely coach running it: left out
     if np.isnan(x["pRoom"][k]):
         return "noroom"                               # too few others with a level
     if x["pOpen"][k]:
@@ -354,6 +356,7 @@ def build(det: dict, vmap: dict, m: pd.DataFrame, ratelog=None, reads=None, cfg=
     played_by = {int(p): g.droplevel(0).to_dict() for p, g in visits.groupby(level=0)}
     pr_by = {int(p): g.sort_values("together", ascending=False) for p, g in pr.groupby("i")}
     n_by = d.groupby("pbp_user_id").size()
+    since = str(pd.Timestamp(d["starts_at"].min()).tz_convert("Australia/Melbourne").date())
 
     # how far each player travels: their own furthest regular venue from home;
     # for players who only play at one venue, how far that venue's other
@@ -387,6 +390,7 @@ def build(det: dict, vmap: dict, m: pd.DataFrame, ratelog=None, reads=None, cfg=
         b = B.get(pid, {"terms": [], "sessions": [], "sum": None})
         players.append({
             "id": pid, "level": _r(t.level), "sd": _r(t.sd), "kind": t.kind, "n": int(t.n), "coach": bool(t.coach),
+            "from": since,
             "home": int(t.home) if t.home == t.home else None,
             "dupr": None if dd is None or dd["dupr"] != dd["dupr"] else {
                 "v": _r(dd["dupr"], 3), "months": _r(dd["months"], 1), "lean": _r(dd["lean"], 3), "target": _r(dd["target"], 3)},
