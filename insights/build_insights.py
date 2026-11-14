@@ -399,6 +399,27 @@ def dupr_log(ratelog, reads):
     return pd.concat([ratelog, r], ignore_index=True)
 
 
+# each player's PM level page (pm_player.build), filled by pm_run
+PLAYERS: dict = {"rows": [], "series": {}}
+
+
+def store_pm_players(client, url, h, run_id, chunk=400):
+    """Each player's page to pm_players / pm_series (record_pm_players,
+    migration 20270216100000), in chunks; the last call drops the previous
+    night's rows. Prints counts only."""
+    rows, series = PLAYERS["rows"], PLAYERS["series"]
+    if not rows or run_id is None:
+        return None
+    n = 0
+    for k in range(0, len(rows), chunk):
+        last = k + chunk >= len(rows)
+        res = rpc(client, url, h, "record_pm_players", {
+            "p_run_id": run_id, "p_players": clean(rows[k:k + chunk]),
+            "p_series": clean(series) if last else {}, "p_final": last})
+        n += (res or {}).get("players", 0) if isinstance(res, dict) else 0
+    return n
+
+
 def pm_run(frm, to):
     """The PM level: fitted once a day on the longest window. v1 (pm_level.py)
     and v2 (pm_v2.py) both run; v2 sits in summary["v2"]. Returns (summary for
@@ -415,7 +436,19 @@ def pm_run(frm, to):
     v2, levels = None, []
     try:
         import pm_v2 as V2
-        v2, levels = V2.fit(B.LAST["m"], B.LAST["s"], dupr_log(R.RATELOG, R.PBPREADS), frm, to)
+        det = {}
+        v2, levels = V2.fit(B.LAST["m"], B.LAST["s"], dupr_log(R.RATELOG, R.PBPREADS), frm, to, detail=det)
+        if v2 and det:
+            # each player's page for staff (Look up a player): stored by
+            # store_pm_players after record_pm_run, never in the insights file
+            try:
+                import pm_player as PP
+                t1 = time.time()
+                PLAYERS["rows"], PLAYERS["series"] = PP.build(det, B.LAST.get("vmap", {}), B.LAST["m"],
+                                                              R.RATELOG, R.PBPREADS)
+                print(f"PM level players: {len(PLAYERS['rows'])} pages in {round(time.time() - t1)}s")
+            except Exception as e:
+                print(f"PM level players: skipped ({type(e).__name__})")
     except Exception as e:                       # v2 never stops the build
         print(f"PM level v2: skipped ({type(e).__name__}: {e})")
     if summary is not None and v2:
@@ -500,6 +533,10 @@ def main() -> int:
                                                                 if k not in ("tests", "venues", "rooms", "settings")}}),
                                     "p_levels": levels})
                                 pm["runId"] = res.get("run_id") if isinstance(res, dict) else None
+                                try:
+                                    print(f"PM level players stored: {store_pm_players(client, url, h, pm['runId'])}")
+                                except Exception as e:
+                                    print(f"PM level players: not stored ({type(e).__name__})")
                                 print(f"PM level v2: {v2['players']} players, tests {v2['tests']}, "
                                       f"{v2.get('seconds')}s, stored {res}")
                             if pm and pm.get("tests") is not None:
