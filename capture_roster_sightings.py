@@ -22,7 +22,7 @@ The Supabase key goes on the `apikey` header only: new-style sb_ keys are
 rejected on Authorization: Bearer (the F73 lesson). Legacy eyJ keys still work
 on apikey too, so apikey-only is correct for both.
 """
-import asyncio, json, os, sys, httpx
+import asyncio, json, os, re, sys, httpx
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 
@@ -336,6 +336,26 @@ async def main():
             else:
                 print(f"  RPC FAILED: HTTP {r.status_code} {r.text[:200]}")
                 sys.exit(1)
+
+        # Names for staff (PM level > Look up a player, 20270216100000):
+        # each roster player's name and initials, juniors none. Never stops
+        # the capture; prints counts only.
+        if observations and not os.environ.get("SKIP_PEOPLE"):
+            people = {}
+            for o in observations:
+                for p in o.get("players") or []:
+                    if p.get("id") is not None:
+                        people[p["id"]] = {"id": p["id"], "name": p.get("name") or "", "initials": p.get("initials") or "",
+                                           "is_child": p.get("is_child") is True}
+            try:
+                rows = list(people.values())
+                saved = 0
+                for k in range(0, len(rows), 2000):
+                    saved += int(await _rpc(client, "roster_people_seen", {"p_people": rows[k:k + 2000]}) or 0)
+                print(f"Roster names: {saved} players")
+            except Exception as e:
+                status = re.search(r"HTTP (\d{3})", str(e))
+                print(f"Roster names: not saved ({type(e).__name__}{' HTTP ' + status.group(1) if status else ''})")
 
         # Claimed tournaments and leagues take in these lists now, rather
         # than waiting for the nightly read.
