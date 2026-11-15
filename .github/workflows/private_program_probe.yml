@@ -1,0 +1,30 @@
+name: Private Program Probe
+# Read only, by hand: can the scraper's account read a programme PlayByPoint
+# doesn't list publicly (its page and rosters)? Prints counts and dates only.
+on:
+  workflow_dispatch:
+    inputs:
+      slugs:
+        description: 'Programme slugs, comma separated (the part after /programs/)'
+        required: true
+        default: 'monday-funday-session'
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install httpx curl_cffi loguru python-dotenv rich supabase typer tenacity
+      - name: Probe
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          PBP_COOKIES_JSON: ${{ secrets.PBP_COOKIES_JSON }}
+          PROXY_URL: ""
+          PROBE_SLUGS: ${{ inputs.slugs }}
+        run: python private_program_probe.py
