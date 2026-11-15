@@ -632,6 +632,19 @@ async def fetch_clinic_stubs(api, facility_id: int) -> tuple[list[dict], int, bo
     return stubs, pages, maybe_more
 
 
+def _waitlist(lesson: dict, props: dict) -> dict:
+    """{"waitlist_open": True/False/None, "waitlist": people waiting or None}
+    for one lesson on a programme page. Off when the programme switches its
+    waitlist off; unknown (None) when the page gives no count."""
+    off = props.get("enableWaitlist") is False or props.get("waitlist") is False
+    n = lesson.get("waitlist_count")
+    if off:
+        return {"waitlist_open": False, "waitlist": None}
+    if isinstance(n, int) and n >= 0:
+        return {"waitlist_open": True, "waitlist": n}
+    return {"waitlist_open": None, "waitlist": None}
+
+
 def _far_observation(lesson: dict, stub: dict, facility_id: int, program_slug: str, price: str, props: dict) -> dict | None:
     """A fill-log reading for a session beyond the app's window (see
     LOG_FAR_SESSIONS): the same fields the roster job sends, from the program
@@ -1030,6 +1043,12 @@ async def scrape_pbp_venue(
                             # special-casing. `price` above is unchanged.
                             "price_tiers": lesson_tiers,
                             "coaches": coaches,
+                            # Waitlist (16 Nov): whether the programme takes one,
+                            # and how many were waiting at this read. open is
+                            # None when the page doesn't say. The app shows a
+                            # full session with an open waitlist as "Full ·
+                            # waitlist" instead of plain "Full".
+                            **_waitlist(lesson, props),
                         })
 
                     # Only now, with the whole page handled: this programme's
