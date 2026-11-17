@@ -328,6 +328,13 @@ def _figures_for(fg: dict, ids: set) -> dict:
         q["venues"] = keep(q.get("venues"))
         for vv in q["venues"].values():
             vv["to"] = [t for t in vv.get("to", []) if t[0] in ids]
+    sw = fg.get("switching")
+    if isinstance(sw, dict):
+        sw["venues"] = keep(sw.get("venues"))
+        sw["flows"] = [f for f in sw.get("flows", []) if f[0] in ids and f[1] in ids]
+        for vv in sw["venues"].values():
+            vv["to"] = [t for t in vv.get("to", []) if t[0] in ids]
+            vv["from"] = [t for t in vv.get("from", []) if t[0] in ids]
     return fg
 
 
