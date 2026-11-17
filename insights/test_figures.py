@@ -562,3 +562,59 @@ def test_cut_or_move_keeps_never_booked_apart():
     assert [r["label"] for r in out["neverBooked"]] == ["Mon 7pm Power Lunch"]
     assert [r["label"] for r in out["city"]] == ["Mon 12pm Quiet Social"]
     assert all(r["label"] != "Mon 7pm Power Lunch" for rs in out["venues"].values() for r in rs)
+
+
+# ── 9. switching between venues ──
+def _switch_frame(movers=7, leavers_all=5, stayers=12, small_flow=3):
+    """Players with 3+ sessions in each 28-day period. movers: main venue 1 ->
+    2 but still play once at 1; leavers_all: 1 -> 2 and never back at 1;
+    stayers: venue 1 throughout; small_flow: 1 -> 3 (under 5)."""
+    end = MON + timedelta(days=55)
+    rows, p = [], 2000
+
+    def play(pid, fid, days):
+        for k in days:
+            rows.append((pid, fid, f"s{fid}-{k}", at(MON + timedelta(days=k))))
+
+    for kind, n in (("mover", movers), ("leaver", leavers_all), ("stay", stayers), ("small", small_flow)):
+        for _ in range(n):
+            p += 1
+            play(p, 1, (0, 7, 14, 21))                       # before: venue 1
+            if kind == "stay":
+                play(p, 1, (28, 35, 42))
+            elif kind == "mover":
+                play(p, 2, (29, 36, 43)); play(p, 1, (50,))
+            elif kind == "leaver":
+                play(p, 2, (29, 36, 43))
+            else:
+                play(p, 3, (29, 36, 43))
+    return bookings(rows), end
+
+
+def test_switching_counts_and_flows():
+    o, end = _switch_frame()
+    out = FG.switching(o, end, tracked={1, 2, 3})
+    assert out["ready"] and out["city"]["compared"] == 27
+    assert out["city"]["switched"] == 15 and out["city"]["leftAll"] == 8 and out["city"]["pct"] == 55.6
+    assert out["flows"] == [[1, 2, 12]]                     # 1 -> 3 is only 3 people
+    v1, v2 = out["venues"]["1"], out["venues"]["2"]
+    assert v1["players"] == 27 and v1["lost"] == 15 and v1["leftAll"] == 8 and v1["to"] == [[2, 12]]
+    assert v2["gained"] == 12 and v2["from"] == [[1, 12]]
+    assert out["venues"]["3"]["gained"] is None             # 3
+
+
+def test_switching_needs_56_days():
+    o, end = _switch_frame()
+    out = FG.switching(o, date(2026, 11, 10), tracked={1, 2, 3})
+    assert out["ready"] is False and out["flows"] == []
+
+
+def test_switching_privacy_hides_small_remainders():
+    o, end = _switch_frame()
+    d = {"figures": {"switching": FG.switching(o, end, tracked={1, 2, 3})}}
+    privacy.enforce(d)
+    v1 = d["figures"]["switching"]["venues"]["1"]
+    # lost 15 = to venue 2 (12) + to venue 3 (3, not listed): 15 - 12 = 3 left over, so one must go
+    assert v1["lost"] is None or all(t[1] is None for t in v1["to"])
+    c, fl = d["figures"]["switching"]["city"], d["figures"]["switching"]["flows"]
+    assert c["switched"] is None or all(f[2] is None for f in fl) or c["switched"] - 12 not in range(1, 5)
