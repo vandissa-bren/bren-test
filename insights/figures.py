@@ -691,6 +691,67 @@ def leaning(okv: pd.DataFrame, end_day: date) -> dict:
     return out
 
 
+# ── 9. switching between venues (17 Nov 2026) ───────────────────────────────
+SWITCH_DAYS = 28            # two back-to-back 28-day periods
+SWITCH_MIN = 3              # sessions in each period, to count as a player of that period
+SWITCH_TOP = 3              # where they went / came from, per venue
+
+
+def switching(okv: pd.DataFrame, end_day: date, tracked=None) -> dict:
+    """Did players move their main venue? For each player with 3+ sessions in
+    each of two back-to-back 28-day periods (the last 28 days and the 28
+    before), their main venue in each is where they played most (a tie goes to
+    the venue they played at last). They've switched when it changed; they've
+    left completely when they played none of the last 28 days at the old one.
+    Needs 56 days of data. Counts only; each 5 or more (privacy.py)."""
+    now0 = end_day - timedelta(days=SWITCH_DAYS - 1)
+    before0 = now0 - timedelta(days=SWITCH_DAYS)
+    out = {"ready": before0 >= DATA_START, "days": SWITCH_DAYS, "from": str(before0), "to": str(end_day),
+           "city": {"compared": 0, "switched": 0, "leftAll": 0, "pct": None}, "flows": [], "venues": {}}
+    if not out["ready"] or okv.empty:
+        return out
+    o = okv[["pbp_user_id", "fid", "starts_at"]].dropna(subset=["fid"]).copy()
+    if tracked is not None:
+        o = o[o["fid"].isin(set(tracked))]
+    o["d"] = o["starts_at"].dt.tz_convert(MEL).dt.date
+    o = o[(o["d"] >= before0) & (o["d"] <= end_day)]
+    o["now"] = o["d"] >= now0
+    o["fid"] = o["fid"].astype(int)
+
+    def main(x: pd.DataFrame) -> pd.Series:
+        g = x.groupby(["pbp_user_id", "fid"]).agg(n=("d", "size"), last=("starts_at", "max")).reset_index()
+        g = g.sort_values(["pbp_user_id", "n", "last"], ascending=[True, False, False])
+        return g.drop_duplicates("pbp_user_id").set_index("pbp_user_id")["fid"]
+
+    b, n = o[~o["now"]], o[o["now"]]
+    keep = (set(b.groupby("pbp_user_id").size().loc[lambda c: c >= SWITCH_MIN].index)
+            & set(n.groupby("pbp_user_id").size().loc[lambda c: c >= SWITCH_MIN].index))
+    if not keep:
+        return out
+    mb, mn = main(b[b["pbp_user_id"].isin(keep)]), main(n[n["pbp_user_id"].isin(keep)])
+    t = pd.DataFrame({"a": mb, "b": mn}).dropna()
+    t["moved"] = t["a"] != t["b"]
+    still = set(map(tuple, n[["pbp_user_id", "fid"]].drop_duplicates().to_numpy()))
+    t["leftAll"] = t["moved"] & np.array([(p, a) not in still for p, a in zip(t.index, t["a"])], dtype=bool)
+    sw = t[t["moved"]]
+    out["city"] = {"compared": _hold(len(t)), "switched": _hold(len(sw)), "leftAll": _hold(int(sw["leftAll"].sum())),
+                   "pct": _r1(100 * len(sw) / len(t)) if len(sw) >= MIN_GROUP else None}
+    fl = sw.groupby(["a", "b"]).size()
+    out["flows"] = [[int(a), int(b_), int(k)] for (a, b_), k in fl.sort_values(ascending=False).items() if k >= MIN_GROUP][:10]
+    for v in sorted(set(t["a"]) | set(t["b"])):
+        base = t[t["a"] == v]
+        lost = base[base["moved"]]
+        gained = sw[sw["b"] == v]
+        to = lost.groupby("b").size().sort_values(ascending=False)
+        frm = gained.groupby("a").size().sort_values(ascending=False)
+        out["venues"][str(int(v))] = {
+            "players": _hold(len(base)), "lost": _hold(len(lost)), "leftAll": _hold(int(lost["leftAll"].sum())),
+            "gained": _hold(len(gained)),
+            "to": [[int(w), int(k)] for w, k in to.items() if k >= MIN_GROUP][:SWITCH_TOP],
+            "from": [[int(w), int(k)] for w, k in frm.items() if k >= MIN_GROUP][:SWITCH_TOP]}
+    return out
+
+
 # ── 8. sessions to cut or move ─────────────────────────────────────────────
 def cut_or_move(f: pd.DataFrame, km, vname, end_day: date | None = None) -> dict:
     """Weekly sessions under 40% full in 3 of their last 4 runs, the latest
@@ -769,5 +830,6 @@ def build(f, okv, firsts, end_day, km, vname, tracked, allr=None) -> tuple[dict,
         "refilled": refilled(f, okv, allr),
         "leaning": leaning(okv, end_day),
         "cutOrMove": cut_or_move(f, km, vname, end_day),
+        "switching": switching(okv, end_day, set(tracked)),
     }
     return figs, where_candidates(f, okv, km, vname, list(tracked), end_day)
