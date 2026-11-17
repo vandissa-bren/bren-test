@@ -97,6 +97,10 @@ COUNTS = [
     "figures.sameFaces.venues.*[].players",
     "figures.where.venues.*[].players",
     "figures.leaning.venues.*.players", "figures.leaning.venues.*.top",
+    "figures.switching.city.compared", "figures.switching.city.switched", "figures.switching.city.leftAll",
+    "figures.switching.flows[][2]",
+    "figures.switching.venues.*.players", "figures.switching.venues.*.lost", "figures.switching.venues.*.leftAll",
+    "figures.switching.venues.*.gained", "figures.switching.venues.*.to[][1]", "figures.switching.venues.*.from[][1]",
 ]
 
 # (rate path, base path), both relative to the same parent object. The rate is
@@ -265,6 +269,25 @@ def partitions_ex(d: dict):
         for t in vv.get("to") or []:
             if isinstance(t, list) and len(t) >= 2:
                 add((vv, "elsewhere"), [(t, 1)])
+    # switching venues: switched is a subset of compared, left-completely of
+    # switched; at a venue, lost of its players, left-completely of lost, each
+    # "went to X" of lost and "came from X" of gained; each switcher is lost
+    # by exactly one venue and gained by one, so the city's switched against
+    # the venues' lost (and gained) is a city partition
+    sw = ((d.get("figures") or {}).get("switching") or {})
+    if isinstance(sw.get("city"), dict):
+        add((sw["city"], "compared"), [(sw["city"], "switched")])
+        add((sw["city"], "switched"), [(sw["city"], "leftAll")])
+        add((sw["city"], "switched"), [(f, 2) for f in sw.get("flows") or [] if isinstance(f, list) and len(f) >= 3])
+    swv = [vv for vv in (sw.get("venues") or {}).values() if isinstance(vv, dict)]
+    for vv in swv:
+        add((vv, "players"), [(vv, "lost")])
+        add((vv, "lost"), [(vv, "leftAll")])
+        add((vv, "lost"), [(t, 1) for t in vv.get("to") or [] if isinstance(t, list) and len(t) >= 2])
+        add((vv, "gained"), [(t, 1) for t in vv.get("from") or [] if isinstance(t, list) and len(t) >= 2])
+    if isinstance(sw.get("city"), dict) and swv:
+        add((sw["city"], "switched"), [(vv, "lost") for vv in swv], "city")
+        add((sw["city"], "switched"), [(vv, "gained") for vv in swv], "city")
     # the city's quiet regulars (and regulars) against the venues listed:
     # "15 city-wide, 12 at the only venue shown" says 3 at the hidden ones
     if isinstance(q.get("city"), dict) and qv:
