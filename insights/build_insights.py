@@ -335,6 +335,11 @@ def _figures_for(fg: dict, ids: set) -> dict:
         for vv in sw["venues"].values():
             vv["to"] = [t for t in vv.get("to", []) if t[0] in ids]
             vv["from"] = [t for t in vv.get("from", []) if t[0] in ids]
+    pg = fg.get("pages")
+    if isinstance(pg, dict):
+        pg["venues"] = keep(pg.get("venues"))
+        for vv in pg["venues"].values():
+            vv["travel"] = [t for t in vv.get("travel", []) if t["v"] in ids]
     return fg
 
 
