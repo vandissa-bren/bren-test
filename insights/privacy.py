@@ -101,6 +101,9 @@ COUNTS = [
     "figures.switching.flows[][2]",
     "figures.switching.venues.*.players", "figures.switching.venues.*.lost", "figures.switching.venues.*.leftAll",
     "figures.switching.venues.*.gained", "figures.switching.venues.*.to[][1]", "figures.switching.venues.*.from[][1]",
+    # venue pages (venue_pages.py)
+    "figures.pages.venues.*.anchors[].players", "figures.pages.venues.*.newcomers.n",
+    "figures.pages.venues.*.newcomers.rows[].n", "figures.pages.venues.*.travel[].players",
 ]
 
 # (rate path, base path), both relative to the same parent object. The rate is
@@ -118,6 +121,11 @@ RATES = [
     *[(p, f"w{k}", "n") for p in ("figures.retention.city[]", "figures.retention.venues.*[]") for k in (1, 2, 4, 8)],
     # same faces: % of a run's players (its median size) who were at the run before
     ("figures.sameFaces.venues.*[]", "pct", "players"),
+    # venue pages: % of a weekly session's players who book nothing else there;
+    # % of first-timers back within 28 days
+    ("figures.pages.venues.*.anchors[]", "only", "players"),
+    ("figures.pages.venues.*.newcomers", "venue", "n"),
+    ("figures.pages.venues.*.newcomers.rows[]", "back", "n"),
 ]
 # bases the builders add only for this check; removed before publishing
 INTERNAL = [("venues[]", "fromAfarN"), ("venues[]", "cameBackN")]
@@ -288,6 +296,11 @@ def partitions_ex(d: dict):
     if isinstance(sw.get("city"), dict) and swv:
         add((sw["city"], "switched"), [(vv, "lost") for vv in swv], "city")
         add((sw["city"], "switched"), [(vv, "gained") for vv in swv], "city")
+    # venue pages: first-timers at the sessions listed are some of the venue's
+    for vv in (((d.get("figures") or {}).get("pages") or {}).get("venues") or {}).values():
+        nc = vv.get("newcomers") if isinstance(vv, dict) else None
+        if isinstance(nc, dict):
+            add((nc, "n"), [(r, "n") for r in nc.get("rows") or [] if isinstance(r, dict)])
     # the city's quiet regulars (and regulars) against the venues listed:
     # "15 city-wide, 12 at the only venue shown" says 3 at the hidden ones
     if isinstance(q.get("city"), dict) and qv:
