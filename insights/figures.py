@@ -832,4 +832,6 @@ def build(f, okv, firsts, end_day, km, vname, tracked, allr=None) -> tuple[dict,
         "cutOrMove": cut_or_move(f, km, vname, end_day),
         "switching": switching(okv, end_day, set(tracked)),
     }
+    import venue_pages as VP                              # the venue pages' pictures (venue_pages.py)
+    figs["pages"] = VP.build(f, okv, firsts, end_day, km, tracked)
     return figs, where_candidates(f, okv, km, vname, list(tracked), end_day)
