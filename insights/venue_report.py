@@ -42,7 +42,8 @@ def hhmm(col: pd.Series) -> pd.Series:
     return pd.to_datetime(t[0].str.zfill(2) + ":" + t[1], format="%H:%M", errors="coerce")
 
 def registry():
-    data = json.loads((HERE.parent / "venues.json").read_text())
+    import venue_list
+    data = venue_list.raw()
     if isinstance(data, dict):
         data = data.get("venues", data)
     if isinstance(data, dict):
