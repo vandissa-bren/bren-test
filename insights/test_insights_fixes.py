@@ -279,3 +279,41 @@ def test_table_reads_past_the_row_cap(page, known):
     c = _CappedClient(total_known=known)
     rows = BI.table(c, "http://x", {}, "court_slot_states", {}, page=page)
     assert [r["id"] for r in rows] == list(range(2500))
+
+
+def test_unproven_leavers_capped_at_places_booked_at_the_start():
+    # No run reads days 2+ (no background), so nothing proves the three players
+    # last seen two days ahead left. The fill log says 3 were booked at the start
+    # and 2 were still on the roster near it: one place is left, so one of the
+    # three counts as played and the other two left. A walk-in added
+    # after the start is untouched. (All three were last seen on the same pass,
+    # so nothing else on the roster proves they left; ties keep the first listed.)
+    early = "2026-10-18"
+    rows = [
+        {"pbp_user_id": 1, "session_key": "pbp-s", "session_date": DAY, "first_seen": t("05:00", early),
+         "last_seen": t("05:00", early), "starts_at": START},
+        {"pbp_user_id": 2, "session_key": "pbp-s", "session_date": DAY, "first_seen": t("05:00", early),
+         "last_seen": t("05:00", early), "starts_at": START},
+        {"pbp_user_id": 3, "session_key": "pbp-s", "session_date": DAY, "first_seen": t("05:00", early),
+         "last_seen": t("05:00", early), "starts_at": START},
+        {"pbp_user_id": 4, "session_key": "pbp-s", "session_date": DAY, "first_seen": t("05:00", early),
+         "last_seen": t("09:20"), "starts_at": START},
+        {"pbp_user_id": 5, "session_key": "pbp-s", "session_date": DAY, "first_seen": t("05:00", early),
+         "last_seen": t("09:20"), "starts_at": START},
+        {"pbp_user_id": 6, "session_key": "pbp-s", "session_date": DAY, "first_seen": t("09:10"),
+         "last_seen": t("09:20"), "starts_at": START},
+    ]
+    # the capture job kept running that day (hourly, on sessions that day): no outage
+    rows += [{"pbp_user_id": 950 + h, "session_key": "pbp-bg2", "session_date": early,
+              "first_seen": t(f"{h:02d}:00", early), "last_seen": t("11:00", early),
+              "starts_at": t("12:00", early)} for h in range(6, 12)]
+    r = frame(rows)
+    before = CX.classify(r)
+    assert not before["cancelled"].any()
+    s = pd.DataFrame([{"session_key": "pbp-s", "capacity": 4, "spots_at_start": 1}])
+    out = CX.classify(r, s)
+    got = {k: v for k, v in zip(out["pbp_user_id"], out["cancelled"]) if k < 900}
+    assert got == {1: False, 2: True, 3: True, 4: False, 5: False, 6: False}
+    # without a fill-log reading the rule leaves them alone
+    out = CX.classify(r, pd.DataFrame([{"session_key": "pbp-s", "capacity": 4, "spots_at_start": None}]))
+    assert not out["cancelled"].any()
