@@ -268,14 +268,19 @@ def session_prices(s):
     only where the venue publishes member tiers. price_basis says which rule
     applied: tier, package, listed, season-weeks, season-listing, season."""
     listed = s["price"].astype(str).str.extract(r"(\d+(?:\.\d+)?)")[0].astype(float)
-    typical = listed.groupby(s["fid"]).transform("median")
+    # a venue's typical session price, leagues left out: a venue that runs
+    # many leagues would otherwise make $250 look typical (25 Nov 2026)
+    fmt = s["fmt"] if "fmt" in s else pd.Series([None] * len(s), index=s.index)
+    is_league = fmt.isin(["league"])
+    typical = listed.where(~is_league).groupby(s["fid"]).transform("median")
+    typical = typical.fillna(listed.groupby(s["fid"]).transform("median"))
     prog = {}
     for row in PROGRAMS.itertuples():
         prog[(str(row.venue_id), str(row.program_slug))] = (_tiers(row.tiers), _num(row.lessons_ahead_max))
     tiers_col = s["price_tiers"] if "price_tiers" in s else pd.Series([None] * len(s), index=s.index)
     out_p, out_m, basis = [], [], []
-    for i, lp, typ, raw, vid, slug, title in zip(s.index, listed, typical, tiers_col, s["venue_id"], s["program_slug"],
-                                                 s["title"] if "title" in s else [None] * len(s)):
+    for i, lp, typ, raw, vid, slug, title, league in zip(s.index, listed, typical, tiers_col, s["venue_id"], s["program_slug"],
+                                                         s["title"] if "title" in s else [None] * len(s), is_league):
         own = _tiers(raw)
         ptiers, ahead = prog.get((str(vid), str(slug)), ([], None))
         casual = [t for t in own if t.get("player_category") != "member"]
@@ -291,7 +296,14 @@ def session_prices(s):
                 price, how = min(packs), "package"
         if price is None and lp == lp:
             text = title if isinstance(title, str) else ""
-            seasonal = bool(SEASON.search(text)) or (typ == typ and typ > 0 and lp > 3 * typ and lp > 40)
+            # a season: its title says so, it's a league, PlayByPoint prices it
+            # as a commitment (lesson_unit other than "session", e.g. Dink &
+            # Drive's "per_week_per_next_sessions"), or it's over 3x the
+            # venue's typical session
+            commitment = any(t.get("lesson_unit") not in ("session", None) and _num(t.get("price")) is not None
+                             and abs(_num(t.get("price")) - lp) < 0.01 for t in casual + ptiers)
+            seasonal = (bool(SEASON.search(text)) or bool(league) or commitment
+                        or (typ == typ and typ > 0 and lp > 3 * typ and lp > 40))
             if not seasonal:
                 price, how = lp, "listed"
             else:
@@ -300,7 +312,7 @@ def session_prices(s):
                     price, how = lp / int(m.group(1)), "season-weeks"
                 elif ahead and ahead >= 2 and lp > 2 * (typ if typ == typ else 0):
                     price, how = lp / ahead, "season-listing"
-                elif lp <= 40 and not (typ == typ and lp > 3 * typ):
+                elif lp <= 40 and not commitment and not (typ == typ and lp > 3 * typ):
                     price, how = lp, "listed"
                 else:
                     how = "season"
