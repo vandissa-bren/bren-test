@@ -24,6 +24,7 @@ import numpy as np
 import pandas as pd
 
 from catalogue_terms import session_terms as parse
+import programme_terms as PT
 import cancellations as CX
 
 HERE = Path(__file__).resolve().parent
@@ -109,6 +110,10 @@ def load():
     global PBPREADS
     pf = DATA / "pbpreads.csv"
     PBPREADS = pd.read_csv(pf, na_values=["null"]) if pf.exists() else None
+    # what each programme says about itself (build_insights "progdetails"; programme_terms.py)
+    global PROGTERMS
+    pf = DATA / "progdetails.csv"
+    PROGTERMS = PT.table(pd.read_csv(pf, na_values=["null"])) if pf.exists() else {}
     return s, r, c
 
 
@@ -118,6 +123,8 @@ RATECHECKS = None
 # signed-in DUPR readings (build_insights "pbpreads"): the PM level's DUPR history only
 PBPREADS = None
 PROGRAMS = pd.DataFrame(columns=["venue_id", "program_slug", "tiers", "lessons_ahead_max"])
+# {program_slug: programme_terms.parse(...)}: levels, formats, coaching, season length from descriptions
+PROGTERMS = {}
 # each player's first session at each venue, up to the period's end (build_insights "firsts")
 FIRSTS = pd.DataFrame(columns=["pbp_user_id", "fid", "first_date", "first_key"])
 
@@ -164,17 +171,39 @@ def attach_titles(s, c):
         s["dur_h"] = own.where(own > 0, s["dur_h"])
     terms = [parse(t, ty if isinstance(ty, str) else None, sk if isinstance(sk, str) else None) if isinstance(t, str) and t else None
              for t, ty, sk in zip(s["title"], s["session_type"], s["skill_level"])]
+    # the session's programme: its own logged one, else its listing's
+    if "program_slug" not in s:
+        s["program_slug"] = np.nan
+    slug_by_key = c.dropna(subset=["program_slug"]).drop_duplicates("key").set_index("key")["program_slug"]
+    s["program_slug"] = s["program_slug"].fillna(s["session_key"].map(slug_by_key))
+    # where the title says nothing, what its programme says (programme_terms.py,
+    # 27 Nov 2026): the level when the title gives none (and doesn't say all
+    # levels), the format when the title names none (only the venue's type did)
+    pt = [PROGTERMS.get(sl) if isinstance(sl, str) else None for sl in s["program_slug"]]
+    s["level_from"] = None
+    for i, (t, p) in enumerate(zip(terms, pt)):
+        if not p or not t:
+            continue
+        t = dict(t)
+        if not t["band"] and not t["all_levels"] and p["band"]:
+            t["band"], t["label"] = p["band"], p["label"]
+            s.iat[i, s.columns.get_loc("level_from")] = "programme"
+        elif not t["band"] and not t["all_levels"] and p["all_levels"]:
+            t["all_levels"], t["label"] = True, "All levels"
+            s.iat[i, s.columns.get_loc("level_from")] = "programme"
+        if t["format_from"] == "type" and p["format"]:
+            t["format"], t["format_from"] = p["format"], "programme"
+            t["family"] = FORMAT_FAMILY.get(p["format"], t["family"])
+        terms[i] = t
+    s["prog_coached"] = [bool(p and p["coached"]) for p in pt]
+    s["prog_weeks"] = [p["weeks"] if p else None for p in pt]
+    s["members_only"] = [bool(p and p["members"]) for p in pt]
     s["fmt"] = [session_format(t) if t else type_format(ty) for t, ty in zip(terms, s["session_type"])]
     s["family"] = [t["family"] if t else FORMAT_FAMILY.get(f) for t, f in zip(terms, s["fmt"])]
     s["label"] = [t["label"] if t else None for t in terms]
     s["band_lo"] = [t["band"][0] if t and t["band"] else np.nan for t in terms]
     s["band_hi"] = [t["band"][1] if t and t["band"] else np.nan for t in terms]
     s["level_class"] = [level_class(t) for t in terms]
-    # the session's programme: its own logged one, else its listing's
-    if "program_slug" not in s:
-        s["program_slug"] = np.nan
-    slug_by_key = c.dropna(subset=["program_slug"]).drop_duplicates("key").set_index("key")["program_slug"]
-    s["program_slug"] = s["program_slug"].fillna(s["session_key"].map(slug_by_key))
     s = session_prices(s)
     s["price_hr"] = s["price_n"] / s["dur_h"]
     s["daypart"] = np.select([s["hour"] < 9, s["hour"] < 17], ["early", "day"], "evening")
@@ -279,8 +308,9 @@ def session_prices(s):
         prog[(str(row.venue_id), str(row.program_slug))] = (_tiers(row.tiers), _num(row.lessons_ahead_max))
     tiers_col = s["price_tiers"] if "price_tiers" in s else pd.Series([None] * len(s), index=s.index)
     out_p, out_m, basis = [], [], []
-    for i, lp, typ, raw, vid, slug, title, league in zip(s.index, listed, typical, tiers_col, s["venue_id"], s["program_slug"],
-                                                         s["title"] if "title" in s else [None] * len(s), is_league):
+    pweeks = s["prog_weeks"] if "prog_weeks" in s else pd.Series([None] * len(s), index=s.index)
+    for i, lp, typ, raw, vid, slug, title, league, dweeks in zip(s.index, listed, typical, tiers_col, s["venue_id"], s["program_slug"],
+                                                                 s["title"] if "title" in s else [None] * len(s), is_league, pweeks):
         own = _tiers(raw)
         ptiers, ahead = prog.get((str(vid), str(slug)), ([], None))
         casual = [t for t in own if t.get("player_category") != "member"]
@@ -310,6 +340,9 @@ def session_prices(s):
                 m = WEEKS.search(text)
                 if m and 2 <= int(m.group(1)) <= 52:
                     price, how = lp / int(m.group(1)), "season-weeks"
+                elif dweeks == dweeks and dweeks:
+                    # the programme's description gives the season's length (programme_terms)
+                    price, how = lp / int(dweeks), "season-weeks"
                 elif ahead and ahead >= 2 and lp > 2 * (typ if typ == typ else 0):
                     price, how = lp / ahead, "season-listing"
                 elif lp <= 40 and not commitment and not (typ == typ and lp > 3 * typ):
