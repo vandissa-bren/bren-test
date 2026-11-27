@@ -773,6 +773,9 @@ def main():
     tracked = [k for k, v in vmap.items() if v.get("tracked")]
     allr = m.loc[m["session_key"].isin(set(f["session_key"])), ["session_key", "pbp_user_id"]]
     data["figures"], data["_where"] = FG.build(f, okv, R.FIRSTS, end_day, R.km, vname, tracked, allr)
+    # price changes, social groups, the player path, session health (more_figures.py, 27 Nov 2026)
+    import more_figures as MF
+    data["figures"].update(MF.build(f, okv, R.FIRSTS, end_day, tracked, _optional_csv("courtrates")))
 
     # ── ratings: how DUPRs move (Insights › Ratings; ratings.py) ──
     import ratings as RT
