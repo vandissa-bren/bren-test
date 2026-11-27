@@ -81,11 +81,14 @@ def test_price_change_found_with_fill_either_side():
 
 def test_hire_rate_changes():
     f = frame()
+    R = lambda c, p, a, b: {"facility_id": 1, "court_id": c, "shift": "peak", "price": p, "member_price": None,
+                            "first_seen": a, "last_seen": b}
     rates = pd.DataFrame([
-        {"facility_id": 1, "court_id": "c1", "shift": "peak", "price": 40, "member_price": None, "first_seen": "2026-10-01T00:00:00Z"},
-        {"facility_id": 1, "court_id": "c1", "shift": "peak", "price": 44, "member_price": None, "first_seen": "2026-11-01T00:00:00Z"},
-        {"facility_id": 1, "court_id": "c2", "shift": "peak", "price": 40, "member_price": None, "first_seen": "2026-10-01T00:00:00Z"},
-        {"facility_id": 1, "court_id": "c2", "shift": "peak", "price": 44, "member_price": None, "first_seen": "2026-11-01T00:00:00Z"}])
+        R("c1", 40, "2026-10-01T00:00:00Z", "2026-10-31T00:00:00Z"), R("c1", 44, "2026-11-01T00:00:00Z", "2026-11-26T00:00:00Z"),
+        R("c2", 40, "2026-10-01T00:00:00Z", "2026-10-31T00:00:00Z"), R("c2", 44, "2026-11-01T00:00:00Z", "2026-11-26T00:00:00Z"),
+        # a one-day flicker on c3 isn't a change
+        R("c3", 40, "2026-10-01T00:00:00Z", "2026-10-20T00:00:00Z"), R("c3", 30, "2026-10-21T00:00:00Z", "2026-10-21T12:00:00Z"),
+        R("c3", 40, "2026-10-22T00:00:00Z", "2026-11-26T00:00:00Z")])
     h = MF.build(f, okv_for(f), None, END, [1, 2], rates)["prices"]["venues"]["1"]["hire"]
     assert h == [{"shift": "peak", "date": "2026-11-01", "from": 40.0, "to": 44.0, "courts": 2}]
 
@@ -118,3 +121,13 @@ def test_privacy_holds_small_counts():
     d["figures"]["paths"]["venues"]["1"]["firsts"] = 3
     privacy.enforce(d)
     assert d["figures"]["paths"]["venues"]["1"]["firsts"] is None
+
+
+def test_path_window_is_4_weeks_while_the_data_is_young():
+    p = build()["paths"]
+    assert p["days"] == 28 and p["regularSessions"] == 3
+
+
+def test_health_grades_by_fifths_of_the_city():
+    h = build()["health"]
+    assert sum(h["city"]["grades"].values()) == h["city"]["sessions"]
