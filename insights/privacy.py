@@ -104,6 +104,10 @@ COUNTS = [
     # venue pages (venue_pages.py)
     "figures.pages.venues.*.anchors[].players", "figures.pages.venues.*.newcomers.n",
     "figures.pages.venues.*.newcomers.rows[].n", "figures.pages.venues.*.travel[].players",
+    # more_figures.py
+    "figures.groups.city.players", "figures.groups.venues.*.players", "figures.groups.venues.*.list[].size",
+    "figures.paths.city.firsts", "figures.paths.city.regularsN", "figures.paths.venues.*.firsts",
+    "figures.paths.venues.*.regularsN", "figures.health.venues.*[].players",
 ]
 
 # (rate path, base path), both relative to the same parent object. The rate is
@@ -126,6 +130,13 @@ RATES = [
     ("figures.pages.venues.*.anchors[]", "only", "players"),
     ("figures.pages.venues.*.newcomers", "venue", "n"),
     ("figures.pages.venues.*.newcomers.rows[]", "back", "n"),
+    # more_figures.py: shares of a venue's first-timers (paths) and of those who became regulars
+    ("figures.paths.city", "once", "firsts"), ("figures.paths.city", "cameBack", "firsts"),
+    ("figures.paths.city", "regular", "firsts"), ("figures.paths.city", "stillRegular", "regularsN"),
+    ("figures.paths.city", "lapsed", "regularsN"),
+    ("figures.paths.venues.*", "once", "firsts"), ("figures.paths.venues.*", "cameBack", "firsts"),
+    ("figures.paths.venues.*", "regular", "firsts"), ("figures.paths.venues.*", "stillRegular", "regularsN"),
+    ("figures.paths.venues.*", "lapsed", "regularsN"),
 ]
 # bases the builders add only for this check; removed before publishing
 INTERNAL = [("venues[]", "fromAfarN"), ("venues[]", "cameBackN")]
