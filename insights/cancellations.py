@@ -96,8 +96,10 @@ def classify(r, s=None):
     """Adds left_roster, capture_gap, cancelled and cancel_hours_before to r.
 
     r: roster rows with session_key, session_date, first_seen, last_seen and
-       starts_at (the session's start, UTC). s: accepted for compatibility and
-       ignored (fill-log readings are not roster evidence; see module doc)."""
+       starts_at (the session's start, UTC). s: the sessions, optional; with
+       capacity and spots_at_start, it caps unproven leavers at the places
+       booked at the start (rule 3). Fill-log readings are never evidence of
+       WHO left (see module doc), only of how many were booked."""
     r = r.copy()
     if r.empty:
         for c in ("left_roster", "capture_gap", "cancelled"):
@@ -150,6 +152,24 @@ def classify(r, s=None):
         hit.loc[ok[ok].index] |= (i < len(tsn)) & (tsn[np.minimum(i, len(tsn) - 1)] < b)
 
     r["left_roster"] = cand & hit
+    # 3. places the session no longer had (27 Nov 2026). A player last seen
+    # before the cut-off whom no pass saw leave still counted as playing, and
+    # 450 of 2,219 sessions ended up with more players than were booked at the
+    # start. Now, where the fill log says how many were booked at its last look
+    # before the start (capacity - spots), those unproven leavers count as
+    # played only to fill the places the players still on the roster near the
+    # start don't account for, latest-seen first; the rest left before the start.
+    # Players added after the start (walk-ins, the desk) are never touched.
+    if s is not None and {"session_key", "capacity", "spots_at_start"} <= set(s.columns):
+        b = s.drop_duplicates("session_key").set_index("session_key")
+        booked = (b["capacity"] - b["spots_at_start"]).where(b["capacity"].gt(0) & b["spots_at_start"].notna())
+        bk = r["session_key"].map(booked)
+        unproven = cand & ~r["left_roster"]
+        present = ~cand & start.notna() & (r["first_seen"] < start)
+        pres_n = present.groupby(r["session_key"]).transform("sum")
+        rank = r["last_seen"].where(unproven).groupby(r["session_key"]).rank(method="first", ascending=False)
+        room = (bk - pres_n).clip(lower=0)
+        r["left_roster"] = r["left_roster"] | (unproven & bk.notna() & (rank > room))
     # outage check: the next run of the capture job (any band) after the last sighting
     allruns = _naive(runs["t"]).astype("datetime64[ns]").values
     nxt = np.searchsorted(allruns, lo_all.values, side="right")
