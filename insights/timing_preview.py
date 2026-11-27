@@ -34,7 +34,8 @@ def fid_of(venue_id):
 
 
 def registry():
-    data = json.loads(REGISTRY.read_text())
+    import venue_list
+    data = venue_list.raw() if REGISTRY == venue_list.LOCAL else json.loads(REGISTRY.read_text())
     if isinstance(data, dict):
         data = data.get("venues", data)
     if isinstance(data, dict):
