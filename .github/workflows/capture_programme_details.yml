@@ -1,0 +1,32 @@
+name: Capture Programme Details
+# Once a day, before the 4:47 am Insights build: each PlayByPoint programme's
+# category, rating range and description (capture_programme_details.py).
+# Venue facts only; the log prints counts.
+on:
+  schedule:
+    - cron: '23 16 * * *'      # 3:23 am Melbourne (AEDT)
+  workflow_dispatch:
+    inputs:
+      venues:
+        description: 'Facility ids, comma separated (blank = all active)'
+        required: false
+        default: ''
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install httpx curl_cffi python-dotenv loguru rich typer tenacity
+      - name: Capture programme details
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          PBP_COOKIES_JSON: ${{ secrets.PBP_COOKIES_JSON }}
+          PROGRAMME_VENUES: ${{ github.event.inputs.venues }}
+        run: python capture_programme_details.py
