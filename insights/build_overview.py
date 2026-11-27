@@ -23,8 +23,8 @@ MIN_GROUP = 5
 
 
 def registry_all():
-    d = json.loads((HERE.parent / "venues.json").read_text())["venues"]
-    return d
+    import venue_list
+    return venue_list.venues()
 
 
 def area_of(lat, lng):
