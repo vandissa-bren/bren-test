@@ -141,6 +141,24 @@ def table(client, url, h, name, params, page=1000):
             return rows
 
 
+def export_span(client, url, h, kind, a, b):
+    """One export call for a..b; on a statement timeout (the database is busy:
+    28 Nov, the 28-day catalogue export timed out once and that window wasn't
+    published), the span is split in two and each half asked for, down to a
+    single day."""
+    try:
+        return rpc(client, url, h, f"insights_export_{kind}", {"p_from": str(a), "p_to": str(b)})
+    except RuntimeError as e:
+        if "57014" not in str(e) and "statement timeout" not in str(e):
+            raise
+        if a >= b:
+            time.sleep(10)
+            return rpc(client, url, h, f"insights_export_{kind}", {"p_from": str(a), "p_to": str(b)})
+        mid = a + timedelta(days=(b - a).days // 2)
+        print(f"  {kind} {a}..{b}: timed out; asking for it in two halves")
+        return export_span(client, url, h, kind, a, mid) + export_span(client, url, h, kind, mid + timedelta(days=1), b)
+
+
 def export(client, url, h, frm, to, d: Path, chunk_days: int = 14, skip=(), courthire=None):
     """The exports for sessions dated frm..to, fetched a fortnight at a time
     so no single call runs long.
@@ -195,7 +213,7 @@ def export(client, url, h, frm, to, d: Path, chunk_days: int = 14, skip=(), cour
             else:
                 while a <= to:
                     b = min(to, a + timedelta(days=chunk_days - 1))
-                    rows += rpc(client, url, h, f"insights_export_{kind}", {"p_from": str(a), "p_to": str(b)})
+                    rows += export_span(client, url, h, kind, a, b)
                     a = b + timedelta(days=1)
         except Exception as e:
             if kind not in OPTIONAL:
