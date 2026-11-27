@@ -53,3 +53,11 @@ def test_a_session_tier_wins():
     tiers = [{"price": 25, "player_category": None, "lesson_unit": "session"}]
     s = frame(SOCIALS + [{"price": "$250", "title": "League night", "fmt": "league", "price_tiers": tiers}])
     assert s["price_n"].iloc[-1] == 25 and s["price_basis"].iloc[-1] == "tier"
+
+
+def test_tournament_divisions_are_league_sessions():
+    from catalogue_terms import title_format
+    for t in ["Men's Singles 3-3.49", "Mixed Doubles >4", "Women's Skinny Singles <3.5", "Men's Singles 50+"]:
+        assert title_format(t) == "league", t
+    for t in ["Mixed Doubles Social 3.0-3.5", "Women's Doubles Open Play", "Men's Doubles Drills 3.0+", "Mixed Doubles"]:
+        assert title_format(t) != "league", t
