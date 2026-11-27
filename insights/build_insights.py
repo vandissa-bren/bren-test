@@ -415,6 +415,26 @@ def dupr_log(ratelog, reads):
 PLAYERS: dict = {"rows": [], "series": {}}
 
 
+def store_session_prices(client, url, h, chunk=2000):
+    """Each session's per-session price (venue_report.session_prices: a season
+    split into its weeks, or blank) to ins_session_prices (record_session_prices,
+    migration 20270222100000), so the live Insights reads count a $250 league
+    as its weekly share, never $250 a night. Sessions with no listed price are
+    skipped. Prints counts only."""
+    import build_overview as B
+    s = (B.LAST or {}).get("s")
+    if s is None or s.empty or "price_basis" not in s:
+        return 0
+    s = s[s["price_basis"].notna()]
+    rows = [{"k": str(k), "p": None if p != p else round(float(p), 2), "m": None if m != m else round(float(m), 2), "b": b}
+            for k, p, m, b in zip(s["session_key"], s["price_n"], s["mprice_n"], s["price_basis"])]
+    n = 0
+    for i in range(0, len(rows), chunk):
+        res = rpc(client, url, h, "record_session_prices", {"p_rows": rows[i:i + chunk]})
+        n += res if isinstance(res, int) else 0
+    return n
+
+
 def store_pm_players(client, url, h, run_id, chunk=400):
     """Each player's page to pm_players / pm_series (record_pm_players,
     migration 20270216100000), in chunks; the last call drops the previous
@@ -563,6 +583,7 @@ def main() -> int:
     url, h = sb()
     windows = sorted({int(x) for x in os.environ.get("INSIGHTS_WINDOWS", "7,28,90").split(",") if x.strip()}, reverse=True)
     pm = None                      # the PM level, fitted on the longest window, shown with every window
+    prices_stored = False          # per-session prices, stored once from the longest window
     to = datetime.now(MEL).date() - timedelta(days=1)
     ok = 0
     courthire = {}                 # court hire, fetched once for the longest window (export())
@@ -594,6 +615,12 @@ def main() -> int:
                         print(f"{days}d: no sessions between {frm} and {to}; skipped")
                         continue
                     d, net = build(data_dir, work_dir, w["covered"])
+                    if not prices_stored:
+                        prices_stored = True
+                        try:
+                            print(f"Session prices stored: {store_session_prices(client, url, h)}")
+                        except Exception as e:
+                            print(f"Session prices: not stored ({type(e).__name__})")
                     if pm is None:
                         pm = fit_pm(client, url, h, frm, to)
                     if pm:
