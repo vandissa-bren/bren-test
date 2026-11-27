@@ -317,3 +317,20 @@ def test_unproven_leavers_capped_at_places_booked_at_the_start():
     # without a fill-log reading the rule leaves them alone
     out = CX.classify(r, pd.DataFrame([{"session_key": "pbp-s", "capacity": 4, "spots_at_start": None}]))
     assert not out["cancelled"].any()
+
+
+def test_export_splits_a_span_that_times_out(monkeypatch):
+    from datetime import date
+    import build_insights as BI
+    calls = []
+
+    def fake(client, url, h, name, args):
+        a, b = date.fromisoformat(args["p_from"]), date.fromisoformat(args["p_to"])
+        calls.append((a, b))
+        if (b - a).days >= 4:
+            raise RuntimeError(f'{name}: HTTP 500 {{"code":"57014","message":"canceling statement due to statement timeout"}}')
+        return [{"d": str(a)}]
+    monkeypatch.setattr(BI, "rpc", fake)
+    rows = BI.export_span(None, "", {}, "catalogue", date(2026, 11, 1), date(2026, 11, 14))
+    # 1-14 Nov split into 1-4, 5-7, 8-11, 12-14: every day asked for once, in order
+    assert [r["d"] for r in rows] == ["2026-11-01", "2026-11-05", "2026-11-08", "2026-11-12"]
