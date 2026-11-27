@@ -87,8 +87,12 @@ COLS = {
     # optional: courts free / taken / used by the venue's own sessions, per
     # 30-minute slot that has started (ins_court_hire; court_free.py)
     "courthire": ["fid", "slot_date", "slot_start", "n_courts", "taken", "programmed", "hire_taken", "hireable"],
+    # optional: what each programme says about itself (programme_details, read daily by
+    # capture_programme_details.py; 20270223100000): levels, coaches, formats, seasons
+    "progdetails": ["program_slug", "fid", "name", "category", "ntrp_str", "rating_provider", "description"],
 }
-OPTIONAL = {"programs", "firsts", "ratelog", "ratechecks", "pbpreads", "courtrates", "slotshifts", "waitlists", "courthire"}
+OPTIONAL = {"programs", "firsts", "ratelog", "ratechecks", "pbpreads", "courtrates", "slotshifts", "waitlists", "courthire",
+            "progdetails"}
 
 
 def sb():
@@ -164,6 +168,8 @@ def export(client, url, h, frm, to, d: Path, chunk_days: int = 14, skip=(), cour
             elif kind == "courtrates":
                 rows = table(client, url, h, "court_rate_states", {
                     "select": ",".join(cols), "last_seen": f"gte.{frm}", "order": "id"})
+            elif kind == "progdetails":
+                rows = table(client, url, h, "programme_details", {"select": ",".join(cols), "order": "program_slug"})
             elif kind == "slotshifts":
                 rows = table(client, url, h, "court_slot_states", {
                     "select": ",".join(cols), "and": f"(slot_date.gte.{frm},slot_date.lte.{to})",
@@ -209,7 +215,8 @@ def export(client, url, h, frm, to, d: Path, chunk_days: int = 14, skip=(), cour
                "courtrates": ["facility_id", "court_id", "shift", "first_seen"],
                "slotshifts": ["facility_id", "slot_date", "slot_start", "shift"],
                "waitlists": ["session_key", "observed_at"],
-               "courthire": ["fid", "slot_date", "slot_start"]}[kind]
+               "courthire": ["fid", "slot_date", "slot_start"],
+               "progdetails": ["program_slug"]}[kind]
         df = df.drop_duplicates(key)
         df.to_csv(d / f"{kind}.csv", index=False)
         counts[kind] = len(df)
@@ -335,6 +342,9 @@ def _figures_for(fg: dict, ids: set) -> dict:
         for vv in sw["venues"].values():
             vv["to"] = [t for t in vv.get("to", []) if t[0] in ids]
             vv["from"] = [t for t in vv.get("from", []) if t[0] in ids]
+    for key in ("prices", "groups", "paths", "health"):
+        if isinstance(fg.get(key), dict) and isinstance(fg[key].get("venues"), dict):
+            fg[key]["venues"] = keep(fg[key]["venues"])
     pg = fg.get("pages")
     if isinstance(pg, dict):
         pg["venues"] = keep(pg.get("venues"))
