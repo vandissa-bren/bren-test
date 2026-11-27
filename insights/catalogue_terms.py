@@ -303,6 +303,12 @@ _FORMATS = (
     ("round_robin", r"\bround[\s-]*robin\b"),
     ("ladder", r"\bladder\b"),
     ("league", r"\bleague\b|\btournament\b|\bchampionship\b|\bcompetition\b|\bthrowdown\b|\bteam\s+battle\b"),
+    # a division of a one-off tournament: "Men's Singles 3-3.49", "Mixed Doubles >4",
+    # "Women's Singles <3.5", "Men's Singles 50+" (Eastern Indoor, 27 Nov 2026);
+    # never when the title also says social, open play or coaching
+    ("league", r"^(?!.*\b(?:socials?|open\s+play|drills?|clinic|coach(?:ing)?|lessons?)\b)"
+               r".*\b(?:men|women|mixed|gender|ladies)(?:['\u2019]?s)?\s+(?:skinny\s+)?(?:singles|doubles)\b"
+               r".*(?:[<>]\s*\d(?:\.\d+)?|\b\d(?:\.\d+)?\s*-\s*\d(?:\.\d+)?\b|\b\d{2}\s*\+)"),
     ("learn_to_play", r"\blearn\s*(?:to|&)\s*play\b|\bintro(?:duction)?\s+to\b|\bfirst\s+time\b|\bnew\s+to\s+pickle|"
                       r"\bcome\s+and\s+try\b|\bstarter\b|\bfundamentals?\b|\bplayer\s+assessment\b"),
     ("coaching", r"\bcoach(?:ing|ed)?\b|\blesson\b"),
