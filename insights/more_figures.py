@@ -10,7 +10,8 @@ more_figures.py -- four more figures for Insights (27 Nov 2026), admin only.
            back, became regulars, are still regulars, or lapsed (and whether
            they now play somewhere else)
   health   a health score for each weekly session: how full it runs, which way
-           it's heading, whether first-timers come back, whether its regulars stay
+           it's heading, whether first-timers come back, whether its regulars stay,
+           each against the city's other weekly sessions; graded A-E by fifths
 
 Privacy as everywhere (privacy.py): a count of players is 0 or 5+; a share of
 players is published only when both the players it counts and the rest are 0
@@ -31,12 +32,14 @@ from figures import DATA_START, MEL, MIN_GROUP, _hold, _r1
 PRICE_STEP = 0.5            # prices compared to the nearest 50c
 PRICE_HOLD = 2              # the old and the new price each held for 2+ runs
 PRICE_FILL_RUNS = 4         # fill compared over up to 4 runs either side
+HIRE_HOLD_DAYS = 7          # a court-hire rate counts once it held a week
 # groups
 GROUP_MIN = 3
 # paths
-PATH_DAYS = 56              # 8 weeks to show what a first-timer does
+PATH_DAYS = 56              # 8 weeks to show what a first-timer does ...
+PATH_DAYS_SHORT = 28        # ... 4 weeks while the data is younger than that (until ~21 Dec 2026)
 PATH_ACTIVE_DAYS = 28       # "still" = played there in the last 4 weeks
-REGULAR_SESSIONS = 4
+REGULAR_SESSIONS = 4        # sessions in the 8 weeks to count as a regular (3 in 4 weeks)
 # health
 HEALTH_RUNS = 8
 WEIGHTS = {"fill": 0.4, "trend": 0.2, "newcomers": 0.2, "regulars": 0.2}
@@ -99,7 +102,11 @@ def prices(x: pd.DataFrame, rates, end_day: date) -> dict:
         r["first_seen"] = pd.to_datetime(r["first_seen"], utc=True, errors="coerce", format="mixed")
         r = r.sort_values("first_seen")
         hire = defaultdict(int)
+        r["last_seen"] = pd.to_datetime(r["last_seen"], utc=True, errors="coerce", format="mixed")
         for (fid, court, shift), g in r.groupby(["facility_id", "court_id", "shift"]):
+            # a rate counts once it held a week: the log also catches the price
+            # flickering for a day or two (a promo, a one-off), which isn't a change
+            g = g[(g["last_seen"] - g["first_seen"]) >= pd.Timedelta(days=HIRE_HOLD_DAYS)]
             pr, ts = g["price"].to_numpy(), g["first_seen"].to_list()
             for i in range(1, len(pr)):
                 if pr[i] != pr[i - 1] and _day(ts[i]) > DATA_START:
@@ -191,10 +198,14 @@ def paths(okv: pd.DataFrame, firsts, end_day: date, tracked) -> dict:
     if firsts is not None and len(firsts):
         f = firsts.dropna(subset=["pbp_user_id", "first_date", "fid"])
         known = {(int(p), int(v)): pd.Timestamp(x).date() for p, v, x in zip(f["pbp_user_id"], f["fid"], f["first_date"])}
-    last_day = end_day - timedelta(days=PATH_DAYS)
+    # 8 weeks to show what a first-timer does, once there's a fortnight of first-timers
+    # that old; till then 4 weeks (and 3 sessions make a regular)
+    days = PATH_DAYS if end_day - timedelta(days=PATH_DAYS) >= FG.COHORT_FROM + timedelta(days=14) else PATH_DAYS_SHORT
+    regular_n = REGULAR_SESSIONS if days == PATH_DAYS else 3
+    last_day = end_day - timedelta(days=days)
     recent = end_day - timedelta(days=PATH_ACTIVE_DAYS)
     plays_recent = o[o["d"] > recent].groupby("pbp_user_id")["fid"].agg(set)
-    out = {"days": PATH_DAYS, "city": {}, "venues": {}}
+    out = {"days": days, "regularSessions": regular_n, "city": {}, "venues": {}}
     city = defaultdict(int)
     for fid, g in o.groupby("fid"):
         if fid not in set(tracked):
@@ -207,14 +218,14 @@ def paths(okv: pd.DataFrame, firsts, end_day: date, tracked) -> dict:
                 continue                    # played there before the window: not a first-timer
             if not (FG.COHORT_FROM <= first <= last_day):
                 continue
-            n = int((h["d"] <= first + timedelta(days=PATH_DAYS)).sum())
+            n = int((h["d"] <= first + timedelta(days=days)).sum())
             still = fid in plays_recent.get(p, set())
             cnt["firsts"] += 1
             if n == 1:
                 cnt["once"] += 1
             else:
                 cnt["cameBack"] += 1
-            if n >= REGULAR_SESSIONS:
+            if n >= regular_n:
                 cnt["regular"] += 1
                 if still:
                     cnt["stillRegular"] += 1
@@ -244,12 +255,6 @@ def _path_shares(c: dict) -> dict:
 
 
 # ── session health ───────────────────────────────────────────────────────────
-def grade(score):
-    if score is None:
-        return None
-    return "A" if score >= 80 else "B" if score >= 65 else "C" if score >= 50 else "D" if score >= 35 else "E"
-
-
 def health(x: pd.DataFrame, okv: pd.DataFrame, firsts, end_day: date) -> dict:
     out = {"weights": WEIGHTS, "city": {}, "venues": {}}
     lab = FG._labels(x.dropna(subset=["sid"]))
@@ -268,8 +273,11 @@ def health(x: pd.DataFrame, okv: pd.DataFrame, firsts, end_day: date) -> dict:
     fo = fo[(fo["d"] >= FG.COHORT_FROM) & (fo["d"] <= end_day - timedelta(days=28))]
     venue_days = o.groupby(["pbp_user_id", "fid"])["d"].agg(sorted)
     grades = defaultdict(int)
+    rows = []
     for sid, g in x.dropna(subset=["sid"]).sort_values("starts_at").groupby("sid"):
         if len(g) < 4 or not FG._current(g, end_day):
+            continue
+        if g["capacity"].median() <= 2:         # private lessons and assessments
             continue
         g = g.tail(HEALTH_RUNS)
         fid = int(g["fid"].iloc[0])
@@ -297,19 +305,33 @@ def health(x: pd.DataFrame, okv: pd.DataFrame, firsts, end_day: date) -> dict:
         kept_pct = _pct(kept, len(regs)) if len(regs) >= 5 else None
         if kept_pct is not None:
             parts["regulars"] = kept_pct
-        w = sum(WEIGHTS[k] for k in parts)
-        score = round(sum(WEIGHTS[k] * v for k, v in parts.items()) / w) if w else None
-        gr = grade(score)
-        grades[gr] += 1
         l = lab.get(sid, {})
-        out["venues"].setdefault(str(fid), []).append({
+        rows.append((str(fid), parts, {
             "sid": sid, "title": l.get("title"), "dow": l.get("dow"), "hm": l.get("hm"), "runs": int(len(g)),
-            "score": score, "grade": gr, "fill": _r1(parts["fill"]), "trend": _r1(delta),
+            "fill": _r1(parts["fill"]), "trend": _r1(delta),
             "newcomersBack": new_pct, "regularsKept": kept_pct,
-            "players": _hold(oo["pbp_user_id"].nunique())})
+            "players": _hold(oo["pbp_user_id"].nunique())}))
+    # each part as where it sits among the city's weekly sessions (percentile,
+    # 0-100), so a 45% city doesn't grade most sessions E; the score is the
+    # weighted mean of the parts it has; grades by fifths of the city
+    by_part = {k: sorted(p[k] for _, p, _ in rows if k in p) for k in WEIGHTS}
+    def pct_rank(k, v):
+        a = by_part[k]
+        return 100 * (np.searchsorted(a, v, "left") + np.searchsorted(a, v, "right")) / (2 * len(a))
+    scores = []
+    for fid, parts, row in rows:
+        w = sum(WEIGHTS[k] for k in parts)
+        row["score"] = round(sum(WEIGHTS[k] * pct_rank(k, v) for k, v in parts.items()) / w) if w else None
+        scores.append(row["score"])
+    cuts = np.percentile([x for x in scores if x is not None], [20, 40, 60, 80]) if scores else []
+    for fid, parts, row in rows:
+        sc = row["score"]
+        row["grade"] = None if sc is None else "ABCDE"[4 - int(np.searchsorted(cuts, sc, "right"))]
+        grades[row["grade"]] += 1
+        out["venues"].setdefault(fid, []).append(row)
     for v in out["venues"].values():
         v.sort(key=lambda r: -(r["score"] or 0))
-    out["city"] = {"grades": dict(grades)}
+    out["city"] = {"grades": dict(grades), "sessions": len(rows)}
     return out
 
 
