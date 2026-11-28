@@ -131,3 +131,10 @@ def test_path_window_is_4_weeks_while_the_data_is_young():
 def test_health_grades_by_fifths_of_the_city():
     h = build()["health"]
     assert sum(h["city"]["grades"].values()) == h["city"]["sessions"]
+
+
+def test_groups_need_a_third_player_in_common():
+    from more_figures import core_groups
+    # two trios joined by one pair link stay two groups; a chain is no group
+    assert sorted(map(sorted, core_groups([(1, 2), (2, 3), (3, 1), (3, 4), (4, 5), (5, 6), (6, 4)]))) == [[1, 2, 3], [4, 5, 6]]
+    assert core_groups([(1, 2), (2, 3), (3, 4)]) == []
