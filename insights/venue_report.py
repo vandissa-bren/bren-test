@@ -115,6 +115,13 @@ def load():
     global PROGTERMS
     pf = DATA / "progdetails.csv"
     PROGTERMS = PT.table(pd.read_csv(pf, na_values=["null"])) if pf.exists() else {}
+    # sessions whose roster the venue hides (build_insights "hidden"): when the
+    # first empty read came, for the cancellation rule
+    hf = DATA / "hidden.csv"
+    if hf.exists():
+        hd = pd.read_csv(hf, na_values=["null"]).drop_duplicates("session_key")
+        hd["roster_hidden_from"] = pd.to_datetime(hd["first_hidden"], utc=True, errors="coerce", format="mixed")
+        s = s.merge(hd[["session_key", "roster_hidden_from"]], on="session_key", how="left")
     return s, r, c
 
 
