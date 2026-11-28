@@ -108,6 +108,11 @@ COUNTS = [
     "figures.groups.city.players", "figures.groups.venues.*.players", "figures.groups.venues.*.list[].size",
     "figures.paths.city.firsts", "figures.paths.city.regularsN", "figures.paths.venues.*.firsts",
     "figures.paths.venues.*.regularsN", "figures.health.venues.*[].players",
+    # the new venue guide (guide.py)
+    "figures.guide.venues.*.players.home", "figures.guide.venues.*.players.levels.*",
+    "figures.guide.venues.*.players.freq.*", "figures.guide.venues.*.players.segments[].players",
+    "figures.guide.venues.*.players.newWeekly[].players", "figures.guide.venues.*.players.travel[].players",
+    "figures.guide.venues.*.groups.players", "figures.guide.venues.*.groups.list[].size",
 ]
 
 # (rate path, base path), both relative to the same parent object. The rate is
@@ -276,6 +281,15 @@ def partitions_ex(d: dict):
     for r in (d.get("levelFit") or []) + (d.get("levelClass") or []):
         if isinstance(r, dict):
             add((r, "players"), [(r, "verified")])
+    # the new venue guide: a venue's players nearby split by level and by how
+    # often they play (each covers all of them); the level groups again
+    for gv in (((d.get("figures") or {}).get("guide") or {}).get("venues") or {}).values():
+        gp = (gv or {}).get("players")
+        if isinstance(gp, dict):
+            for sub in ("levels", "freq"):
+                if isinstance(gp.get(sub), dict):
+                    add((gp, "home"), [(gp[sub], k) for k in gp[sub]], "exact")
+            add((gp, "home"), [(r, "players") for r in gp.get("segments") or [] if isinstance(r, dict)])
     # regulars who've gone quiet: quiet = elsewhere + not seen; quiet is a
     # subset of regulars; each "now books at X" is a subset of elsewhere
     q = ((d.get("figures") or {}).get("quiet") or {})
