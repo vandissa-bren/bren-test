@@ -94,6 +94,9 @@ def collect_target_sessions(catalogue: list[dict]) -> list[dict]:
             seen.add(lid)
             out.append({"row_id": row_id, "lesson_id": lid, "date": date_str,
                         "capacity": s.get("capacity"),
+                        # what the listing says is left (the nightly read's
+                        # player_count), for spotting a hidden roster
+                        "spots_left": s.get("spots_left"),
                         "start": s.get("start"),
                         "session_type": s.get("type") or s.get("category"),
                         "price": s.get("price"),
@@ -105,6 +108,15 @@ def collect_target_sessions(catalogue: list[dict]) -> list[dict]:
                         "price_tiers": s.get("price_tiers") or None,
                         "coaches": s.get("coaches") or None})
     return out
+
+
+def hidden_roster(players: list, t: dict) -> bool:
+    """An empty roster read for a session the listing says has bookings
+    (places left below capacity). PlayByPoint returns an empty list, not an
+    error, when a venue hides who's booked, so this is the only sign."""
+    cap, left = t.get("capacity"), t.get("spots_left")
+    return (not players and isinstance(cap, int) and isinstance(left, int)
+            and 0 <= left < cap)
 
 
 async def fetch_roster(api, lesson_id) -> list[dict] | None:
@@ -233,6 +245,7 @@ async def main():
 
         run_at = datetime.now(timezone.utc).isoformat()
         observations, spot_updates, inv_observations, failures, empty, withppl = [], [], [], 0, 0, 0
+        hidden, hidden_venues = 0, set()
         read_ok = {}                              # lesson_id -> players, for take_in_claimed
         # One shared client session for all lesson_players calls.
         async with PlayByPointAPI(cookies=cookies, club_slug="thejar", **kw) as api:
@@ -242,6 +255,15 @@ async def main():
                 if players is None:
                     failures += 1
                     continue                      # could-not-read: send nothing for it
+                if hidden_roster(players, t):
+                    # The roster came back empty but the listing counts
+                    # bookings: the venue hides who's booked (seen from 16 Nov
+                    # at Dink & Drive Box Hill and Port Melbourne, Knox City).
+                    # Sending it would record everyone as cancelled and the
+                    # session as empty, so it's left as the listing has it.
+                    hidden += 1
+                    hidden_venues.add(t["row_id"])
+                    continue
                 read_ok[str(t["lesson_id"])] = players
                 if players:
                     withppl += 1
@@ -411,13 +433,16 @@ async def main():
             else:
                 print(f"  UPKEEP RPC FAILED: HTTP {r.status_code} {r.text[:160]}")
 
+        if hidden:
+            print(f"Rosters hidden: {hidden} sessions at {len(hidden_venues)} venues came back empty "
+                  f"while their listing counts bookings; left as listed")
         print("=" * 56)
-        print(f"CAPTURE SUMMARY  sessions={len(targets)}  read_ok={withppl + empty}  "
-              f"with_players={withppl}  empty={empty}  read_failed={failures}  "
+        print(f"CAPTURE SUMMARY  sessions={len(targets)}  read_ok={withppl + empty + hidden}  "
+              f"with_players={withppl}  empty={empty}  hidden={hidden}  read_failed={failures}  "
               f"rows_written={written}  spots_updated={spots_written}  inv_snapshots={inv_written}  "
               f"upkeep={upkeep}")
         # Loud only if we read NOTHING at all (session dead / blocked).
-        if targets and (withppl + empty) == 0:
+        if targets and (withppl + empty + hidden) == 0:
             print("READ NOTHING FROM PLAYBYPOINT — session may be expired or blocked")
             sys.exit(1)
 
