@@ -36,6 +36,11 @@ from __future__ import annotations
 import re
 from typing import Optional
 
+
+def _s(v) -> str:
+    """A text value, or "" for None and a missing (NaN) value."""
+    return v if isinstance(v, str) else ""
+
 DUPR_MIN, DUPR_MAX = 2.0, 8.0
 # A top of 6.0 or more is no real ceiling (PBP writes "3.25 / 7.0" for "3.25 and up").
 OPEN_TOP = 6.0
@@ -61,7 +66,7 @@ def _strip_non_ratings(t: str) -> str:
     return t
 
 def _clean(title: Optional[str]) -> str:
-    return _strip_non_ratings(_strip_negated((title or "").lower()))
+    return _strip_non_ratings(_strip_negated(_s(title).lower()))
 
 def _is_rating_like(raw: str, mentions_dupr: bool) -> bool:
     try:
@@ -154,7 +159,7 @@ def _union(bands: list) -> Optional[tuple]:
 def _field_band(skill_level: Optional[str]) -> Optional[tuple]:
     """PlayByPoint's skill_level as (lo|None, hi|None): '1.0 / 3.5' -> (None, 3.5),
     '3.5 / 7.0' -> (3.5, None), '> 3.0' -> (3.0, None), '2.0 / 3.0' -> (2.0, 3.0)."""
-    s = (skill_level or "").strip().lower()
+    s = _s(skill_level).strip().lower()
     m = re.match(r"^" + NUM + r"\s*(?:/|-|–|to)\s*" + NUM + r"$", s)
     if m:
         lo, hi = float(m.group(1)), float(m.group(2))
@@ -172,9 +177,9 @@ def _field_band(skill_level: Optional[str]) -> Optional[tuple]:
 def infer_skill_level(title: Optional[str], skill_level: Optional[str]) -> str:
     """The display label: '2.5-3.5', '3.75+', '<3.0', or the field as PBP wrote it,
     or 'All levels'."""
-    field = (skill_level or "").strip()
-    has_field = bool(field) and field.lower() != "all levels"
-    raw = (title or "").lower()
+    field = _s(skill_level).strip()
+    has_field = isinstance(field, str) and bool(field) and field.lower() != "all levels"
+    raw = _s(title).lower()
     mentions = "dupr" in raw
     t = _clean(title)
 
@@ -214,7 +219,7 @@ def infer_skill_level(title: Optional[str], skill_level: Optional[str]) -> str:
 def label_band(label: Optional[str]) -> Optional[tuple[float, float]]:
     """'2.5-3.5' -> (2.5,3.5) · '3.5+' / '> 3.5' -> (3.5, 8) · '1.0 / 3.5' -> (1.0,3.5)
     · '<3.0' -> (2.0, 3.0) · 'All levels' -> None."""
-    if not label:
+    if not isinstance(label, str) or not label:
         return None
     s = label.strip().lower()
     m = re.match(r"^(\d(?:\.\d+)?)\s*(?:-|–|—|/|to)\s*(\d(?:\.\d+)?)$", s)
@@ -286,7 +291,7 @@ _MONTHS = ("january|february|march|april|may|june|july|august|september|october|
            "november|december|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec")
 
 def programme_key(slug: Optional[str]) -> Optional[str]:
-    if not slug:
+    if not isinstance(slug, str) or not slug:
         return None
     s = slug.lower()
     s = re.sub(r"-copy(?:-[0-9a-f]+)?$", "", s)
@@ -326,14 +331,14 @@ _DUPR_RATED = re.compile(r"\bdupr\s+(?:rated|recorded|session|nights?|doubles|si
                          r"\b(?:rated|recorded)\s+session\b|\bsuper\s+dupr\b|\(dupr\)|\bdupr\s+rated\b")
 
 def title_format(text: Optional[str]) -> Optional[str]:
-    t = _strip_negated((text or "").lower())
+    t = _strip_negated(_s(text).lower())
     for name, rx in _FORMATS:
         if re.search(rx, t):
             return name
     return None
 
 def dupr_rated(text: Optional[str]) -> bool:
-    return bool(_DUPR_RATED.search((text or "").lower()))
+    return bool(_DUPR_RATED.search(_s(text).lower()))
 
 
 # ── mapPBPType (sessionTerms.ts) — the app's display category ───────────────
@@ -342,7 +347,7 @@ _APP_CATEGORY = {"round_robin": "Round Robin", "ladder": "Ladder", "league": "Le
                  "match_play": "Match Play", "open_play": "Open Play", "social": "Social Event"}
 
 def _map_type_field(raw: Optional[str]) -> str:
-    t = (raw or "").lower()
+    t = _s(raw).lower()
     if "round robin" in t or "roundrobin" in t:            return "Round Robin"
     if "ladder" in t:                                       return "Ladder"
     if "open play" in t or "openplay" in t:                 return "Open Play"
@@ -370,21 +375,21 @@ _LEARNING = ("clinic", "lesson", "coaching", "learn to play", "academy", "drill"
 _COMPETITIVE = ("tournament", "league", "competition", "championship", "ladder", "team battle", "round robin")
 
 def play_family(raw_type: Optional[str], text: Optional[str] = None) -> Optional[str]:
-    both = f"{text or ''} {raw_type or ''}".lower().replace("-", " ")
+    both = f"{_s(text)} {_s(raw_type)}".lower().replace("-", " ")
     if not both.strip() or "court booking" in both:
         return None
     f = title_format(text)
     if f:
         fam = _FAMILY[f]
     else:
-        ty = (raw_type or "").lower().replace("-", " ")
+        ty = _s(raw_type).lower().replace("-", " ")
         if any(w in ty for w in _LEARNING):
             fam = "learning"
         elif any(w in ty for w in _COMPETITIVE):
             fam = "competitive"
         else:
             fam = "social"
-    if fam == "social" and (dupr_rated(text) or "dupr session" in (raw_type or "").lower()):
+    if fam == "social" and (dupr_rated(text) or "dupr session" in _s(raw_type).lower()):
         fam = "competitive"
     return fam
 
@@ -403,7 +408,7 @@ _AUDIENCE = (
 
 def session_terms(title: Optional[str], raw_type: Optional[str] = None,
                   skill_level: Optional[str] = None) -> dict:
-    low = (title or "").lower()
+    low = _s(title).lower()
     band, _ = session_band(title, skill_level, [])
     label = infer_skill_level(title, skill_level)
     f = title_format(title)
