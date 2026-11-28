@@ -90,9 +90,13 @@ COLS = {
     # optional: what each programme says about itself (programme_details, read daily by
     # capture_programme_details.py; 20270223100000): levels, coaches, formats, seasons
     "progdetails": ["program_slug", "fid", "name", "category", "ntrp_str", "rating_provider", "description"],
+    # optional: sessions whose roster the venue hides, and when the first empty
+    # read came (roster_hidden_sessions, 20270226100000). From then on a capture
+    # run proves nothing about who left (cancellations.classify)
+    "hidden": ["session_key", "first_hidden"],
 }
 OPTIONAL = {"programs", "firsts", "ratelog", "ratechecks", "pbpreads", "courtrates", "slotshifts", "waitlists", "courthire",
-            "progdetails"}
+            "progdetails", "hidden"}
 
 
 def sb():
@@ -186,6 +190,9 @@ def export(client, url, h, frm, to, d: Path, chunk_days: int = 14, skip=(), cour
             elif kind == "courtrates":
                 rows = table(client, url, h, "court_rate_states", {
                     "select": ",".join(cols), "last_seen": f"gte.{frm}", "order": "id"})
+            elif kind == "hidden":
+                rows = table(client, url, h, "roster_hidden_sessions", {
+                    "select": ",".join(cols), "first_hidden": f"gte.{frm - timedelta(days=22)}", "order": "session_key"})
             elif kind == "progdetails":
                 rows = table(client, url, h, "programme_details", {"select": ",".join(cols), "order": "program_slug"})
             elif kind == "slotshifts":
@@ -234,7 +241,7 @@ def export(client, url, h, frm, to, d: Path, chunk_days: int = 14, skip=(), cour
                "slotshifts": ["facility_id", "slot_date", "slot_start", "shift"],
                "waitlists": ["session_key", "observed_at"],
                "courthire": ["fid", "slot_date", "slot_start"],
-               "progdetails": ["program_slug"]}[kind]
+               "progdetails": ["program_slug"], "hidden": ["session_key"]}[kind]
         df = df.drop_duplicates(key)
         df.to_csv(d / f"{kind}.csv", index=False)
         counts[kind] = len(df)
