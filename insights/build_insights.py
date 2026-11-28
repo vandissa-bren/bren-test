@@ -696,7 +696,12 @@ def main() -> int:
                 print(f"{days}d ({frm} to {to}): {n} -> {len(out['venues'])} venues, "
                       f"{len(out['sessions'])} sessions, {len(body) // 1024} KB in {time.time() - t0:.0f}s")
             except Exception as e:
+                import traceback
                 print(f"{days}d: FAILED {type(e).__name__}: {e}")
+                # where it failed: file, line and function only (no data), so a
+                # public log never carries a name or an id
+                for fr in traceback.extract_tb(e.__traceback__)[-6:]:
+                    print(f"    at {Path(fr.filename).name}:{fr.lineno} in {fr.name}")
     return 0 if ok else 1
 
 
