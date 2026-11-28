@@ -131,9 +131,15 @@ def classify(r, s=None):
         idx = grp.index
         i = np.searchsorted(tsn, lo_all[idx].values, side="right")
         hit.loc[idx] = (i < len(tsn)) & (tsn[np.minimum(i, len(tsn) - 1)] < hi_all[idx].values)
-    # 2. global runs whose band covers the session's date
+    # 2. global runs whose band covers the session's date. Where the venue hides
+    # the roster (s.roster_hidden_from, 28 Nov 2026), only runs before its first
+    # empty read count: after it, an empty list says nothing about who left.
     runs = capture_runs(r)
     sday = pd.to_datetime(r["session_date"], errors="coerce").dt.tz_localize("UTC")
+    hidden_from = None
+    if s is not None and "roster_hidden_from" in s.columns:
+        hf = s.drop_duplicates("session_key").set_index("session_key")["roster_hidden_from"]
+        hidden_from = pd.to_datetime(r["session_key"].map(hf), utc=True, errors="coerce")
     for lo_d, hi_d in BANDS:
         ts = runs.loc[(runs["lo"] == lo_d) & (runs["hi"] == hi_d), "t"]
         if ts.empty:
@@ -142,7 +148,8 @@ def classify(r, s=None):
         # a run on UTC day D reads dates D+lo .. D+hi, so for this session it
         # must run on UTC days (date - hi) .. (date - lo)
         w0 = pd.concat([last + pd.Timedelta(seconds=1), sday - pd.Timedelta(days=hi_d)], axis=1).max(axis=1)
-        w1 = pd.concat([upper, sday - pd.Timedelta(days=lo_d - 1)], axis=1).min(axis=1)
+        w1 = pd.concat([upper, sday - pd.Timedelta(days=lo_d - 1)]
+                       + ([hidden_from] if hidden_from is not None else []), axis=1).min(axis=1)
         ok = cand & w0.notna() & w1.notna() & (w0 < w1)
         if not ok.any():
             continue
