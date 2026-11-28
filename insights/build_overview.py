@@ -578,6 +578,24 @@ def _optional_csv(name):
     return x if len(x) else None
 
 
+def one_off_competitions(f: pd.DataFrame) -> set:
+    """Session keys of one-off competitions: a competition by its title
+    (catalogue_terms: league, tournament, championship, a tournament division
+    such as "Men's Singles 3-3.49") that ran on one date only at its venue
+    under that title. A weekly league night runs on many dates and stays.
+    (series.py gives competitions no series, so they're matched by title.)"""
+    from catalogue_terms import title_format
+    if f.empty or "title" not in f:
+        return set()
+    t = f["title"].where(f["title"].map(lambda v: isinstance(v, str)), None)
+    comp = t.map(lambda v: v is not None and title_format(v) == "league")
+    day = f["starts_at"].dt.tz_convert(R.MEL).dt.date
+    key = f["fid"].astype(str) + "|" + t.fillna("").str.strip().str.lower()
+    dates = day.groupby(key).nunique()
+    once = key.map(dates) <= 1
+    return set(f.loc[comp & once, "session_key"])
+
+
 def main():
     s, r, c = R.load()
     R.NOW = max(s["last_obs"].max(), r["last_seen"].max())
@@ -656,6 +674,16 @@ def main():
     # bookings in FINISHED sessions at the venues
     okv = ok[ok["fid"].isin(vmap) & ok["session_key"].isin(set(f["session_key"]))].copy()
     okv["fid"] = okv["fid"].astype(int)
+    # one-off competition entries (a tournament division, a championship day)
+    # aren't visits: a venue's tournament weekend brought 155 "newcomers" in one
+    # week (Eastern Indoor, w/c 2 Nov) and few came back. They stay in the
+    # venue and city player and booking counts, and are left out of came back,
+    # new and returning, the scorecard and the figures (first visits, retention,
+    # groups, the player path...): okv_play, 28 Nov 2026
+    oneoff = one_off_competitions(f)
+    okv_play = okv[~okv["session_key"].isin(oneoff)]
+    print(f"One-off competitions left out of first visits: {len(oneoff)} sessions, "
+          f"{len(okv) - len(okv_play)} bookings")
     import views as VW
     end_day = end.tz_convert(R.MEL).date()
     per = okv.groupby(["pbp_user_id", "fid"]).size().reset_index(name="n")
@@ -685,7 +713,7 @@ def main():
         lv = okv[okv["fid"] == fid]
         cc = canc[canc["fid"] == fid]
         v_rating, v_rated = VW.median_rating(lv)
-        v_back, v_back_n = VW.came_back(okv, fid, end_day)
+        v_back, v_back_n = VW.came_back(okv_play, fid, end_day)
         tlv = tl[tl["fid"] == fid]
         lp = TP.lead_profile(tlv)
         pb = pub[pub["fid"] == fid]["ahead"]
@@ -762,9 +790,9 @@ def main():
             "timing": timing(tl, f), "quality": quality(s, f, tl, start, end, vmap),
             "levelMix": level_mix(okv, dict(zip(s["session_key"], s["level_class"]))),
             "levelSupply": level_supply(okv, f, vmap), "coaches": coaches(f, okv),
-            "newret": new_returning(okv, f, vmap, start, end),
+            "newret": new_returning(okv_play, f, vmap, start, end),
             "digest": VW.digest(f, okv, vname),
-            "scorecard": VW.scorecard(f, okv, R.FIRSTS, venues, city, weeks),
+            "scorecard": VW.scorecard(f, okv_play, R.FIRSTS, venues, city, weeks),
             "glossary": VW.GLOSSARY}
 
     # ── the seven figures and "sessions to cut or move" (figures.py); "where to
@@ -772,10 +800,20 @@ def main():
     import figures as FG
     tracked = [k for k, v in vmap.items() if v.get("tracked")]
     allr = m.loc[m["session_key"].isin(set(f["session_key"])), ["session_key", "pbp_user_id"]]
-    data["figures"], data["_where"] = FG.build(f, okv, R.FIRSTS, end_day, R.km, vname, tracked, allr)
+    data["figures"], data["_where"] = FG.build(f, okv_play, R.FIRSTS, end_day, R.km, vname, tracked, allr)
     # price changes, social groups, the player path, session health (more_figures.py, 27 Nov 2026)
     import more_figures as MF
-    data["figures"].update(MF.build(f, okv, R.FIRSTS, end_day, tracked, _optional_csv("courtrates")))
+    data["figures"].update(MF.build(f, okv_play, R.FIRSTS, end_day, tracked, _optional_csv("courtrates")))
+    # the new venue guide's figures, for every venue on the list (guide.py, 28 Nov 2026)
+    import guide as GD
+    try:
+        data["figures"]["guide"] = GD.build(f, okv_play, R.FIRSTS, vmap, end_day, data["figures"].get("groups"), oneoff)
+        print(f"New venue guide: {len(data['figures']['guide']['venues'])} venues")
+    except Exception as e:      # new: never let it stop the rest of the build
+        import traceback
+        traceback.print_exc()
+        print(f"New venue guide: failed ({type(e).__name__}); left out of this build")
+        data["figures"]["guide"] = {"venues": {}}
 
     # ── ratings: how DUPRs move (Insights › Ratings; ratings.py) ──
     import ratings as RT
