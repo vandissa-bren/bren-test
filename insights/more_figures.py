@@ -121,6 +121,38 @@ def prices(x: pd.DataFrame, rates, end_day: date) -> dict:
 
 
 # ── social groups ────────────────────────────────────────────────────────────
+def core_groups(edges) -> list:
+    """Groups in a "plays with" graph: players joined by links that are part of
+    a triangle (A plays with B, and both play with C). A link whose two
+    players share no third (a chain of pairs) is dropped before the graph is
+    split into its connected parts."""
+    adj = defaultdict(set)
+    for i, j in edges:
+        if i != j:
+            adj[i].add(j)
+            adj[j].add(i)
+    keep = defaultdict(set)
+    for i, ns in adj.items():
+        for j in ns:
+            if i < j and adj[i] & adj[j]:
+                keep[i].add(j)
+                keep[j].add(i)
+    seen, out = set(), []
+    for p in keep:
+        if p in seen:
+            continue
+        stack, comp = [p], set()
+        while stack:
+            a = stack.pop()
+            if a in comp:
+                continue
+            comp.add(a)
+            stack.extend(keep[a] - comp)
+        seen |= comp
+        out.append(comp)
+    return out
+
+
 def groups(x: pd.DataFrame, okv: pd.DataFrame, end_day: date) -> dict:
     import pm_player as PP
     out = {"city": {"groups": 0}, "venues": {}}
@@ -132,22 +164,11 @@ def groups(x: pd.DataFrame, okv: pd.DataFrame, end_day: date) -> dict:
     pairs = PP.partners(d, sess)
     if pairs.empty:
         return out
-    # groups: players joined by "plays with" links (union-find)
-    parent = {}
-
-    def find(a):
-        while parent.setdefault(a, a) != a:
-            parent[a] = parent[parent[a]]
-            a = parent[a]
-        return a
-    for i, j in zip(pairs["i"], pairs["j"]):
-        ra, rb = find(i), find(j)
-        if ra != rb:
-            parent[ra] = rb
-    members = defaultdict(set)
-    for p in list(parent):
-        members[find(p)].add(p)
-    G = [m for m in members.values() if len(m) >= GROUP_MIN]
+    # groups: players joined by "plays with" links that sit in a triangle, so a
+    # chain of pairs (A with B, B with C) is not a group
+    # (28 Nov 2026: union-find alone made a "group" of 12 across 12 venues)
+    members = core_groups(zip(pairs["i"], pairs["j"]))
+    G = [m for m in members if len(m) >= GROUP_MIN]
     lab = FG._labels(x.dropna(subset=["sid"]))
     weeks = max(1.0, (x["_date"].max() - x["_date"].min()).days / 7) if len(x) else 1.0
     active = d.groupby("pbp_user_id").size()
