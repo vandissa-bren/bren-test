@@ -687,11 +687,18 @@ def main() -> int:
                     "builtAt": datetime.now(timezone.utc).isoformat(), "exported": n}))
                 body = json.dumps({"days": days, "built_at": out["window"]["builtAt"], "data": out},
                                   separators=(",", ":"), default=str)
-                r = client.post(f"{url}/rest/v1/insights_builds?on_conflict=days",
-                                headers={**h, "Prefer": "resolution=merge-duplicates,return=minimal"},
-                                content=body)
+                # storing a big build can hit the statement timeout while something
+                # else is busy: up to two more tries, 20 s apart (28 Nov 2026)
+                for attempt in range(3):
+                    r = client.post(f"{url}/rest/v1/insights_builds?on_conflict=days",
+                                    headers={**h, "Prefer": "resolution=merge-duplicates,return=minimal"},
+                                    content=body)
+                    if r.status_code < 300 or "57014" not in r.text or attempt == 2:
+                        break
+                    print(f"{days}d: storing {len(body) // 1024} KB timed out; trying again in 20 s")
+                    time.sleep(20)
                 if r.status_code >= 300:
-                    raise RuntimeError(f"store: HTTP {r.status_code} {r.text[:300]}")
+                    raise RuntimeError(f"store ({len(body) // 1024} KB): HTTP {r.status_code} {r.text[:300]}")
                 ok += 1
                 print(f"{days}d ({frm} to {to}): {n} -> {len(out['venues'])} venues, "
                       f"{len(out['sessions'])} sessions, {len(body) // 1024} KB in {time.time() - t0:.0f}s")
